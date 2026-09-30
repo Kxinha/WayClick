@@ -49,7 +49,8 @@ cat.showFullScreen()
 w = a.App()
 w.click_box.setChecked(True); w.key_box.setChecked(False)
 app.aboutToQuit.connect(w.cleanup)
-w.mode.setCurrentText("Runs while mouse button is held")
+w.mode.setCurrentText("Runs while the trigger is held")
+w.trigger.set_key(a.BTN["Left"])        # gatilho: botao esquerdo
 w.delay.setValue(0); w.duration.setValue(0); w.interval.setValue(20.0)
 w.sound.setChecked(False)
 

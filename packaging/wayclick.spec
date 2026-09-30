@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.4.0
+Version:        1.5.0
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -71,6 +71,12 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Tue Sep 30 2026 gabrielmf1998 <noreply@github.com> - 1.5.0-1
+- One Trigger field: any key or any mouse button, set by pressing it
+- Two trigger modes instead of three; the trigger decides how it listens
+- The hotkey is named for its job: arm/disarm, not trigger
+- Thumb mouse buttons usable as trigger and as click
+
 * Sun Sep 13 2026 gabrielmf1998 <noreply@github.com> - 1.4.0-1
 - Keyboard macro takes several keys, each with its own interval
 - Trigger picks which engines it holds, and says so before you press it

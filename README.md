@@ -15,7 +15,9 @@ running as root.
 
 - **1 click/s down to a 0.1 ms interval** — 10,000 clicks/s, measured at 100%
   delivery on the receiving window
-- **Global hotkey** that works even when the window is not focused
+- **Trigger** on any key or any mouse button, set by pressing it: hold left
+  click and it presses E, or hold a thumb button, or a key
+- **Arm/disarm hotkey** that works even when the window is not focused
 - **Hold mode** — clicks only while you physically hold the mouse button
 - **Keyboard macro** — up to eight keys at once, each captured the way
   shortcuts are set, each with its own interval; repeat or hold
@@ -200,28 +202,41 @@ Ctrl, Alt, Super) do not repeat, so they stay cleanly held.
 **Mode**
 
 - `No trigger (hotkey toggles)` — Start runs it; the hotkey toggles it too.
-- `Runs while hotkey is held` — runs only while the key stays down.
-- `Runs while mouse button is held` — arm it, then it runs only while you
-  physically hold the mouse button. Release and it stops, still armed.
+- `Runs while the trigger is held` — arm it, then it runs only while you hold
+  the trigger. Let go and it stops, still armed.
 
 The mode gates **everything that is enabled**, not just clicking, and the
 button below says which of the two it will do: **Start** when there is no
 trigger, **Arm** when there is one. The Trigger tab carries a dot whenever a
 trigger is set, the same way the other tabs mark what they have enabled.
 
+**Trigger** — what you hold. Click the field and press it: any key on your
+keyboard, or any mouse button including the two thumb ones. There is one field
+because there is one question; which of the two it is decides how WayClick
+listens, not what you have to configure. A mouse button goes through the same
+capture hold mode uses; a key is read from `/dev/input` like the hotkey.
+
+"Hold left click and it presses E ten times a second" is that: trigger set to
+`Left click`, the keyboard macro on `E` at 100 ms, clicking off.
+
 **Trigger holds** — which engines wait for the trigger. Untick one and it runs
-the moment you press Arm, while the ticked ones still wait for the button. Hold
-the mouse button to autoclick while the keyboard macro runs the whole time, or
-the reverse. It only applies to `Runs while mouse button is held`: the other
-modes decide the whole run rather than what happens inside it.
+the moment you press Arm, while the ticked ones still wait. Hold the mouse
+button to autoclick while the keyboard macro runs the whole time, or the
+reverse.
 
 **Start delay** — seconds before it begins. Move the cursor off the window
 first, otherwise the autoclicker clicks its own Stop button.
 
 **Auto-stop after** — stops on its own after N seconds (`never` = off).
 
-**Global hotkey** — F6–F12, Insert, Pause, ScrollLock or numpad +/−. Works from
-any window. `Esc` always stops when the window is focused.
+**Arm/disarm hotkey** — arms and disarms from any window, whatever has focus.
+Set by pressing it, same as everything else, so any key works; the field warns
+when you pick one that also types, since it would arm and disarm every time you
+pressed it anywhere. `Esc` always stops when the window is focused.
+
+It is not the trigger. Arming makes the trigger live, and the trigger is what
+runs things — which is what lets "arm with F8, run while holding left click"
+be two separate, obvious settings.
 
 **Sound feedback** — a short high beep when it starts, low when it stops, so you
 know the hotkey registered without looking.
@@ -372,6 +387,7 @@ input devices and measure real behaviour. Run them from the project root:
 sg input -c "python3 tests/t_hold.py"        # hold mode end to end, with a fake mouse
 sg input -c "python3 tests/t_hold_keyonly.py"  # hold mode driving only the keyboard macro
 sg input -c "python3 tests/t_trigger_scope.py" # keyboard free while clicking waits for the button
+sg input -c "python3 tests/t_macro_trigger.py" # hold a mouse button, and hold a key, to drive a macro
 python3 tests/t_multikey.py                  # several keys at once, each on its own interval
 python3 tests/t_update.py                    # update notice: compare, cache, and the bar
 sg input -c "python3 tests/t_clone.py"       # asks KWin over D-Bus if the clone inherited your settings

@@ -16,7 +16,9 @@ compositor e sem nada rodando como root.
 
 - **De 1 clique/s até 0,1 ms de intervalo** — 10.000 cliques/s, medidos com 100%
   de entrega na janela que recebe
-- **Atalho global** que funciona mesmo com a janela fora de foco
+- **Gatilho** em qualquer tecla ou botão do mouse, definido apertando:
+  segure o clique esquerdo e ele aperta E, ou um botão do polegar, ou uma tecla
+- **Atalho de armar/desarmar** que funciona mesmo com a janela fora de foco
 - **Modo segurar** — só clica enquanto você segura o botão do mouse
 - **Macro de teclado** — até oito teclas ao mesmo tempo, cada uma capturada
   como se define um atalho e com o seu próprio intervalo; repetindo ou segurando
@@ -200,30 +202,42 @@ Modificadores (Shift, Ctrl, Alt, Super) não repetem, então ficam limpos.
 **Modo**
 
 - `Sem gatilho (o atalho liga/desliga)` — o Start roda; o atalho também alterna.
-- `Age enquanto o atalho é segurado` — roda só enquanto a tecla estiver
-  pressionada.
-- `Age enquanto o botão do mouse é segurado` — arme, e ele roda só enquanto você
-  segurar fisicamente o botão. Ao soltar, para, mas continua armado.
+- `Age enquanto o gatilho é segurado` — arme, e ele roda só enquanto você
+  segurar o gatilho. Ao soltar, para, mas continua armado.
 
 O modo segura **tudo o que estiver ligado**, não só o clique, e o botão logo
 abaixo diz qual das duas coisas vai fazer: **Start** quando não há gatilho,
 **Armar** quando há. A aba Gatilho ganha um ponto sempre que existe um gatilho
 definido, do mesmo jeito que as outras marcam o que têm ligado.
 
+**Gatilho** — o que você segura. Clique no campo e aperte: qualquer tecla do
+teclado, ou qualquer botão do mouse, inclusive os dois do polegar. É um campo
+só porque é uma pergunta só; qual dos dois é decide como o WayClick escuta, não
+o que você precisa configurar. Botão passa pela mesma captura que o modo
+segurar usa; tecla é lida do `/dev/input`, igual ao atalho.
+
+"Segurar o clique esquerdo e apertar E dez vezes por segundo" é isso: Gatilho
+em `clique Left`, a macro de teclado no `E` a cada 100 ms, clique desligado.
+
 **O gatilho segura** — quais engines esperam o gatilho. Desmarque uma e ela roda
-assim que você apertar Armar, enquanto as marcadas continuam esperando o botão.
-Dá para segurar o botão do mouse para clicar com a macro de teclado rodando o
-tempo todo, ou o contrário. Só vale no `Age enquanto o botão do mouse é
-segurado`: os outros modos decidem a rodada inteira, não o que acontece dentro
-dela.
+assim que você apertar Armar, enquanto as marcadas continuam esperando. Dá para
+segurar o botão do mouse para clicar com a macro de teclado rodando o tempo
+todo, ou o contrário.
 
 **Atraso ao iniciar** — segundos antes de começar. Tire o cursor da janela
 primeiro, senão o autoclicker clica no próprio botão Parar.
 
 **Parar sozinho após** — para depois de N segundos (`nunca` = desligado).
 
-**Atalho global** — F6–F12, Insert, Pause, ScrollLock ou +/− do numérico.
-Funciona de qualquer janela. `Esc` sempre para, com a janela em foco.
+**Atalho de armar/desarmar** — arma e desarma de qualquer janela, seja qual for
+a que estiver em foco. Definido apertando, igual a todo o resto, então qualquer
+tecla serve; o campo avisa quando você escolhe uma que também digita, porque
+ela armaria e desarmaria toda vez que fosse apertada em qualquer lugar. `Esc`
+sempre para, com a janela em foco.
+
+Ele não é o gatilho. Armar faz o gatilho valer, e o gatilho é quem roda as
+coisas — que é o que permite "armar no F8 e rodar segurando o clique esquerdo"
+serem duas configurações separadas e óbvias.
 
 **Som ao acionar** — um bipe agudo ao ligar e grave ao desligar, para você saber
 que o atalho pegou sem precisar olhar.
@@ -378,6 +392,7 @@ partir da raiz do projeto:
 sg input -c "python3 tests/t_hold.py"        # modo segurar de ponta a ponta, com mouse falso
 sg input -c "python3 tests/t_hold_keyonly.py"  # modo segurar acionando só a macro de teclado
 sg input -c "python3 tests/t_trigger_scope.py" # teclado solto enquanto o clique espera o botão
+sg input -c "python3 tests/t_macro_trigger.py" # segurar botão do mouse, e segurar tecla, acionando a macro
 python3 tests/t_multikey.py                  # várias teclas ao mesmo tempo, cada uma no seu intervalo
 python3 tests/t_update.py                    # aviso de versão nova: compara, guarda e mostra
 sg input -c "python3 tests/t_clone.py"       # pergunta ao KWin via D-Bus se o clone herdou sua config

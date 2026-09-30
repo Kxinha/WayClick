@@ -55,7 +55,10 @@ def step():
         app.quit()
         return
     if desc.startswith("hold"):
-        w.mode.setCurrentText("Runs while hotkey is held")
+        # o atalho agora so arma/desarma; quem segura e o campo Gatilho, e
+        # apontar o Gatilho para a mesma tecla reproduz o comportamento antigo
+        w.mode.setCurrentText("Runs while the trigger is held")
+        w.trigger.set_key(a.KEYNAMES["F8"], "F8")
     action()
     QTimer.singleShot(250, lambda: check(desc, expect))
 

@@ -27,7 +27,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -98,7 +98,8 @@ UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
 UI_GET_SYSNAME = (2 << 30) | (64 << 16) | (ord("U") << 8) | 44
 EV_SYN, EV_KEY, EV_REL, EV_ABS, EV_MSC = 0, 1, 2, 3, 4
 SYN_REPORT = 0
-BTN = {"Left": 0x110, "Right": 0x111, "Middle": 0x112}
+BTN = {"Left": 0x110, "Right": 0x111, "Middle": 0x112,
+       "Side": 0x113, "Extra": 0x114}   # os dois do polegar
 BTN_ALL = range(0x110, 0x118)           # left..task
 REL_ALL = (0, 1, 6, 7, 8, 9, 0x0b, 0x0c)  # x,y,hwheel,dial,wheel,misc,hi-res
 EVENT_FMT = "llHHi"                      # struct input_event
@@ -493,6 +494,13 @@ KEYNAMES = {"F6": 64, "F7": 65, "F8": 66, "F9": 67, "F10": 68, "F11": 87,
             "KP_Add": 78, "KP_Sub": 74}
 KEY_ESC = 1
 BTN_TOOL_FINGER = 0x145
+
+# O atalho global vale em QUALQUER janela: ele é lido direto do /dev/input e
+# não há como "escapar" dele digitando. Uma tecla que também escreve algo, no
+# modo que liga e desliga, vira uma armadilha — cada 'e' digitado num chat
+# ligaria a macro. Estas não escrevem nada, então são seguras; as outras a UI
+# aceita, mas avisando.
+SAFE_HOTKEYS = set(KEYNAMES.values())
 
 
 def is_uinput_device(path):
@@ -1056,6 +1064,25 @@ CODE_NAMES = {}
 for _n, _c in KEYS.items():
     CODE_NAMES.setdefault(_c, _n)
 
+# Código de botão começa em 0x100; tecla nenhuma chega perto (a maior aqui é
+# 194). Então o próprio número diz se o gatilho é tecla ou botão, sem precisar
+# guardar um sinalizador junto.
+BTN_NAMES = {code: name for name, code in BTN.items()}
+QT_BUTTONS = {Qt.LeftButton: BTN["Left"], Qt.RightButton: BTN["Right"],
+              Qt.MiddleButton: BTN["Middle"], Qt.BackButton: BTN["Side"],
+              Qt.ForwardButton: BTN["Extra"]}
+
+
+def is_button(code):
+    return code >= 0x100
+
+
+def trigger_label(code, event=None):
+    """Nome do gatilho, seja tecla ou botão do mouse."""
+    if code in BTN_NAMES:
+        return _("{btn} click", btn=_(BTN_NAMES[code]))
+    return key_label(code, event)
+
 
 def key_label(code, event=None):
     """Nome amigável para um código evdev capturado do teclado."""
@@ -1075,16 +1102,23 @@ class KeyCatcher(QPushButton):
     modificador, numérico e seta)."""
     changed = Signal()
 
-    def __init__(self, code=57, name="Space"):
+    def __init__(self, code=57, name="Space", allow_mouse=False):
         super().__init__()
         self.code, self.name = code, name
+        self.allow_mouse = allow_mouse
         self._arming = False
         self.clicked.connect(self._arm)
-        self.setToolTip(_("Click, then press the key you want"))
+        self.setToolTip(_("Click, then press the key you want")
+                        if not allow_mouse else
+                        _("Click, then press a key or a mouse button"))
         self._refresh()
 
     def _refresh(self):
-        self.setText(_("Press a key…") if self._arming else self.name)
+        if not self._arming:
+            self.setText(self.name)
+        else:
+            self.setText(_("Press a key or a mouse button…") if self.allow_mouse
+                         else _("Press a key…"))
 
     def _arm(self):
         self._arming = True
@@ -1099,7 +1133,7 @@ class KeyCatcher(QPushButton):
 
     def set_key(self, code, name=None):
         self.code = code
-        self.name = name or key_label(code)
+        self.name = name or trigger_label(code)
         self._arming = False
         self._refresh()
         self.changed.emit()
@@ -1112,7 +1146,28 @@ class KeyCatcher(QPushButton):
             self._disarm()
             return
         self.releaseKeyboard()
-        self.set_key(code, key_label(code, event))
+        self.set_key(code, trigger_label(code, event))
+
+    def mousePressEvent(self, event):
+        """Armado e com allow_mouse, o clique no campo vira a escolha. É o que
+        faltava para "segurar o botão esquerdo e repetir E": o gatilho é um
+        botão, e não havia onde dizer isso sem passar pelo modo certo."""
+        if not (self._arming and self.allow_mouse):
+            return super().mousePressEvent(event)
+        code = QT_BUTTONS.get(event.button())
+        if code is None:
+            return super().mousePressEvent(event)
+        self.releaseKeyboard()
+        self.set_key(code, trigger_label(code))
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        # sem isso o release do clique que acabou de ser capturado re-arma o
+        # campo, porque QPushButton emite clicked() no release
+        if self.allow_mouse and not self._arming:
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class KeyRow(QWidget):
@@ -1399,8 +1454,43 @@ TRANSLATIONS = {
         "Key:": "Tecla:", "Action:": "Ação:", "Mode:": "Modo:",
         "Start delay:": "Atraso ao iniciar:",
         "Auto-stop after:": "Parar sozinho após:",
+        "Arm/disarm hotkey:": "Atalho de armar/desarmar:",
+        "Trigger:": "Gatilho:",
+        "{btn} click": "clique {btn}",
+        "Runs while the trigger is held": "Age enquanto o gatilho é segurado",
+        "Press a key or a mouse button…": "Aperte uma tecla ou um botão…",
+        "Click, then press a key or a mouse button":
+            "Clique e aperte a tecla ou o botão que quiser",
+        "ARMED — hold {trig}": "ARMADO — segure {trig}",
+        "Arm, then hold {trig}: it is captured and becomes the click stream. "
+        "{hk} arms/disarms; Esc disarms.":
+            "Arme e segure {trig}: ele é capturado e vira o fluxo de cliques. "
+            "{hk} arma/desarma; Esc desarma.",
+        "Arm, then hold {trig} and it runs; let go and it stops. "
+        "{hk} arms/disarms; Esc disarms.":
+            "Arme e segure {trig}: ele roda; solte e para. "
+            "{hk} arma/desarma; Esc desarma.",
+        "{hk} also types: it arms and disarms every time you press it in any "
+        "window. Pick a key that types nothing (F6-F12, Insert, Pause, "
+        "ScrollLock).":
+            "{hk} também digita: ela arma e desarma toda vez que for apertada, "
+            "em qualquer janela. Escolha uma tecla que não escreve nada "
+            "(F6-F12, Insert, Pause, ScrollLock).",
         "Global hotkey:": "Atalho global:",
         "Left": "Esquerdo", "Right": "Direito", "Middle": "Meio",
+        "Side": "Lateral", "Extra": "Lateral 2",
+        "Mouse button:": "Botão do mouse:",
+        "Hold {hk} and it runs; let go and it stops. No need to press Start "
+        "first — the hotkey is watched the whole time.":
+            "Segure {hk} e ele roda; solte e ele para. Não precisa apertar "
+            "Start antes: o atalho fica sendo ouvido o tempo todo.",
+        "{hk} also types: as a toggle it fires every time you press it in any "
+        "window. Use it with a 'while held' mode, or pick a key that types "
+        "nothing (F6-F12, Insert, Pause, ScrollLock).":
+            "{hk} também digita: como liga/desliga ela dispara toda vez que "
+            "você a aperta, em qualquer janela. Use com um modo 'enquanto "
+            "segura', ou escolha uma tecla que não escreve nada (F6-F12, "
+            "Insert, Pause, ScrollLock).",
         "Repeat": "Repetir", "Hold": "Segurar",
         "Arm": "Armar",
         "Trigger is the {btn} mouse button: arming runs nothing until you "
@@ -1429,9 +1519,6 @@ TRANSLATIONS = {
         "Two rows use the same key; only the first one runs.":
             "Duas linhas usam a mesma tecla; só a primeira roda.",
         "No trigger (hotkey toggles)": "Sem gatilho (o atalho liga/desliga)",
-        "Runs while hotkey is held": "Age enquanto o atalho é segurado",
-        "Runs while mouse button is held":
-            "Age enquanto o botão do mouse é segurado",
         "never": "nunca", "Rescan mice": "Reprocurar mouses",
         "Sound feedback on hotkey": "Som ao acionar o atalho",
         "Start with system": "Iniciar com o sistema",
@@ -1828,9 +1915,12 @@ def set_autostart(on):
 # ------------------------------------------------------------------ UI ------
 # "Runs" e não "Clicks": o modo gateia tudo o que estiver ligado — clique,
 # macro de teclado e tecla direcionada —, não só o clique.
+# Dois modos, não três. "enquanto o atalho" e "enquanto o botão" eram o mesmo
+# modo com gatilhos diferentes, e obrigavam a escolher o modo certo antes de
+# poder escolher o gatilho — que é onde todo mundo tropeçava. Agora o campo
+# Gatilho aceita os dois e o modo só diz se ele segura ou não.
 MODES = {"No trigger (hotkey toggles)": "toggle",
-         "Runs while hotkey is held": "hotkey_hold",
-         "Runs while mouse button is held": "mouse_hold"}
+         "Runs while the trigger is held": "hold"}
 CFG = os.path.join(XDG_CONFIG, "wayclick.json")
 
 
@@ -1907,13 +1997,18 @@ class App(QWidget):
         self.refresh_mice()
         self.dev.currentIndexChanged.connect(self._mouse_changed)
 
-        self.hk = QComboBox(); self.hk.addItems(KEYNAMES.keys())
-        self.hk.setCurrentText(cfg.get("hotkey", "F8"))
+        # qualquer tecla, capturada apertando, igual aos outros campos de
+        # tecla. A lista de 16 que existia aqui não deixava usar Q, E ou Shift
+        # como gatilho, que é exatamente o caso de "segurar X e repetir Y".
+        self.hk = KeyCatcher(cfg.get("hotkey_code")
+                             or KEYNAMES.get(cfg.get("hotkey", "F8"), 66),
+                             cfg.get("hotkey", "F8"))
         self.mode = QComboBox()
         for label, key in MODES.items():
             self.mode.addItem(_(label), key)
-        self.mode.setCurrentIndex(
-            max(0, self.mode.findData(cfg.get("mode", "toggle"))))
+        old = cfg.get("mode", "toggle")
+        self.mode.setCurrentIndex(max(0, self.mode.findData(
+            "hold" if old in ("hold", "hotkey_hold", "mouse_hold") else "toggle")))
         self.mode.currentIndexChanged.connect(self._mode_changed)
         self.sound = QCheckBox(_("Sound feedback on hotkey"))
         self.sound.setChecked(cfg.get("sound", True))
@@ -1962,10 +2057,17 @@ class App(QWidget):
         self.key_box.toggled.connect(self._key_box_toggled)
         self.click_box.toggled.connect(self._click_box_toggled)
 
-        # Quem o gatilho segura. Sem isso o modo é tudo ou nada, e "segurar o
-        # botão para clicar, com a macro rodando o tempo todo" — ou o contrário
-        # — não existia. Só vale no mouse_hold: os outros modos decidem a
-        # rodada inteira, não o que roda dentro dela.
+        # O gatilho: uma tecla OU um botão do mouse, capturado apertando. Era
+        # a pergunta que a UI não respondia — "quero o clique esquerdo" não
+        # tinha onde ser dito sem antes acertar o modo, e o campo do atalho,
+        # que é o nome óbvio para procurar, só aceitava tecla.
+        #
+        # Abaixo dele, quem o gatilho segura: sem isso o modo é tudo ou nada, e
+        # "segurar o botão para clicar com a macro rodando o tempo todo" — ou o
+        # contrário — não existia.
+        self.trigger = KeyCatcher(*self._trigger_spec(cfg), allow_mouse=True)
+        self.trigger.changed.connect(self._trigger_changed)
+
         self.trig_boxes = {}
         scope_row = QHBoxLayout()
         scope = cfg.get("trigger_scope") or {}
@@ -1981,10 +2083,11 @@ class App(QWidget):
 
         form = QFormLayout()
         self._row(form, "Mode:", self.mode)
+        self.trig_lbl = self._row(form, "Trigger:", self.trigger)
         self.scope_lbl = self._row(form, "Trigger holds:", scope_row)
         self._row(form, "Start delay:", self.delay)
         self._row(form, "Auto-stop after:", self.duration)
-        self._row(form, "Global hotkey:", self.hk)
+        self._row(form, "Arm/disarm hotkey:", self.hk)
         trigger_form = form
 
         # --- injeção direcionada a uma janela (beta) ---
@@ -2100,15 +2203,15 @@ class App(QWidget):
         self._paint_status()
 
         # atalho global
-        self.watcher = HotkeyWatcher(KEYNAMES[self.hk.currentText()])
+        self.watcher = HotkeyWatcher(self.hk.code)
         self.watcher.pressed.connect(self.on_press)
         self.watcher.released.connect(self.on_release)
         self.watcher.start()
-        self.hk.currentTextChanged.connect(self.on_hotkey_change)
+        self.hk.changed.connect(self.on_hotkey_change)
 
         # fallback só com a janela em foco; desligado quando o global funciona,
         # senão a mesma tecla dispararia duas vezes e se anularia
-        self.local_sc = QShortcut(QKeySequence(self.hk.currentText()), self)
+        self.local_sc = QShortcut(self._hk_sequence(), self)
         self.local_sc.setContext(Qt.ApplicationShortcut)
         self.local_sc.activated.connect(lambda: self.set_running(not self.running))
         self.local_sc.setEnabled(not self.watcher.ok)
@@ -2123,7 +2226,8 @@ class App(QWidget):
         self._remain = 0
 
         self.beeper = Beeper()
-        self.holder = None      # MouseHold, só no modo "mouse_hold"
+        self.holder = None      # MouseHold, quando o gatilho é botão
+        self.trig_watcher = None  # HotkeyWatcher, quando o gatilho é tecla
         self.bridge = None      # KWinBridge, criado sob demanda
         self.xinject = None     # XInject, para janelas X11
         self.target_hits = 0
@@ -2177,29 +2281,28 @@ class App(QWidget):
         if self.warn.text() and not getattr(self, "_hinted", False):
             return
         self._hinted = True
-        hk, btn = self.hk.currentText(), self.btn_sel.currentText()
-        if self.mode_key() == "mouse_hold" and self.click_box.isChecked():
-            self.warn.setText(_(
-                "Hold mode: while armed, your {btn} mouse button is captured "
-                "and turned into the click stream — hold it to autoclick, "
-                "release to stop. {hk} arms/disarms; Esc disarms.",
-                btn=btn.lower(), hk=hk))
-        elif self.mode_key() == "mouse_hold":
-            self.warn.setText(_(
-                "Trigger is the {btn} mouse button: arming runs nothing until "
-                "you hold it. To run the moment you press Arm, set Mode to "
-                "'No trigger' — or untick it under 'Trigger holds'.",
-                btn=btn.lower()))
-        elif self.mode_key() == "hotkey_hold":
-            self.warn.setText(_(
-                "Trigger is {hk} held down: arming runs nothing until you hold "
-                "it. To run the moment you press Arm, set Mode to "
-                "'No trigger'.", hk=hk))
-        else:
+        hk, trig = self.hk.name, self.trigger.name
+        if self.mode_key() != "hold":
             self.warn.setText(_(
                 "Move the cursor off this window before starting — otherwise "
                 "it clicks itself. That is what the {d}s start delay is for. "
                 "{hk} toggles; Esc stops.", d=self.delay.value(), hk=hk))
+        elif self._should_swallow():
+            self.warn.setText(_(
+                "Arm, then hold {trig}: it is captured and becomes the click "
+                "stream. {hk} arms/disarms; Esc disarms.", trig=trig, hk=hk))
+        else:
+            self.warn.setText(_(
+                "Arm, then hold {trig} and it runs; let go and it stops. "
+                "{hk} arms/disarms; Esc disarms.", trig=trig, hk=hk))
+        # o atalho liga e desliga em QUALQUER janela, lido do /dev/input: numa
+        # tecla que também escreve, cada vez que ela for digitada em qualquer
+        # lugar a macro liga ou desliga
+        if not is_button(self.hk.code) and self.hk.code not in SAFE_HOTKEYS:
+            self.warn.setText(self.warn.text() + "\n" + _(
+                "{hk} also types: it arms and disarms every time you press it "
+                "in any window. Pick a key that types nothing (F6-F12, Insert, "
+                "Pause, ScrollLock).", hk=hk))
 
     def _page(self, enable, form, hint=None, extra=None):
         """Uma aba: caixa de habilitar (quando a aba é uma engine), o
@@ -2595,7 +2698,9 @@ class App(QWidget):
         que fez a macro de teclado parecer quebrada: o usuário aperta, nada
         acontece, e a explicação está numa aba que ele não tinha por que abrir.
         """
-        return _("Arm") if self.mode_key() != "toggle" else _("Start")
+        # com gatilho, apertar não começa nada: deixa o gatilho valer. Sem
+        # gatilho, começa mesmo. O botão diz qual dos dois vai acontecer.
+        return _("Arm") if self.mode_key() == "hold" else _("Start")
 
     def _sync_start_label(self):
         if not hasattr(self, "btn"):
@@ -2710,6 +2815,9 @@ class App(QWidget):
             if self.holder:
                 self.holder.stop()
                 self.holder = None
+            if self.trig_watcher:
+                self.trig_watcher.stop()
+                self.trig_watcher = None
             self._state = ""
             self._show_status()
             self._sync_start_label()
@@ -2735,12 +2843,11 @@ class App(QWidget):
                 if box.isChecked()}
 
     def _gated_engines(self):
-        """O que o gatilho segura. Só o mouse_hold gateia DENTRO da rodada; nos
-        outros modos o gatilho decide a rodada inteira, e escopo não se
-        aplica."""
+        """O que o gatilho segura. Sem modo que segura não há gatilho, então
+        não há nada segurado — e tudo parte assim que se aperta Start."""
         enabled = self._enabled_engines()
-        if self.mode_key() != "mouse_hold":
-            return enabled
+        if self.mode_key() != "hold":
+            return set()
         return {n for n, box in self.trig_boxes.items()
                 if box.isChecked()} & enabled
 
@@ -2758,23 +2865,47 @@ class App(QWidget):
             self._state = "run"
             self._show_status()
             self._paint_status()
-        elif self.mode_key() == "mouse_hold":
-            self._arm_hold()
+        elif is_button(self.trigger.code):
+            self._arm_hold()             # botão do mouse: precisa da captura
         else:
-            self._start_engines(gated)
+            self._arm_key_trigger()      # tecla: basta escutar o /dev/input
+
+    def _should_swallow(self):
+        """Engolir o gatilho só quando o Clicker reemite ESSE botão: preso ao
+        gatilho e sendo o mesmo botão que se clica. Gatilho num botão diferente
+        (segurar o lateral para clicar com o esquerdo) não tem quem o reemita,
+        e engoli-lo mataria o botão do usuário enquanto armado."""
+        return ("click" in self._gated_engines()
+                and self.trigger.code == BTN[self.btn_sel.currentData()])
 
     def _arm_hold(self):
         path = self.selected_mouse()[0]
-        # engolir o gatilho só quando é o Clicker que o substitui
-        self.holder = MouseHold(self.mouse, BTN[self.btn_sel.currentData()],
+        self.holder = MouseHold(self.mouse, self.trigger.code,
                                 only=[path] if path else None,
-                                swallow="click" in self._gated_engines())
+                                swallow=self._should_swallow())
         self.holder.pressed.connect(self._trigger_pressed)
         self.holder.released.connect(self._hold_released)
         self.holder.failed.connect(self._hold_failed)
         if not self.holder.start():
             self.holder = None
             return
+        self._state = "armed"
+        self._show_status()
+        self._paint_status()
+
+    def _arm_key_trigger(self):
+        """Gatilho numa tecla: um segundo watcher no /dev/input, vivo só
+        enquanto armado. Nada de capturar o mouse, que aqui não faz falta."""
+        if self.trig_watcher:
+            self.trig_watcher.stop()
+        self.trig_watcher = HotkeyWatcher(self.trigger.code)
+        if not self.trig_watcher.ok:
+            self.trig_watcher = None
+            self._hold_failed("no access to /dev/input")
+            return
+        self.trig_watcher.pressed.connect(self._trigger_pressed)
+        self.trig_watcher.released.connect(self._hold_released)
+        self.trig_watcher.start()
         self._state = "armed"
         self._show_status()
         self._paint_status()
@@ -2822,6 +2953,22 @@ class App(QWidget):
 
     # -------------------------------------------------- teclas da macro --
     MAX_KEYS = 8
+
+    @staticmethod
+    def _trigger_spec(cfg):
+        """(código, nome) do gatilho. A config antiga guardava o gatilho em dois
+        lugares diferentes conforme o modo: o botão em trigger_button/button, a
+        tecla em hotkey. Ler os dois evita perder o que já estava configurado."""
+        code = cfg.get("trigger_code")
+        if not code:
+            old = cfg.get("mode", "toggle")
+            if old == "hotkey_hold":
+                code = cfg.get("hotkey_code") or KEYNAMES.get(
+                    cfg.get("hotkey", "F8"), KEYNAMES["F8"])
+            else:
+                code = BTN.get(cfg.get("trigger_button")
+                               or cfg.get("button", "Left"), BTN["Left"])
+        return code, cfg.get("trigger_name") or trigger_label(code)
 
     @staticmethod
     def _key_specs(cfg):
@@ -2936,7 +3083,15 @@ class App(QWidget):
         """Sem clique preso ao gatilho não há quem reemita o botão: o relay tem
         que deixá-lo passar, senão o botão do usuário morre enquanto armado."""
         if self.holder:
-            self.holder.swallow = "click" in self._gated_engines()
+            self.holder.swallow = self._should_swallow()
+
+    def _trigger_changed(self, _i=0):
+        if not hasattr(self, "warn"):
+            return                      # ainda montando a janela
+        self.set_running(False)
+        self._hinted = False
+        self.warn.setText("")
+        self._hint()
 
     def _scope_changed(self, _on=False):
         """Mudar o escopo com algo armado refaz o arranjo: mais simples, e mais
@@ -2947,10 +3102,11 @@ class App(QWidget):
         self._sync_tabs()
 
     def _sync_scope(self):
-        """Escopo só existe no mouse_hold: nos outros modos o gatilho decide a
-        rodada inteira, não o que roda dentro dela."""
-        on = self.mode_key() == "mouse_hold"
+        """Gatilho e escopo só existem quando há um modo que segura."""
+        on = self.mode_key() == "hold"
         self.scope_lbl.setEnabled(on)
+        self.trig_lbl.setEnabled(on)
+        self.trigger.setEnabled(on)
         for box in self.trig_boxes.values():
             box.setEnabled(on)
 
@@ -3141,8 +3297,7 @@ class App(QWidget):
     def _show_status(self):
         state = getattr(self, "_state", "")
         if state == "armed":
-            txt = "◆ " + _("ARMED — hold {btn} mouse button",
-                           btn=self.btn_sel.currentText().lower())
+            txt = "◆ " + _("ARMED — hold {trig}", trig=self.trigger.name)
             free = self._running_parts()
             if free:                    # o que o gatilho não segura já roda
                 txt += "  (" + " + ".join(free) + ")"
@@ -3172,19 +3327,30 @@ class App(QWidget):
 
     # ------------------------------------------------------------ atalho --
     def on_press(self):
-        if self.mode_key() == "hotkey_hold":
-            self.set_running(True)
-        else:
-            self.set_running(not self.running)
+        """O atalho liga e desliga, e só. Quem gateia é o Gatilho: separar os
+        dois é o que permite 'armar com F8, rodar segurando o botão esquerdo'
+        sem que um papel atrapalhe o outro."""
+        self.set_running(not self.running)
 
     def on_release(self):
-        if self.mode_key() == "hotkey_hold":
-            self.set_running(False)
+        pass
 
-    def on_hotkey_change(self, text):
-        self.watcher.set_key(KEYNAMES[text])
-        self.local_sc.setKey(QKeySequence(text))
-        self.local_sc.setEnabled(not self.watcher.ok)
+    def _hk_sequence(self):
+        """QKeySequence do atalho, para o fallback que só vale com a janela em
+        foco. Nem todo nome de tecla tem equivalente no Qt ('Left Shift' não
+        tem); quando não tem, o fallback simplesmente não existe, o que é bem
+        melhor do que um atalho que dispara na tecla errada."""
+        seq = QKeySequence(self.hk.name)
+        return seq if not seq.isEmpty() else QKeySequence()
+
+    def on_hotkey_change(self, _text=None):
+        self.watcher.set_key(self.hk.code)
+        seq = self._hk_sequence()
+        self.local_sc.setKey(seq)
+        self.local_sc.setEnabled(not self.watcher.ok and not seq.isEmpty())
+        self._hinted = False
+        self.warn.setText("")
+        self._hint()
 
     # Limpeza via aboutToQuit e não closeEvent: sobrescrever closeEvent faz o
     # shiboken embrulhar o QCloseEvent, o que segfaulta no PySide6 + Python
@@ -3201,6 +3367,9 @@ class App(QWidget):
         if self.bridge:
             self.bridge.cleanup()
         self.watcher.stop()
+        if self.trig_watcher:
+            self.trig_watcher.stop()
+            self.trig_watcher = None
         if self.keyboard:
             self.keyboard.close()
             self.keyboard = None
@@ -3213,7 +3382,10 @@ class App(QWidget):
                            "button": self.btn_sel.currentData(),
                            "delay": self.delay.value(),
                            "duration": self.duration.value(),
-                           "hotkey": self.hk.currentText(),
+                           "trigger_code": self.trigger.code,
+                           "trigger_name": self.trigger.name,
+                           "hotkey": self.hk.name,
+                           "hotkey_code": self.hk.code,
                            "mode": self.mode_key(),
                            "sound": self.sound.isChecked(),
                            "mouse_name": self.selected_mouse()[1],

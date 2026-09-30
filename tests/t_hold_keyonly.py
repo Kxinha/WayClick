@@ -64,7 +64,8 @@ row = w.key_rows[0]
 row.catcher.set_key(a.KEYS["Space"], "Space")
 row.interval.setValue(100.0)
 row.mode.setCurrentText("Repeat")
-w.mode.setCurrentText("Runs while mouse button is held")
+w.mode.setCurrentText("Runs while the trigger is held")
+w.trigger.set_key(a.BTN["Left"])        # gatilho: botao esquerdo
 w.delay.setValue(0); w.duration.setValue(0)
 
 R = {}
