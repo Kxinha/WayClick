@@ -22,6 +22,10 @@ compositor e sem nada rodando como root.
 - **Modo segurar** — só clica enquanto você segura o botão do mouse
 - **Macro de teclado** — até oito teclas ao mesmo tempo, cada uma capturada
   como se define um atalho e com o seu próprio intervalo; repetindo ou segurando
+- **Macros com atalho, estilo AutoHotkey**: cada macro com o seu atalho (tecla
+  ou botão do mouse, com modificadores), liga e desliga, enquanto segura, uma
+  vez ou sempre, uma lista de passos, e o atalho escondido do jogo como o
+  AutoHotkey faz. **Importar AHK** transforma um script `.ahk` em macros
 - **Mandar tecla para uma janela** — escolha uma janela aberta e alimente ela
   com uma tecla; em alvo X11 chega sem mexer no foco, mesmo minimizada
 - **Anti-AFK** — mexe o ponteiro e devolve, com deriva zero
@@ -131,12 +135,14 @@ python3 wayclick.py
 ```bash
 wayclick            # normal
 wayclick --tray     # começa escondido na bandeja
+wayclick --import script.ahk --dry-run   # no que um script do AutoHotkey vira
 wayclick --version
 ```
 
-São quatro abas: **Clique**, **Teclado** e **Janela** são as três coisas que ele
-pode executar — cada uma tem sua caixa de habilitar, e a aba ganha um ponto
-quando está ligada, então dá para ver o que está armado sem abrir. Habilite
+São cinco abas. **Atalhos** guarda os macros estilo AutoHotkey, que rodam nos
+próprios atalhos e não precisam do Iniciar. **Clique**, **Teclado** e
+**Janela** são as três coisas que o Iniciar executa. Cada uma tem sua caixa de
+habilitar, e a aba ganha um ponto quando está ligada, então dá para ver o que está armado sem abrir. Habilite
 qualquer combinação. **Acionamento** é como tudo liga e desliga, mais o
 Anti-AFK, que roda por fora do Iniciar/Parar. O status e o botão Iniciar ficam
 sempre visíveis abaixo das abas, e a janela cabe numa tela de 1366×768.
@@ -197,6 +203,91 @@ Uma coisa esperada no `Segurar`: manter uma tecla normal pressionada aciona a
 repetição automática do próprio sistema, igualzinho a segurar no teclado.
 Modificadores (Shift, Ctrl, Alt, Super) não repetem, então ficam limpos.
 
+### Atalhos (estilo AutoHotkey)
+
+O que o AutoHotkey faz no Windows, para o Wayland: cada **macro** tem o seu
+atalho e roda de qualquer janela, com o foco onde estiver, mesmo com o WayClick
+parado. Vários convivem, como vários scripts `.ahk` rodando juntos, e cada um
+ganha uma marca na lista enquanto roda (mais um ⚡ na linha de status e o
+ícone da bandeja animado).
+
+Um macro é
+
+- um **atalho**: qualquer tecla ou botão do mouse, definido apertando,
+  opcionalmente com Ctrl, Shift, Alt ou Super. Modificador a mais não
+  atrapalha: um macro no `F1` continua disparando enquanto você segura Shift
+  para correr. Quando dois macros dividem a tecla, `Ctrl+F1` ganha de `F1`
+  enquanto o Ctrl está apertado.
+- **Esconder o atalho dos outros programas**: ligado por padrão, como no
+  AutoHotkey, então o jogo nunca vê o `F1` que você apertou. Desligado, a
+  tecla também faz o que faria normalmente (o prefixo `~` do AutoHotkey).
+- um **modo**: *Liga e desliga* (aperte para começar, de novo para parar),
+  *Enquanto segura* (para assim que você solta), *Uma vez por aperto*, ou
+  *Sempre* (sem atalho, roda sempre que os macros estão habilitados; bom para
+  uma tecla contra inatividade a cada minuto).
+- **Repetir os passos a cada N ms**, contado de início a início como o
+  `SetTimer`, ou assim que acabarem. **Tempo de cada toque** é quanto cada
+  toque fica apertado; *automático* é 40 ms ou metade do tempo de repetição,
+  porque jogos leem as teclas uma vez por quadro e perdem toque curto demais.
+- **passos**, em ordem: tocar uma tecla ou clicar (N vezes), segurar, soltar,
+  esperar (exato, ou um tempo aleatório entre dois valores), digitar texto,
+  girar a roda, mover o ponteiro uma distância.
+
+O que um macro segura é solto quando ele para, quando você o desabilita e
+quando o WayClick fecha. Um modificador que você segura para o atalho é solto
+antes dos passos, como o AutoHotkey faz, então `Alt+A` mandando `Ctrl+C` chega
+como `Ctrl+C` e não `Ctrl+Alt+C`. Abrir o editor pausa os macros, para dar
+para escolher um atalho que um macro rodando já usa.
+
+**Importar AHK…** lê um arquivo `.ahk` (v1 ou v2) e transforma os atalhos dele
+em macros, mostrando antes no que cada um virou e o que não deu para converter,
+com o número da linha. Não é um interpretador de AutoHotkey; ele reconhece os
+padrões que scripts de jogo usam:
+
+| No script | Vira |
+|---|---|
+| `F1::` + `toggle := !toggle` + `SetTimer, Label, 50` / `Off` | Liga e desliga, a cada 50 ms |
+| `SetTimer(Func, t ? 50 : 0)`, `% toggle ? 1 : "Off"` | Liga e desliga, a cada 50 / 1 ms |
+| `while toggle { ... }`, `Loop { if !toggle break ... }` | Liga e desliga, passos em laço |
+| `while GetKeyState("X", "P") { ... }`, `if state = U break` | Enquanto segura |
+| `Send {RButton down}`, `KeyWait`, `{RButton up}` | Enquanto segura, botão apertado |
+| `a::b`, `CapsLock::Ctrl` | Enquanto segura, um remapeamento |
+| `F5:: Send ..., Click, Sleep, Loop 3 { }` | Uma vez por aperto |
+| `SetTimer` na seção de auto execução | Sempre |
+| `Send` com `{Tecla down}`, `{Tecla up}`, `{Tecla N}`, `^!+#`, texto, `{Click}`, `{WheelDown N}`; `Click`, `Sleep`, `Random`, `MouseMove ..., R`, `Gosub`, funções, atalhos empilhados, `$`, `*`, `~`, nomes `sc`/`vk`, `SetKeyDelay` | os passos correspondentes |
+
+Hotstrings, atalhos `Tecla Up`, combinações `A & B`, condições de janela `#If`
+(o atalho passa a valer em todas as janelas), cliques em coordenadas da tela (o
+Wayland não deixa posicionar o ponteiro) e programação em geral são avisados e
+ignorados.
+
+O script anexado ao primeiro pedido desta função importa como *F1, liga e
+desliga, a cada 1 ms, tocar E*:
+
+```ahk
+F1::
+toggle := !toggle
+if (toggle)
+        SetTimer, SpamE, 1
+else
+        SetTimer, SpamE, Off
+return
+
+SpamE:
+Send, e
+return
+```
+
+Uma diferença honesta: no Windows o AutoHotkey arredonda o `SetTimer` para 10
+ou 15,6 ms, então esse script apertava E umas 64 vezes por segundo. O WayClick
+roda o 1 ms que foi pedido, 1.000 vezes por segundo (medido: mediana de 1,000
+ms entre toques). O relatório da importação avisa isso; aumente o tempo no
+macro se algum jogo perder teclas nesse ritmo.
+
+No terminal, `wayclick --import script.ahk --dry-run` mostra o mesmo relatório,
+e sem `--dry-run` acrescenta os macros na config (com o WayClick fechado, já
+que um WayClick aberto grava a própria lista ao sair).
+
 ### Acionamento
 
 **Modo**
@@ -233,7 +324,9 @@ primeiro, senão o autoclicker clica no próprio botão Parar.
 a que estiver em foco. Definido apertando, igual a todo o resto, então qualquer
 tecla serve; o campo avisa quando você escolhe uma que também digita, porque
 ela armaria e desarmaria toda vez que fosse apertada em qualquer lugar. `Esc`
-sempre para, com a janela em foco.
+sempre para, com a janela em foco. **Esconder dos outros programas** continua
+armando e desarmando, mas a tecla não chega ao jogo, como o AutoHotkey esconde
+os atalhos dele; vem desligado, para nada mudar para quem já usa.
 
 Ele não é o gatilho. Armar faz o gatilho valer, e o gatilho é quem roda as
 coisas — que é o que permite "armar no F8 e rodar segurando o clique esquerdo"
@@ -326,9 +419,23 @@ Então o WayClick age uma camada abaixo do compositor.
 kernel. O libinput reconhece, o compositor trata como hardware, e os cliques
 caem onde o cursor estiver. Para chegar a 10.000 cliques/s, a sequência
 press/SYN/release/SYN sai em um único `write()`, e o laço usa deadline absoluto:
-dorme o grosso do intervalo e queima os últimos ~100 µs em busy-wait, porque a
-granularidade do sleep do sistema sozinha não alcança precisão de
-sub-milissegundo.
+dorme o grosso do intervalo e, só abaixo de 1 ms, queima as últimas centenas de
+µs em busy-wait, porque a granularidade do sleep do sistema sozinha não alcança
+precisão de sub-milissegundo. De 1 ms para cima ele só dorme (período medido
+com mediana de 1,000 ms), porque busy-wait segura a GIL do Python e deixaria
+sem vez a thread que repassa o seu teclado.
+
+**Esconder um atalho.** O compositor não tem API para engolir uma tecla, então
+o WayClick faz como o modo segurar faz com o mouse: uma thread de entrada lê
+todos os teclados, e quando algum atalho precisa sumir ela pega um
+`EVIOCGRAB` naquele teclado e repassa todo o resto por um clone virtual com o
+mesmo nome, ids, teclas e LEDs (o KDE mantém o seu layout e o Caps Lock
+continua acendendo). A captura só acontece com nenhuma tecla apertada, senão o
+compositor veria o aperto e nunca o soltar, e o que ainda estiver apertado
+quando ela solta é solto no clone. Atraso do relay medido em 0,04 ms de
+mediana, também com um macro de 1 ms rodando. Todos os macros, o atalho de
+armar e o modo segurar dividem esse único leitor, e é por isso que capturar o
+teclado não deixa os outros surdos.
 
 **Atalho global** — lê `/dev/input/event*` direto, único jeito de enxergar
 teclas que não estão indo para a sua janela. Teclados criados por remapeadores
@@ -385,7 +492,23 @@ teclado apertando uma tecla de movimento.
 ## Testes
 
 Os arquivos em `tests/` são verificações executáveis, não testes unitários —
-eles criam dispositivos de entrada falsos e medem comportamento real. Rode a
+eles criam dispositivos de entrada falsos e medem comportamento real.
+
+Estes quatro são isolados e podem rodar enquanto você usa o desktop, até com
+um jogo aberto: o WayClick só abre devices com `wctest` no nome, o teclado e o
+mouse falsos são capturados antes do primeiro evento, e todo device virtual
+que o WayClick cria é capturado pelo teste no instante em que aparece, que é
+também como o teste lê o que teria chegado ao compositor (veja
+`tests/harness.py`). Sem root.
+
+```bash
+python3 tests/t_ahk_import.py                       # o importador nos scripts de tests/ahk
+sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk a 1 ms, todos os modos, esconder, relay
+sg input -c "python3 tests/t_hotkeys_ui.py"         # a aba Atalhos de ponta a ponta, config, --import
+sg input -c "python3 tests/t_clicker_timing.py"     # período do Clicker e relay do teclado juntos
+```
+
+Rode com `QT_QPA_PLATFORM=offscreen`. Os outros precisam do compositor; rode a
 partir da raiz do projeto:
 
 ```bash

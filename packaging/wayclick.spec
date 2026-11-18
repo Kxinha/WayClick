@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.5.0
+Version:        1.6.0
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -71,6 +71,16 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Wed Nov 18 2026 gabrielmf1998 <noreply@github.com> - 1.6.0-1
+- Hotkey macros in the AutoHotkey style: each with its own hotkey, toggle,
+  while held, once or always, and a list of steps
+- The hotkey can be hidden from the game, like AutoHotkey does
+- Import AHK turns the hotkeys of a .ahk script (v1 or v2) into macros;
+  also wayclick --import FILE [--dry-run]
+- The arm hotkey can be hidden from other apps too
+- One input reader shared by every hotkey, relaying grabbed keyboards
+- Timers sleep instead of spinning from 1 ms up, so nothing starves the relay
+
 * Tue Sep 30 2026 gabrielmf1998 <noreply@github.com> - 1.5.0-1
 - One Trigger field: any key or any mouse button, set by pressing it
 - Two trigger modes instead of three; the trigger decides how it listens

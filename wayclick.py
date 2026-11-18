@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """WayClick — autoclicker para Wayland via /dev/uinput (kernel), sem X11."""
-import ctypes, fcntl, glob, grp, json, math, os, pwd, re, select, shlex, shutil
-import struct
+import ctypes, fcntl, glob, grp, json, math, os, pwd, random, re, select
+import shlex, shutil, struct
 import signal, subprocess, sys, tempfile, threading, time, urllib.request
 import wave
 
@@ -13,12 +13,16 @@ try:
                                QKeySequence, QPainter, QPainterPath, QPen,
                                QPixmap,
                                QShortcut)
-    from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
+    from PySide6.QtWidgets import (QAbstractItemView, QApplication,
+                                   QCheckBox, QComboBox, QDialog,
+                                   QDialogButtonBox, QFileDialog,
                                    QFormLayout, QDoubleSpinBox, QGroupBox,
-                                   QHBoxLayout, QLabel, QMenu, QMenuBar,
-                                   QMessageBox, QPushButton, QScrollArea,
-                                   QSpinBox, QSystemTrayIcon, QVBoxLayout,
-                                   QWidget, QFrame, QListView, QTabWidget)
+                                   QHBoxLayout, QLabel, QLineEdit,
+                                   QListWidget, QListWidgetItem, QMenu,
+                                   QMenuBar, QMessageBox, QPlainTextEdit,
+                                   QPushButton, QScrollArea, QSpinBox,
+                                   QSystemTrayIcon, QVBoxLayout, QWidget,
+                                   QFrame, QListView, QTabWidget)
 except ImportError:
     sys.exit("PySide6 is required.\n"
              "  Fedora/RHEL:   sudo dnf install python3-pyside6\n"
@@ -27,7 +31,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -190,9 +194,8 @@ class VirtualMouse:
         os.write(self.fd, dev)
         fcntl.ioctl(self.fd, UI_DEV_CREATE)
         self.node = self._own_node()
-        if self.node:
-            OWN_NODES.add(self.node)
-        time.sleep(0.4)  # deixa udev/libinput enumerarem o device
+        _own(self.node)
+        time.sleep(SETTLE_S)  # deixa udev/libinput enumerarem o device
 
     @staticmethod
     def _identity(fd):
@@ -243,12 +246,17 @@ class VirtualMouse:
         self._emit(EV_SYN, SYN_REPORT, 0)
 
     def close(self):
+        if self.fd < 0:                 # já fechado
+            return
+        if _HUB is not None:            # quem repassava por aqui solta antes
+            _HUB.forget(self)
         OWN_NODES.discard(self.node)
+        fd, self.fd = self.fd, -1
         try:
-            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+            fcntl.ioctl(fd, UI_DEV_DESTROY)
         except OSError:
             pass
-        os.close(self.fd)
+        os.close(fd)
 
 
 # teclado completo para a macro (códigos de linux/input-event-codes.h).
@@ -285,26 +293,32 @@ KEYS = {
 KB_NAME = b"wayclick-virtual-keyboard"
 
 
-class VirtualKeyboard:
-    """Teclado virtual no kernel, para a macro de teclas.
+# Energia, suspender, dormir e acordar ficam de fora do teclado virtual: um
+# macro importado com o código errado não pode desligar a máquina.
+KB_SKIP = {116, 142, 143, 205}
 
-    Declara todas as teclas de KEYS de uma vez, então trocar a tecla escolhida
-    não exige recriar o device.
+
+class VirtualKeyboard:
+    """Teclado virtual no kernel, para a macro de teclas e os macros com atalho.
+
+    Declara de uma vez todas as teclas comuns (1 a 248), então trocar a tecla
+    escolhida não exige recriar o device, e um macro importado do AutoHotkey
+    com uma tecla fora da lista da UI ainda funciona.
     """
 
     def __init__(self):
         self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
         fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
-        for code in set(KEYS.values()):
-            fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
+        for code in range(1, 249):
+            if code not in KB_SKIP:
+                fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
         os.write(self.fd, struct.pack("80s", KB_NAME)
                  + struct.pack("HHHH", 0x03, 0x1234, 0x5679, 1)
                  + struct.pack("i", 0) + b"\x00" * (4 * 64 * 4))
         fcntl.ioctl(self.fd, UI_DEV_CREATE)
         self.node = uinput_node(self.fd)
-        if self.node:
-            OWN_NODES.add(self.node)      # o watcher de atalho não pode nos ouvir
-        time.sleep(0.4)
+        _own(self.node)                   # o watcher de atalho não pode nos ouvir
+        time.sleep(SETTLE_S)
 
     @staticmethod
     def packet(code, value):
@@ -322,12 +336,17 @@ class VirtualKeyboard:
         os.write(self.fd, self.packet(code, 1 if down else 0))
 
     def close(self):
+        if self.fd < 0:                 # já fechado
+            return
+        if _HUB is not None:            # quem repassava por aqui solta antes
+            _HUB.forget(self)
         OWN_NODES.discard(self.node)
+        fd, self.fd = self.fd, -1
         try:
-            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+            fcntl.ioctl(fd, UI_DEV_DESTROY)
         except OSError:
             pass
-        os.close(self.fd)
+        os.close(fd)
 
 
 class AntiAfk(threading.Thread):
@@ -436,8 +455,12 @@ class Clicker(threading.Thread):
         super().__init__(daemon=True)
         self.mouse, self.limit = mouse, limit
         self.interval = max(interval_ms, 0.1) / 1000.0
-        # busy-wait curto: só o suficiente pra cobrir a granularidade do sleep
-        self.spin = min(self.SPIN_S, self.interval * 0.3)
+        # busy-wait curto: só o suficiente pra cobrir a granularidade do sleep,
+        # e só abaixo de 1 ms. Ele segura a GIL, e a thread que repassa o
+        # teclado capturado precisa dela: de 1 ms para cima o sleep sozinho já
+        # acerta (mediana 1,000 ms, p99 1,013 ms) sem atrasar ninguém.
+        self.spin = 0.0 if self.interval >= 0.001 else \
+            min(self.SPIN_S, self.interval * 0.3)
         # O botão precisa ficar baixo por um tempo real. Jogo não escuta evento,
         # ele pergunta "o botão está apertado?" a cada quadro; com press e
         # release colados, medimos 0 de 126 quadros pegando o botão baixo — o
@@ -567,7 +590,7 @@ def open_devices(match, only=None):
         except OSError:
             denied += 1
             continue
-        if match(f):
+        if not _filtered_out(f.fileno()) and match(f):
             files.append(f)
         else:
             f.close()
@@ -614,53 +637,704 @@ def reexec_with_input_group():
         pass
 
 
+# ------------------------------------------------------------- input hub ----
+# Um leitor só para todo teclado e mouse.
+#
+# Antes cada função abria os devices por conta própria, e isso funcionava
+# enquanto ninguém capturava teclado. EVIOCGRAB é exclusivo: quem captura vira
+# o ÚNICO a receber eventos daquele device. Bloquear a tecla de um atalho, que
+# é o que o AutoHotkey faz por padrão (F1:: some com o F1 do jogo), exige
+# capturar o teclado, e aí o atalho de armar, lendo o mesmo teclado por outro
+# fd, ficaria surdo. Com o hub, quem captura é ele, e todo mundo continua
+# ouvindo por ele.
+#
+# Quem quer algo se inscreve (HotkeyWatcher, MouseHold, MacroEngine) e
+# responde três perguntas: quer os mouses? quer capturar este device? e, a
+# cada tecla, se ela deve sumir. O que não some segue para o compositor por um
+# clone virtual do device capturado, com o mesmo nome e a mesma identidade.
+
+EVIOCGKEY = _ior(0x18, 96)               # bitmap das teclas apertadas agora
+EV_LED = 0x11
+UI_SET_LEDBIT = 0x40045569
+SYN_DROPPED = 3
+MSC_SCAN = 4
+SETTLE_S = 0.4                 # udev + libinput precisam disso para ver o device
+MODIFIERS = {"ctrl": (29, 97), "shift": (42, 54), "alt": (56, 100),
+             "super": (125, 126)}
+MOD_OF = {c: m for m, cs in MODIFIERS.items() for c in cs}
+MOD_LABEL = {"ctrl": "Ctrl", "shift": "Shift", "alt": "Alt", "super": "Super"}
+
+# Para a suíte de testes: só devices cujo nome contém isto são abertos, e cada
+# device virtual que o app cria é entregue a NEW_NODE_HOOK assim que nasce (o
+# teste o captura antes de qualquer evento, então nada chega ao desktop).
+DEVICE_FILTER = os.environ.get("WAYCLICK_DEVICE_FILTER", "").encode() or None
+NEW_NODE_HOOK = None
+GRAB_EVERYTHING = False        # testes: tudo passa pelo relay, nada vaza
+
+# Um campo de tecla esperando o aperto: atalho nenhum dispara nem some, senão
+# escolher F1 como tecla de um macro que já usa F1 seria impossível.
+CAPTURE = threading.Event()
+
+
+def _ev(etype, code, value):
+    return struct.pack(EVENT_FMT, 0, 0, etype, code, value)
+
+
+SYN = _ev(EV_SYN, SYN_REPORT, 0)
+
+
+def _own(node):
+    """Registra um device virtual nosso. O hub não o lê (o que a macro digita
+    não pode disparar atalho) e, nos testes, o gancho o captura na hora."""
+    if node:
+        OWN_NODES.add(node)
+        if NEW_NODE_HOOK is not None:
+            NEW_NODE_HOOK(node)
+
+
+def _filtered_out(fd):
+    return DEVICE_FILTER is not None and DEVICE_FILTER not in dev_name(fd)
+
+
+def keys_down(fd):
+    """Alguma tecla ou botão apertado agora neste device?"""
+    return any(_ioctl_buf(fd, EVIOCGKEY, 96))
+
+
+def key_state(fd):
+    bits = _ioctl_buf(fd, EVIOCGKEY, 96)
+    return {i * 8 + b for i, byte in enumerate(bits) if byte
+            for b in range(8) if byte >> b & 1}
+
+
+class CloneDevice:
+    """Cópia virtual de um device capturado: mesmo nome, mesma identidade,
+    mesmas teclas, botões, eixos e LEDs.
+
+    A identidade importa pelo mesmo motivo do clone do mouse: o KDE guarda
+    configuração por device. Os LEDs importam porque, com o teclado capturado,
+    é no clone que o compositor acende o Caps Lock; o hub repassa ao físico.
+    """
+
+    def __init__(self, src_fd):
+        self.fd = os.open("/dev/uinput", os.O_RDWR | os.O_NONBLOCK)
+        try:
+            name, ident = VirtualMouse._identity(src_fd)
+            for evtype, setter, nbytes in ((EV_KEY, UI_SET_KEYBIT, 96),
+                                           (EV_REL, UI_SET_RELBIT, 8),
+                                           (EV_MSC, UI_SET_MSCBIT, 8),
+                                           (EV_LED, UI_SET_LEDBIT, 8)):
+                bits = dev_bits(src_fd, evtype, nbytes)
+                codes = [c for c in range(nbytes * 8) if has_bit(bits, c)]
+                if not codes:
+                    continue
+                fcntl.ioctl(self.fd, UI_SET_EVBIT, evtype)
+                for c in codes:
+                    fcntl.ioctl(self.fd, setter, c)
+            os.write(self.fd, struct.pack("80s", name)
+                     + struct.pack("HHHH", *ident) + struct.pack("i", 0)
+                     + b"\x00" * (4 * 64 * 4))
+            fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        except OSError:
+            os.close(self.fd)
+            raise
+        self.name = name
+        self.node = uinput_node(self.fd)
+        _own(self.node)
+        self.ready_at = time.monotonic() + SETTLE_S
+
+    def close(self):
+        OWN_NODES.discard(self.node)
+        try:
+            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        except OSError:
+            pass
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+class HubDevice:
+    def __init__(self, path, f, kbd, phys, anym):
+        self.path, self.f, self.fd = path, f, f.fileno()
+        self.kbd = kbd                  # passa por is_keyboard
+        self.phys, self.anym = phys, anym   # mouse físico / qualquer ponteiro
+        self.mouse = False              # aberto porque alguém quer mouses
+        self.keybits = dev_bits(self.fd, EV_KEY)
+        self.writable = "+" in getattr(f, "mode", "")
+        self.grabbed = False
+        self.pending = False            # quer captura, esperando teclas soltas
+        self.out = None                 # para onde vai o que não for bloqueado
+        self.clone = None               # CloneDevice nosso, quando não há saída
+        self.frame = bytearray()
+        self.down = set()               # o que está apertado neste device
+        self.swallowed = set()          # apertos bloqueados: o release some junto
+        self.dropping = False
+        self.dead = False
+        self.grab_error = 0.0
+
+    def has(self, code):
+        return has_bit(self.keybits, code)
+
+
+class InputHub:
+    RESCAN_S = 3.0
+    PENDING_S = 0.03
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.subs = []
+        self.devs = {}
+        self.outputs = {}               # path -> saída fixa (o mouse do app)
+        self.denied = 0
+        self.mod_held = {}              # código do modificador -> {paths}
+        self._rejected = {}
+        self._closing = []
+        self._mice_spec = (False, frozenset())
+        self._rp, self._wp = os.pipe()
+        os.set_blocking(self._rp, False)
+        os.set_blocking(self._wp, False)
+        self._run = False
+        self._thread = None
+        self._next_scan = 0.0
+
+    # ------------------------------------------------------ inscrições --
+    def start(self):
+        if self._thread:
+            return
+        self._run = True
+        self.scan()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="wayclick-input")
+        self._thread.start()
+
+    def add(self, sub):
+        with self.lock:
+            if sub not in self.subs:
+                self.subs.append(sub)
+        self.scan()
+
+    def remove(self, sub):
+        with self.lock:
+            if sub in self.subs:
+                self.subs.remove(sub)
+        self.scan()
+
+    def changed(self):
+        self.scan()
+
+    def set_output(self, path, out):
+        with self.lock:
+            if out is None:
+                self.outputs.pop(path, None)
+            elif path:
+                self.outputs[path] = out
+            self._apply_grabs()
+        self._wake()
+
+    def forget(self, out):
+        """Uma saída vai ser fechada. Quem escrevia nela solta a captura na
+        hora: escrever num fd fechado, que o kernel pode reaproveitar para
+        outro arquivo, seria muito pior do que um mouse sem captura."""
+        with self.lock:
+            for path in [p for p, o in self.outputs.items() if o is out]:
+                del self.outputs[path]
+            for d in self.devs.values():
+                if d.grabbed and d.out is out:
+                    self._ungrab(d)
+            self._apply_grabs()
+        self._wake()
+
+    def lift_mods(self, mods):
+        """Solta, para o compositor, os modificadores do atalho que o usuário
+        está segurando. O AutoHotkey faz o mesmo antes de mandar as teclas:
+        sem isso, Alt+A que manda Ctrl+C chegaria ao programa como
+        Ctrl+Alt+C. O release físico, quando vier, some, porque já foi."""
+        codes = {c for m in mods for c in MODIFIERS.get(m, ())}
+        with self.lock:
+            for d in self.devs.values():
+                if not d.grabbed or d.out is None or d.dead:
+                    continue
+                up = sorted(c for c in d.down & codes if c not in d.swallowed)
+                if not up:
+                    continue
+                try:
+                    os.write(d.out.fd, b"".join(_ev(EV_KEY, c, 0) for c in up)
+                             + SYN)
+                except OSError:
+                    continue
+                d.swallowed.update(up)
+
+    # ------------------------------------------------------- consultas --
+    def keyboard_files(self):
+        with self.lock:
+            return [d.f for d in self.devs.values() if d.kbd and not d.dead]
+
+    def mods_active(self):
+        with self.lock:
+            return {MOD_OF[c] for c, paths in self.mod_held.items() if paths}
+
+    def mice_for(self, spec):
+        with self.lock:
+            return [d for d in self.devs.values()
+                    if not d.dead and self._mouse_match(d, spec)]
+
+    def device(self, path):
+        with self.lock:
+            return self.devs.get(path)
+
+    def _have_phys(self):
+        return any(d.phys for d in self.devs.values() if not d.dead)
+
+    def _mouse_match(self, d, spec):
+        if spec == "all":
+            return d.phys or (d.anym and not self._have_phys())
+        return bool(spec) and d.path in spec and d.anym
+
+    # ----------------------------------------------------------- devices --
+    def _mice_wanted(self):
+        all_, paths = False, set()
+        for s in self.subs:
+            m = getattr(s, "mice", None)
+            if m == "all":
+                all_ = True
+            elif m:
+                paths |= set(m)
+        return all_, frozenset(paths)
+
+    @staticmethod
+    def _open(path):
+        for mode in ("r+b", "rb"):
+            try:
+                return open(path, mode, buffering=0)
+            except OSError:
+                continue
+        return None
+
+    def scan(self):
+        """Abre o que interessa e ainda não está aberto, fecha o que deixou de
+        interessar e reaplica as capturas. Roda no início, a cada inscrição e
+        a cada RESCAN_S: teclado ou mouse plugado depois também vale."""
+        with self.lock:
+            spec = self._mice_wanted()
+            if spec != self._mice_spec:
+                self._mice_spec = spec
+                self._rejected.clear()
+            all_mice, mouse_paths = spec
+            present = event_paths()
+            for path in list(self.devs):
+                if path not in present:
+                    self._drop(self.devs[path])
+            denied, virtual = 0, []
+            for path in present:
+                if path in self.devs or path in OWN_NODES:
+                    continue
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                key = (st.st_rdev, st.st_ctime_ns)
+                if self._rejected.get(path) == key:
+                    continue
+                f = self._open(path)
+                if f is None:
+                    denied += 1
+                    continue
+                try:
+                    if _filtered_out(f.fileno()):
+                        raise ValueError
+                    kbd = is_keyboard(f)
+                    phys = is_mouse(f)
+                    anym = phys or is_mouse_any(f)
+                except (OSError, ValueError):
+                    f.close()
+                    self._rejected[path] = key
+                    continue
+                if kbd or (all_mice and phys) or (path in mouse_paths and anym):
+                    self.devs[path] = HubDevice(path, f, kbd, phys, anym)
+                elif all_mice and anym:
+                    virtual.append((path, f, key, kbd, phys, anym))
+                else:
+                    f.close()
+                    self._rejected[path] = key
+            # ponteiro virtual só entra quando não há mouse físico nenhum:
+            # quem usa remapeador de mouse só tem esses
+            for path, f, key, kbd, phys, anym in virtual:
+                if not self._have_phys():
+                    self.devs[path] = HubDevice(path, f, kbd, phys, anym)
+                else:
+                    f.close()
+                    self._rejected[path] = key
+            for d in list(self.devs.values()):
+                d.mouse = self._mouse_match(d, "all") if all_mice else False
+                d.mouse = d.mouse or self._mouse_match(d, mouse_paths)
+                if not d.kbd and not d.mouse and not d.grabbed:
+                    self._drop(d, unplugged=False)
+            self.denied = denied
+            self._apply_grabs()
+        self._wake()
+
+    def _drop(self, d, unplugged=True):
+        for code in list(d.down):
+            self._key(d, code, 0)
+        if d.grabbed or d.clone or d.pending:
+            self._ungrab(d)
+        d.dead = True
+        self.devs.pop(d.path, None)
+        for paths in self.mod_held.values():
+            paths.discard(d.path)
+        self._closing.append(d.f)
+
+    # ---------------------------------------------------------- capturas --
+    def _wants(self, d):
+        wanters = [s for s in self.subs if self._ask(s, "wants_grab", d)]
+        if GRAB_EVERYTHING and not wanters:
+            return [None]
+        return wanters
+
+    @staticmethod
+    def _ask(sub, name, *args):
+        fn = getattr(sub, name, None)
+        if fn is None:
+            return None
+        try:
+            return fn(*args)
+        except Exception:
+            return None
+
+    def _output_for(self, d, wanters):
+        for s in wanters:
+            out = self._ask(s, "output_for", d) if s is not None else None
+            if out is not None:
+                return out
+        return self.outputs.get(d.path)
+
+    def _apply_grabs(self):
+        for d in list(self.devs.values()):
+            if d.dead:
+                continue
+            wanters = self._wants(d)
+            if not wanters:
+                if d.grabbed or d.clone or d.pending:
+                    self._ungrab(d)
+                continue
+            out = self._output_for(d, wanters)
+            now = any(getattr(s, "grab_now", False) for s in wanters if s)
+            if d.grabbed:
+                if out is not None and out is not d.out:
+                    self._swap(d, out)
+                elif out is None and d.out is not d.clone:
+                    self._ungrab(d)         # a saída fixa saiu: refaz com clone
+                    d.pending = True
+                continue
+            if out is not None and now:
+                self._grab(d, out)
+            else:
+                d.pending = True
+
+    def _try_pending(self):
+        now = time.monotonic()
+        for d in list(self.devs.values()):
+            if not d.pending or d.dead or d.grabbed:
+                continue
+            if d.grab_error and now - d.grab_error < self.RESCAN_S:
+                continue
+            out = self._output_for(d, self._wants(d))
+            if out is None:
+                if d.clone is None:
+                    try:
+                        d.clone = CloneDevice(d.fd)
+                    except OSError:
+                        d.grab_error = now
+                        continue
+                if now < d.clone.ready_at:
+                    continue
+                out = d.clone
+            # Capturar com tecla apertada deixaria essa tecla presa no
+            # compositor: ele viu o aperto pelo device físico, e o release
+            # chegaria só a nós. Com repetição de tecla, seria "wwwwww" sem fim.
+            if keys_down(d.fd):
+                continue
+            self._grab(d, out)
+
+    def _grab(self, d, out):
+        try:
+            fcntl.ioctl(d.fd, EVIOCGRAB, 1)
+        except OSError:
+            d.grab_error = time.monotonic()
+            d.pending = True
+            return False
+        d.grabbed, d.pending, d.out = True, False, out
+        d.frame = bytearray()
+        d.swallowed.clear()
+        return True
+
+    def _release_out(self, d):
+        relayed = d.down - d.swallowed
+        if relayed and d.out is not None:
+            try:
+                os.write(d.out.fd, b"".join(_ev(EV_KEY, c, 0) for c in relayed)
+                         + SYN)
+            except OSError:
+                pass
+
+    def _swap(self, d, out):
+        self._release_out(d)
+        d.out = out
+        if d.clone is not None and out is not d.clone:
+            self._closing.append(d.clone)
+            d.clone = None
+
+    def _ungrab(self, d):
+        if d.grabbed:
+            self._release_out(d)
+            try:
+                fcntl.ioctl(d.fd, EVIOCGRAB, 0)
+            except OSError:
+                pass
+        d.grabbed = d.pending = False
+        d.out = None
+        d.swallowed.clear()
+        d.frame = bytearray()
+        if d.clone is not None:
+            self._closing.append(d.clone)
+            d.clone = None
+
+    # ----------------------------------------------------------- eventos --
+    def _key(self, d, code, value):
+        """Uma tecla: avisa cada inscrito e decide se ela some."""
+        if code in MOD_OF:
+            held = self.mod_held.setdefault(code, set())
+            if value:
+                held.add(d.path)
+            else:
+                held.discard(d.path)
+        if value == 1:
+            d.down.add(code)
+        elif value == 0:
+            d.down.discard(code)
+        swallow = code in d.swallowed and value != 1
+        if value == 0:
+            d.swallowed.discard(code)
+        for s in list(self.subs):
+            if self._ask(s, "on_key", d, code, value) and value == 1:
+                swallow = True
+        if value == 1 and swallow and d.grabbed:
+            d.swallowed.add(code)
+        return swallow and d.grabbed
+
+    def _read(self, d):
+        try:
+            data = os.read(d.fd, 4096)
+        except BlockingIOError:
+            return
+        except OSError:
+            self._drop(d)
+            return
+        grabbed, out = d.grabbed, bytearray()
+        for i in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
+            _, _, etype, code, value = struct.unpack_from(EVENT_FMT, data, i)
+            raw = data[i:i + EVENT_SIZE]
+            if d.dropping:
+                if etype == EV_SYN and code == SYN_REPORT:
+                    d.dropping = False
+                    self._resync(d, out)
+                continue
+            if etype == EV_SYN:
+                if code == SYN_DROPPED:
+                    d.dropping = True
+                    d.frame = bytearray()
+                    continue
+                if code == SYN_REPORT:
+                    if grabbed and d.frame:
+                        out += d.frame
+                        out += raw
+                    d.frame = bytearray()
+                    continue
+            elif etype == EV_KEY:
+                if self._key(d, code, value):
+                    # bloqueada: o MSC_SCAN que a anunciava some junto
+                    if len(d.frame) >= EVENT_SIZE:
+                        _, _, pt, pc, _ = struct.unpack_from(
+                            EVENT_FMT, d.frame, len(d.frame) - EVENT_SIZE)
+                        if pt == EV_MSC and pc == MSC_SCAN:
+                            del d.frame[-EVENT_SIZE:]
+                    continue
+            if grabbed:
+                d.frame += raw
+        if out and d.out is not None:
+            try:
+                os.write(d.out.fd, bytes(out))
+            except OSError:
+                pass
+
+    def _resync(self, d, out):
+        """Depois de um SYN_DROPPED o kernel jogou eventos fora: o estado
+        verdadeiro vem do EVIOCGKEY, e o clone é acertado por ele."""
+        now = key_state(d.fd)
+        fix = bytearray()
+        for code in sorted(d.down - now):
+            if not self._key(d, code, 0) and d.grabbed:
+                fix += _ev(EV_KEY, code, 0)
+        for code in sorted(now - d.down):
+            if not self._key(d, code, 1) and d.grabbed:
+                fix += _ev(EV_KEY, code, 1)
+        if fix:
+            out += fix + SYN
+
+    def _leds(self, d):
+        try:
+            data = os.read(d.clone.fd, 4096)
+        except OSError:
+            return
+        buf = bytearray()
+        for i in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
+            _, _, etype, code, value = struct.unpack_from(EVENT_FMT, data, i)
+            if etype == EV_LED:
+                buf += _ev(EV_LED, code, value)
+        if buf and d.writable:
+            try:
+                os.write(d.fd, bytes(buf) + SYN)
+            except OSError:
+                pass
+
+    def _wake(self):
+        try:
+            os.write(self._wp, b"x")
+        except OSError:
+            pass
+
+    def _flush_closing(self):
+        items, self._closing = self._closing, []
+        for item in items:
+            try:
+                item.close()
+            except OSError:
+                pass
+
+    def _loop(self):
+        while self._run:
+            with self.lock:
+                self._flush_closing()
+                live = [d for d in self.devs.values() if not d.dead]
+                rl = [self._rp] + [d.fd for d in live]
+                rl += [d.clone.fd for d in live
+                       if d.clone is not None and d.writable]
+                pending = any(d.pending for d in live)
+            wait = self.PENDING_S if pending else \
+                max(0.05, self._next_scan - time.monotonic())
+            try:
+                ready, _, _ = select.select(rl, [], [], wait)
+            except (OSError, ValueError):
+                ready = []
+                time.sleep(0.02)
+            with self.lock:
+                byfd = {d.fd: d for d in self.devs.values() if not d.dead}
+                clones = {d.clone.fd: d for d in self.devs.values()
+                          if d.clone is not None}
+                for fd in ready:
+                    if fd == self._rp:
+                        try:
+                            os.read(self._rp, 4096)
+                        except OSError:
+                            pass
+                    elif fd in byfd:
+                        self._read(byfd[fd])
+                    elif fd in clones:
+                        self._leds(clones[fd])
+                self._try_pending()
+            if time.monotonic() >= self._next_scan:
+                self._next_scan = time.monotonic() + self.RESCAN_S
+                self.scan()
+
+    def stop(self):
+        global _HUB
+        if _HUB is self:
+            _HUB = None              # o próximo HUB() nasce limpo
+        self._run = False
+        self._wake()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        with self.lock:
+            self.subs = []
+            for d in list(self.devs.values()):
+                self._ungrab(d)
+                self._closing.append(d.f)
+                d.dead = True
+            self.devs.clear()
+            self._flush_closing()
+
+
+_HUB = None
+
+
+def HUB():
+    """O hub do processo, criado no primeiro uso."""
+    global _HUB
+    if _HUB is None:
+        _HUB = InputHub()
+        _HUB.start()
+    return _HUB
+
+
 class HotkeyWatcher(QObject):
+    """Uma tecla vista em qualquer teclado, com o foco onde estiver. `block`
+    faz ela sumir para os outros programas, como um atalho do AutoHotkey."""
     pressed = Signal()
     released = Signal()
+    mice = None
 
-    def __init__(self, keycode):
+    def __init__(self, keycode, block=False, hub=None):
         super().__init__()
-        self.keycode = keycode
-        self._run = True
+        self.keycode, self.block = keycode, block
+        self.hub = hub or HUB()
         self.error = None
-        self.files, self.denied = open_devices(is_keyboard)
+        self._on = False
         if not self.files:
-            self.error = ("sem acesso a /dev/input" if self.denied
+            self.error = ("sem acesso a /dev/input" if self.hub.denied
                           else "nenhum teclado encontrado")
+
+    @property
+    def files(self):
+        return self.hub.keyboard_files()
 
     @property
     def ok(self):
         return bool(self.files)
 
     def start(self):
-        if self.files:
-            threading.Thread(target=self._loop, daemon=True).start()
-
-    def _loop(self):
-        while self._run:
-            try:
-                r, _, _ = select.select(self.files, [], [], 0.5)
-            except (OSError, ValueError):
-                return
-            for f in r:
-                try:
-                    data = f.read(4096)
-                except OSError:
-                    continue
-                while data and len(data) >= EVENT_SIZE:
-                    _, _, etype, code, value = struct.unpack_from(EVENT_FMT, data)
-                    if etype == EV_KEY and code == self.keycode:
-                        if value == 1:
-                            self.pressed.emit()
-                        elif value == 0:
-                            self.released.emit()
-                    data = data[EVENT_SIZE:]
+        self._on = True
+        self.hub.add(self)
 
     def set_key(self, keycode):
         self.keycode = keycode
+        self.hub.changed()
+
+    def set_block(self, on):
+        self.block = bool(on)
+        self.hub.changed()
+
+    def wants_grab(self, d):
+        return self._on and self.block and d.kbd and d.has(self.keycode)
+
+    def on_key(self, d, code, value):
+        if not self._on or code != self.keycode or not d.kbd:
+            return False
+        if CAPTURE.is_set() and value == 1:
+            return False
+        if value == 1:
+            self.pressed.emit()
+        elif value == 0:
+            self.released.emit()
+        return self.block
 
     def stop(self):
-        self._run = False
+        self._on = False
+        self.hub.remove(self)
+
+
 
 
 # --------------------------------------------------- segurar o botão --------
@@ -678,96 +1352,1588 @@ class MouseHold(QObject):
     botão para disparar só a macro de teclado, por exemplo — ninguém reemite,
     e engolir deixaria o botão do usuário morto enquanto estivesse armado.
     Nesse caso o gatilho é repassado normalmente, além de acionar a macro.
+
+    A captura em si é do InputHub; o relay sai pelo `mouse` dado, que é o
+    mesmo device por onde o Clicker clica.
     """
     pressed = Signal()
     released = Signal()
     failed = Signal(str)
+    grab_now = True               # armar e já estar capturado, sem espera
 
-    def __init__(self, mouse, button_code, only=None, swallow=True):
+    def __init__(self, mouse, button_code, only=None, swallow=True, hub=None):
         super().__init__()
         self.mouse, self.button = mouse, button_code
         self.only = only              # captura só o mouse escolhido na UI
         self.swallow = swallow        # lido a cada evento: muda junto com a UI
+        self.hub = hub or HUB()
         self.files = []
-        self._run = False
-        self._thread = None
+        self._on = False
+
+    @property
+    def mice(self):
+        if not self._on:
+            return None
+        return frozenset(self.only) if self.only else "all"
 
     def start(self):
-        files, denied = open_devices(is_mouse_any, self.only)
-        if not files:
-            self.failed.emit("no mouse found" if not denied
+        self._on = True
+        self.hub.add(self)
+        mine = self.hub.mice_for(self.mice)
+        if not mine:
+            self._on = False
+            self.hub.remove(self)
+            self.failed.emit("no mouse found" if not self.hub.denied
                              else "no access to /dev/input")
             return False
-        grabbed = []
-        for f in files:
-            try:
-                fcntl.ioctl(f, EVIOCGRAB, 1)
-                grabbed.append(f)
-            except OSError:
-                f.close()
+        grabbed = [d for d in mine if d.grabbed]
         if not grabbed:
+            self._on = False
+            self.hub.remove(self)
             self.failed.emit("could not grab the mouse")
             return False
-        for f in files:
-            if f not in grabbed:
-                f.close()
-        self.files = grabbed
-        self._run = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        self.files = [d.f for d in grabbed]
         return True
 
-    def _loop(self):
-        out_fd, trigger = self.mouse.fd, self.button
-        while self._run:
-            try:
-                r, _, _ = select.select(self.files, [], [], 0.2)
-            except (OSError, ValueError):
-                break
-            for f in r:
-                try:
-                    data = f.read(4096)          # lote inteiro de uma vez
-                except OSError:
-                    continue
-                if not data:
-                    continue
-                keep = bytearray()
-                for i in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
-                    _, _, etype, code, value = struct.unpack_from(EVENT_FMT, data, i)
-                    if etype == EV_KEY and code == trigger:
-                        if value == 1:
-                            self.pressed.emit()
-                        elif value == 0:
-                            self.released.emit()
-                        if self.swallow:
-                            continue             # o Clicker reemite no lugar
-                    keep += data[i:i + EVENT_SIZE]
-                if keep:
-                    try:
-                        os.write(out_fd, bytes(keep))
-                    except OSError:
-                        pass
-        self._release()
+    def wants_grab(self, d):
+        return self._on and d.anym and self.hub._mouse_match(d, self.mice)
 
-    def _release(self):
-        for f in self.files:
-            try:
-                fcntl.ioctl(f, EVIOCGRAB, 0)
-            except OSError:
-                pass
-            try:
-                f.close()
-            except OSError:
-                pass
-        self.files = []
+    def output_for(self, d):
+        return self.mouse if self.wants_grab(d) else None
+
+    def on_key(self, d, code, value):
+        if not self._on or code != self.button or not self.wants_grab(d):
+            return False
+        if value == 1:
+            self.pressed.emit()
+        elif value == 0:
+            self.released.emit()
+        return self.swallow
 
     def stop(self):
-        if not self._run:
+        if not self._on:
             return
-        self._run = False
-        if self._thread:
-            self._thread.join(timeout=1.0)
-        self._release()
+        self._on = False
+        self.files = []
+        self.hub.remove(self)
+
+
+# ------------------------------------------------------ macros com atalho --
+# O que o AutoHotkey faz e o Linux não tinha: cada macro com o seu atalho,
+# independente do Start. "F1 liga e desliga um E a cada 1 ms" é um macro:
+# atalho F1, modo liga/desliga, repetir a cada 1 ms, passo "Toque E". Vários
+# convivem, como vários scripts .ahk rodando juntos.
+MACRO_MODES = ("toggle", "hold", "once", "always")
+MACRO_MODE_LABELS = {"toggle": "Toggle: press to start, again to stop",
+                     "hold": "While held",
+                     "once": "Once per press",
+                     "always": "Always, while enabled"}
+MACRO_MODE_SHORT = {"toggle": "toggle", "hold": "while held",
+                    "once": "once", "always": "always"}
+STEP_OPS = ("tap", "down", "up", "wait", "text", "wheel", "move")
+MAX_MACROS = 50
+MAX_STEPS = 2000
+REL_WHEEL, REL_HWHEEL = 8, 6
+REL_WHEEL_HI, REL_HWHEEL_HI = 0x0b, 0x0c
+
+# texto digitado passo a passo, posição física de um teclado US
+CHAR_KEYS = {" ": (57, False), "\n": (28, False), "\t": (15, False)}
+for _c in "abcdefghijklmnopqrstuvwxyz":
+    CHAR_KEYS[_c] = (KEYS[_c.upper()], False)
+    CHAR_KEYS[_c.upper()] = (KEYS[_c.upper()], True)
+for _d, _s in zip("1234567890", "!@#$%^&*()"):
+    CHAR_KEYS[_d] = (KEYS[_d], False)
+    CHAR_KEYS[_s] = (KEYS[_d], True)
+for _plain, _shifted, _code in (("-", "_", 12), ("=", "+", 13), ("[", "{", 26),
+                                ("]", "}", 27), ("\\", "|", 43), (";", ":", 39),
+                                ("'", '"', 40), ("`", "~", 41), (",", "<", 51),
+                                (".", ">", 52), ("/", "?", 53)):
+    CHAR_KEYS[_plain] = (_code, False)
+    CHAR_KEYS[_shifted] = (_code, True)
+
+
+def _num(value, default, lo, hi, kind=float):
+    try:
+        v = kind(value)
+    except (TypeError, ValueError):
+        return default
+    if v != v:                       # NaN
+        return default
+    return max(lo, min(hi, v))
+
+
+def new_macro_id():
+    return os.urandom(4).hex()
+
+
+def normalize_step(s):
+    """Um passo vindo da config ou do importador, validado. None se inválido."""
+    if not isinstance(s, dict):
+        return None
+    op = s.get("op")
+    if op not in STEP_OPS:
+        return None
+    if op in ("tap", "down", "up"):
+        code = _num(s.get("code"), 0, 0, 0x2ff, int)
+        if not code:
+            return None
+        step = {"op": op, "code": code}
+        if not is_button(code):          # botão tem nome traduzido na hora
+            step["name"] = str(s.get("name") or key_label(code))[:40]
+        if op == "tap":
+            step["times"] = _num(s.get("times", 1), 1, 1, 1000, int)
+        return step
+    if op == "wait":
+        ms = _num(s.get("ms"), 100.0, 0.0, 3600000.0)
+        mx = _num(s.get("max", 0), 0.0, 0.0, 3600000.0)
+        step = {"op": "wait", "ms": ms}
+        if mx > ms:
+            step["max"] = mx
+        return step
+    if op == "text":
+        text = str(s.get("text") or "")[:500]
+        return {"op": "text", "text": text} if text else None
+    if op == "wheel":
+        d = s.get("dir") if s.get("dir") in ("up", "down", "left", "right") \
+            else "down"
+        return {"op": "wheel", "dir": d,
+                "times": _num(s.get("times", 1), 1, 1, 100, int)}
+    dx = _num(s.get("dx", 0), 0, -5000, 5000, int)
+    dy = _num(s.get("dy", 0), 0, -5000, 5000, int)
+    return {"op": "move", "dx": dx, "dy": dy} if (dx or dy) else None
+
+
+def normalize_macro(m):
+    m = m if isinstance(m, dict) else {}
+    code = _num(m.get("code", 0), 0, 0, 0x2ff, int)
+    mode = m.get("mode") if m.get("mode") in MACRO_MODES else "toggle"
+    steps = [x for x in (normalize_step(s) for s in (m.get("steps") or [])
+                         if isinstance(m.get("steps"), list)) if x]
+    return {
+        "id": str(m.get("id") or new_macro_id())[:16],
+        "name": str(m.get("name") or "")[:60],
+        "enabled": bool(m.get("enabled", True)),
+        "code": code,
+        "key": "" if not code or is_button(code)
+        else str(m.get("key") or key_label(code))[:40],
+        "mods": sorted({x for x in (m.get("mods") or []) if x in MODIFIERS}),
+        "mode": mode,
+        "repeat": bool(m.get("repeat", True)),
+        "period_ms": _num(m.get("period_ms", 100.0), 100.0, 0.0, 3600000.0),
+        "press_ms": _num(m.get("press_ms", 0.0), 0.0, 0.0, 10000.0),
+        "block": bool(m.get("block", True)),
+        "steps": steps[:MAX_STEPS],
+    }
+
+
+def hotkey_label(m):
+    if not m.get("code"):
+        return _("no hotkey")
+    mods = "+".join(MOD_LABEL[x] for x in ("ctrl", "shift", "alt", "super")
+                    if x in m.get("mods", []))
+    code = m["code"]
+    key = trigger_label(code) if is_button(code) else \
+        (m.get("key") or key_label(code))
+    return f"{mods}+{key}" if mods else key
+
+
+def _ms(v):
+    return f"{v:g}"
+
+
+def step_label(s):
+    op = s["op"]
+    if op in ("tap", "down", "up"):
+        code = s["code"]
+        if is_button(code):
+            btn = _(BTN_NAMES[code]) if code in BTN_NAMES else f"button {code}"
+            text = {"tap": _("Click {btn}", btn=btn),
+                    "down": _("Hold {btn} button", btn=btn),
+                    "up": _("Release {btn} button", btn=btn)}[op]
+        else:
+            key = s.get("name") or key_label(code)
+            text = {"tap": _("Tap {key}", key=key),
+                    "down": _("Hold {key}", key=key),
+                    "up": _("Release {key}", key=key)}[op]
+        if op == "tap" and s.get("times", 1) > 1:
+            text += f" ×{s['times']}"
+        return text
+    if op == "wait":
+        if s.get("max"):
+            return _("Wait {a} to {b} ms", a=_ms(s["ms"]), b=_ms(s["max"]))
+        return _("Wait {ms} ms", ms=_ms(s["ms"]))
+    if op == "text":
+        return _("Type “{t}”", t=s["text"].replace("\n", "⏎"))
+    if op == "wheel":
+        return _({"up": "Wheel up", "down": "Wheel down", "left": "Wheel left",
+                  "right": "Wheel right"}[s["dir"]]) + f" ×{s['times']}"
+    return _("Move pointer by {dx}, {dy}", dx=s["dx"], dy=s["dy"])
+
+
+def macro_summary(m, limit=4):
+    """'F1, toggle, every 1 ms: Tap E' para a lista e o relatório."""
+    parts = [hotkey_label(m), _(MACRO_MODE_SHORT[m["mode"]])]
+    if m["mode"] != "once":
+        if not m["repeat"]:
+            parts.append(_("no repeat"))
+        elif m["period_ms"]:
+            parts.append(_("every {ms} ms", ms=_ms(m["period_ms"])))
+    steps = [step_label(s) for s in m["steps"][:limit]]
+    if len(m["steps"]) > limit:
+        steps.append("…")
+    return ", ".join(parts) + ": " + (", ".join(steps) or _("no steps"))
+
+
+class CompiledMacro:
+    """Um macro pronto para o motor: campos já convertidos, imutável."""
+
+    def __init__(self, m):
+        self.id, self.name = m["id"], m["name"] or hotkey_label(m)
+        self.code, self.mods = m["code"], frozenset(m["mods"])
+        self.mode, self.repeat, self.block = m["mode"], m["repeat"], m["block"]
+        self.period = m["period_ms"] / 1000.0
+        self.steps = tuple(m["steps"])
+        self.spec = json.dumps(m, sort_keys=True)
+        loops = self.repeat and self.mode != "once"
+        if m["press_ms"]:
+            self.press = m["press_ms"] / 1000.0
+        elif loops and self.period > 0:
+            # metade do período, no máximo 40 ms: o mesmo acerto do Clicker e
+            # da macro de teclado (jogo consulta estado por quadro)
+            self.press = min(KeyMacro.HOLD_S, self.period * 0.5)
+        else:
+            self.press = KeyMacro.HOLD_S
+        self.uses_keys = any((st["op"] in ("tap", "down", "up")
+                              and not is_button(st["code"]))
+                             or st["op"] == "text" for st in self.steps)
+        self.clicks = {st["code"] for st in self.steps
+                       if st["op"] in ("tap", "down", "up")
+                       and is_button(st["code"])}
+
+
+class MacroRunner(threading.Thread):
+    """Executa a sequência de um macro: uma vez, ou em laço até parar.
+
+    O período é contado de início a início (como o SetTimer do AutoHotkey),
+    com deadline absoluto: o erro de um ciclo não se acumula no seguinte.
+
+    Só dorme, nunca fica girando à espera. Busy-wait segura a GIL, e com o
+    teclado capturado é a thread do hub que repassa cada tecla do usuário:
+    medido com um macro de 1 ms girando, a thread principal ficou até 2 s sem
+    rodar. Dormindo, o período mediu 1,000 ms (p99 1,013 ms) e nada atrasou.
+    Tudo o que a sequência apertou e não soltou é solto ao parar, em
+    qualquer caminho de saída.
+    """
+    MIN_LOOP_S = 0.001           # laço sem espera nenhuma não vira enxurrada
+
+    def __init__(self, macro, kb, mouse, loop, keep, on_done=None):
+        super().__init__(daemon=True, name=f"macro-{macro.id}")
+        self.m, self.kb, self.mouse = macro, kb, mouse
+        self.loop, self.keep = loop, keep
+        self.on_done = on_done
+        self._stop = threading.Event()
+        self.stopping = False
+        self.count = 0
+        self.held = []
+
+    def stop(self):
+        self.stopping = True
+        self._stop.set()
+
+    def _until(self, deadline):
+        rest = deadline - time.perf_counter()
+        if rest > 0:
+            self._stop.wait(rest)
+
+    def _sleep(self, seconds):
+        if seconds > 0:
+            self._until(time.perf_counter() + seconds)
+
+    def _set(self, code, down):
+        dev = self.mouse if is_button(code) else self.kb
+        if dev is None:
+            return
+        os.write(dev.fd, _ev(EV_KEY, code, 1 if down else 0) + SYN)
+        if down:
+            self.held.append(code)
+        elif code in self.held:
+            self.held.remove(code)
+
+    def _tap(self, code, times=1):
+        for i in range(times):
+            if i and self._stop.is_set():
+                return
+            self._set(code, True)
+            self._sleep(self.m.press)
+            self._set(code, False)
+            if i + 1 < times:
+                self._sleep(self.m.press)
+
+    def _wheel(self, direction, times):
+        if self.mouse is None:
+            return
+        lo, hi = (REL_HWHEEL, REL_HWHEEL_HI) if direction in ("left", "right") \
+            else (REL_WHEEL, REL_WHEEL_HI)
+        sign = 1 if direction in ("up", "right") else -1
+        for i in range(times):
+            if i:
+                self._sleep(0.01)
+            os.write(self.mouse.fd, _ev(EV_REL, lo, sign)
+                     + _ev(EV_REL, hi, 120 * sign) + SYN)
+
+    def _step(self, st):
+        op = st["op"]
+        if op == "tap":
+            self._tap(st["code"], st.get("times", 1))
+        elif op == "down":
+            self._set(st["code"], True)
+        elif op == "up":
+            self._set(st["code"], False)
+        elif op == "wait":
+            ms = st["ms"]
+            if st.get("max"):
+                ms = random.uniform(ms, st["max"])
+            self._sleep(ms / 1000.0)
+        elif op == "text":
+            for ch in st["text"]:
+                if self._stop.is_set():
+                    return
+                code, shift = CHAR_KEYS.get(ch, (0, False))
+                if not code:
+                    continue
+                if shift:
+                    self._set(KEYS["Left Shift"], True)
+                self._tap(code)
+                if shift:
+                    self._set(KEYS["Left Shift"], False)
+        elif op == "wheel":
+            self._wheel(st["dir"], st["times"])
+        elif op == "move" and self.mouse is not None:
+            self.mouse.move(st["dx"], st["dy"])
+
+    def run(self):
+        clock = time.perf_counter
+        try:
+            nxt = clock()
+            while not self._stop.is_set():
+                began = clock()
+                for st in self.m.steps:
+                    if self._stop.is_set():
+                        break
+                    self._step(st)
+                self.count += 1
+                if not self.loop or self._stop.is_set():
+                    break
+                if self.m.period > 0:
+                    nxt += self.m.period
+                    self._until(nxt)
+                    if clock() - nxt > 0.05:      # atrasou demais: ressincroniza
+                        nxt = clock()
+                elif clock() - began < self.MIN_LOOP_S:
+                    self._until(began + self.MIN_LOOP_S)
+            if self.keep:
+                self._stop.wait()      # sem repetir: segura até mandarem parar
+        except OSError:
+            pass                         # device fechado no meio
+        finally:
+            for code in reversed(self.held[:]):
+                try:
+                    self._set(code, False)
+                except OSError:
+                    pass
+            self.held = []
+            if self.on_done:
+                self.on_done(self)
+
+
+class MacroEngine(QObject):
+    """Escuta os atalhos de todos os macros, pelo hub, e roda cada um.
+
+    A decisão acontece na thread do hub, sem passar pela da UI: apertar F1 com
+    a janela travada num diálogo ainda liga o macro, e a latência é a do
+    relay. Os sinais só avisam a UI para redesenhar.
+    """
+    changed = Signal()
+    toggled = Signal(bool)
+
+    def __init__(self, outputs, hub=None):
+        super().__init__()
+        self.outputs = outputs          # () -> (teclado virtual, mouse virtual)
+        self.hub = hub or HUB()
+        self.lock = threading.Lock()
+        self.active = False
+        self.macros = ()
+        self.by_code = {}
+        self.runners = {}
+        self.held = {}
+        self.mice = None
+        self.hub.add(self)
+
+    def configure(self, macros, active):
+        compiled = tuple(CompiledMacro(m) for m in macros
+                         if m.get("enabled") and m.get("steps")
+                         and (m.get("code") or m.get("mode") == "always"))
+        new = {c.id: c for c in compiled}
+        with self.lock:
+            stop = [r for mid, r in self.runners.items()
+                    if not active or mid not in new
+                    or new[mid].spec != r.m.spec]
+            self.active = bool(active)
+            self.macros = compiled
+            by_code = {}
+            for c in compiled:
+                if c.code and c.mode != "always":
+                    by_code.setdefault(c.code, []).append(c)
+            self.by_code = by_code
+            self.mice = "all" if self.active and any(
+                is_button(code) for code in by_code) else None
+            always = [c for c in compiled if c.mode == "always"] \
+                if self.active else []
+        for r in stop:
+            r.stop()
+        for c in always:
+            self._start(c, only_if_idle=True)
+        self.hub.changed()
+        self.changed.emit()
+
+    def needs_keyboard(self):
+        return self.active and any(c.uses_keys for c in self.macros)
+
+    def wants_grab(self, d):
+        if not self.active:
+            return False
+        for code, ms in self.by_code.items():
+            if d.has(code) and any(m.block for m in ms):
+                if is_button(code) or d.kbd:
+                    return True
+        return False
+
+    def on_key(self, d, code, value):
+        if not self.active:
+            return False
+        ms = self.by_code.get(code)
+        if not ms:
+            return False
+        if value == 1:
+            if CAPTURE.is_set():
+                return False
+            mods = self.hub.mods_active()
+            hit = [m for m in ms if m.mods <= mods]
+            # Ctrl+F1 e F1 no mesmo teclado: com Ctrl, vale só o mais específico
+            hit = [m for m in hit if not any(m.mods < o.mods for o in hit)]
+            if not hit:
+                return False
+            lift = set()
+            for m in hit:
+                if m.block and m.mods and (m.uses_keys or m.clicks):
+                    lift |= m.mods
+            if lift:
+                self.hub.lift_mods(lift)
+            for m in hit:
+                self._press(m)
+            self.held[code] = [m.id for m in hit if m.mode == "hold"]
+            return any(m.block for m in hit)
+        if value == 0:
+            for mid in self.held.pop(code, []):
+                with self.lock:
+                    r = self.runners.get(mid)
+                if r:
+                    r.stop()
+        return False
+
+    def _alive(self, mid):
+        r = self.runners.get(mid)
+        return r if r is not None and r.is_alive() and not r.stopping else None
+
+    def _press(self, m):
+        with self.lock:
+            r = self._alive(m.id)
+        if m.mode == "toggle":
+            if r:
+                r.stop()
+                self.toggled.emit(False)
+            else:
+                self._start(m)
+                self.toggled.emit(True)
+        elif not r:
+            self._start(m)
+
+    def _start(self, m, only_if_idle=False):
+        kb, mouse = self.outputs()
+        loop = m.repeat and m.mode != "once"
+        keep = not m.repeat and m.mode in ("toggle", "hold", "always")
+        with self.lock:
+            if only_if_idle and self._alive(m.id):
+                return None
+            r = MacroRunner(m, kb, mouse, loop, keep, self._done)
+            self.runners[m.id] = r
+        r.start()
+        self.changed.emit()
+        return r
+
+    def _done(self, r):
+        with self.lock:
+            if self.runners.get(r.m.id) is r:
+                del self.runners[r.m.id]
+        self.changed.emit()
+
+    def running(self):
+        with self.lock:
+            return [r.m for r in self.runners.values()
+                    if r.is_alive() and not r.stopping]
+
+    def stop_all(self, join=True):
+        with self.lock:
+            runners = list(self.runners.values())
+        for r in runners:
+            r.stop()
+        if join:
+            for r in runners:
+                r.join(timeout=0.5)
+
+    def close(self):
+        self.active = False
+        self.stop_all()
+        self.hub.remove(self)
+
+
+# ------------------------------------------------- importar AutoHotkey ----
+# Lê um script .ahk (v1 ou v2) e transforma cada atalho num macro. Não é um
+# interpretador: reconhece os padrões que quase todo script de jogo usa, e diz
+# com número de linha o que ficou de fora, em vez de adivinhar.
+#
+#   F1:: toggle := !toggle, SetTimer Label, N / Off   -> liga/desliga, a cada N
+#   F1:: toggle := !toggle, while toggle { ... }      -> liga/desliga, em laço
+#   X:: while GetKeyState("X", "P") { ... }            -> enquanto segura
+#   X:: Send ..., Click, Sleep                         -> uma vez por aperto
+#   a::b                                              -> remapeia (enquanto segura)
+#   SetTimer no início do script                      -> "sempre"
+AHK_KEYS = {
+    "space": 57, "enter": 28, "return": 28, "tab": 15, "esc": 1, "escape": 1,
+    "backspace": 14, "bs": 14, "delete": 111, "del": 111, "insert": 110,
+    "ins": 110, "home": 102, "end": 107, "pgup": 104, "pgdn": 109, "up": 103,
+    "down": 108, "left": 105, "right": 106, "lshift": 42, "rshift": 54,
+    "shift": 42, "lcontrol": 29, "lctrl": 29, "rcontrol": 97, "rctrl": 97,
+    "control": 29, "ctrl": 29, "lalt": 56, "ralt": 100, "alt": 56,
+    "lwin": 125, "rwin": 126, "capslock": 58, "numlock": 69, "scrolllock": 70,
+    "appskey": 127, "printscreen": 99, "pause": 119,
+    "numpad0": 82, "numpad1": 79, "numpad2": 80, "numpad3": 81, "numpad4": 75,
+    "numpad5": 76, "numpad6": 77, "numpad7": 71, "numpad8": 72, "numpad9": 73,
+    "numpaddot": 83, "numpaddel": 83, "numpadadd": 78, "numpadsub": 74,
+    "numpadmult": 55, "numpaddiv": 98, "numpadenter": 96, "numpadins": 82,
+    "numpadend": 79, "numpaddown": 80, "numpadpgdn": 81, "numpadleft": 75,
+    "numpadclear": 76, "numpadright": 77, "numpadhome": 71, "numpadup": 72,
+    "numpadpgup": 73,
+    "volume_up": 115, "volume_down": 114, "volume_mute": 113,
+    "media_play_pause": 164, "media_next": 163, "media_prev": 165,
+    "media_stop": 166, "browser_back": 158, "browser_forward": 159,
+    "browser_refresh": 173, "browser_home": 172,
+    "lbutton": BTN["Left"], "rbutton": BTN["Right"], "mbutton": BTN["Middle"],
+    "xbutton1": BTN["Side"], "xbutton2": BTN["Extra"],
+}
+for _i in range(1, 25):
+    AHK_KEYS[f"f{_i}"] = KEYS[f"F{_i}"]
+AHK_WHEEL = {"wheelup": "up", "wheeldown": "down", "wheelleft": "left",
+             "wheelright": "right", "wu": "up", "wd": "down"}
+# scancodes estendidos (sc1xx) que não coincidem com o código evdev
+SC_EXT = {0x11C: 96, 0x11D: 97, 0x135: 98, 0x137: 99, 0x138: 100, 0x145: 69,
+          0x147: 102, 0x148: 103, 0x149: 104, 0x14B: 105, 0x14D: 106,
+          0x14F: 107, 0x150: 108, 0x151: 109, 0x152: 110, 0x153: 111,
+          0x15B: 125, 0x15C: 126, 0x15D: 127}
+VK_KEYS = {0x08: 14, 0x09: 15, 0x0D: 28, 0x10: 42, 0x11: 29, 0x12: 56,
+           0x13: 119, 0x14: 58, 0x1B: 1, 0x20: 57, 0x21: 104, 0x22: 109,
+           0x23: 107, 0x24: 102, 0x25: 105, 0x26: 103, 0x27: 106, 0x28: 108,
+           0x2C: 99, 0x2D: 110, 0x2E: 111, 0x5B: 125, 0x5C: 126, 0x5D: 127,
+           0x6A: 55, 0x6B: 78, 0x6D: 74, 0x6E: 83, 0x6F: 98, 0x90: 69,
+           0x91: 70, 0xA0: 42, 0xA1: 54, 0xA2: 29, 0xA3: 97, 0xA4: 56,
+           0xA5: 100, 0x01: BTN["Left"], 0x02: BTN["Right"],
+           0x04: BTN["Middle"], 0x05: BTN["Side"], 0x06: BTN["Extra"]}
+for _i, _n in enumerate((82, 79, 80, 81, 75, 76, 77, 71, 72, 73)):
+    VK_KEYS[0x60 + _i] = _n
+for _i in range(24):
+    VK_KEYS[0x70 + _i] = KEYS[f"F{_i + 1}"]
+for _c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
+    VK_KEYS[ord(_c)] = KEYS[_c]
+AHK_MODS = {"^": "ctrl", "!": "alt", "+": "shift", "#": "super"}
+MOD_KEY = {"ctrl": 29, "alt": 56, "shift": 42, "super": 125}
+
+
+def ahk_key(name):
+    """Nome de tecla do AutoHotkey -> código evdev (None se desconhecido)."""
+    n = (name or "").strip()
+    low = n.lower()
+    if low in AHK_KEYS:
+        return AHK_KEYS[low]
+    if len(n) == 1:
+        hit = CHAR_KEYS.get(n.lower()) or CHAR_KEYS.get(n)
+        return hit[0] if hit else None
+    m = re.fullmatch(r"sc([0-9a-f]{1,3})", low)
+    if m:
+        sc = int(m.group(1), 16)
+        if sc == 0x45:
+            return 119                  # Pause é sc045 para o AHK; NumLock, sc145
+        return SC_EXT.get(sc) or (sc if 1 <= sc <= 0x58 else None)
+    m = re.fullmatch(r"vk([0-9a-f]{1,2})(?:sc[0-9a-f]{1,3})?", low)
+    if m:
+        return VK_KEYS.get(int(m.group(1), 16))
+    return None
+
+
+def _strip_comment(line):
+    if line.lstrip().startswith(";"):
+        return ""
+    quote = False
+    for i, ch in enumerate(line):
+        if ch == '"':
+            quote = not quote
+        elif ch == ";" and not quote and i and line[i - 1] in " \t":
+            return line[:i].rstrip()
+    return line
+
+
+HOTKEY_RE = re.compile(
+    r"^([#!^+<>*~$]*(?:[^\s:\"'(){}]+\s+&\s+[^\s:\"'(){}]+|[^\s\"'(){}]+?|.)"
+    r"(?:\s+up)?)::(.*)$", re.I)
+LABEL_RE = re.compile(r"^([A-Za-z_][\w]*):$")
+FUNC_RE = re.compile(r"^([A-Za-z_]\w*)\(([^()]*)\)$")
+CONTROL_RE = re.compile(r"^(if|else|while|loop|for|try|catch|finally|switch)"
+                        r"\b", re.I)
+
+
+def _ahk_tokens(text):
+    """Linhas lógicas, sem comentários, com { e } em linhas próprias quando
+    abrem ou fecham um bloco (o estilo "if (x) {" e "} else {")."""
+    out, block = [], False
+    text = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    for ln, raw in enumerate(text.split("\n"), 1):
+        s = raw.strip()
+        if block:
+            if s.startswith("*/") or s.endswith("*/"):
+                block = False
+            continue
+        if s.startswith("/*"):
+            block = not s.endswith("*/") or s == "/*"
+            continue
+        s = _strip_comment(s).strip()
+        while s:
+            if s.startswith("}"):
+                out.append((ln, "}"))
+                s = s[1:].strip()
+                continue
+            if s.endswith("{") and s != "{":
+                head = s[:-1].rstrip()
+                if (CONTROL_RE.match(head) or head.endswith("::")
+                        or FUNC_RE.match(head) or head.endswith(")")):
+                    out.append((ln, head))
+                    out.append((ln, "{"))
+                    break
+            out.append((ln, s))
+            break
+    return out
+
+
+def _unquote(a):
+    a = a.strip()
+    if a.startswith("%") and not a.endswith("%"):
+        a = a[1:].strip()               # v1 "% expressão": só a string simples
+    if len(a) >= 2 and a[0] == a[-1] and a[0] in "\"'":
+        body = a[1:-1]
+        return body.replace('""', '"').replace('`"', '"').replace("`'", "'")
+    return a
+
+
+def _split_args(s):
+    """Separa argumentos por vírgula, respeitando aspas e parênteses."""
+    args, cur, depth, quote = [], "", 0, None
+    for ch in s:
+        if quote:
+            cur += ch
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            args.append(cur.strip())
+            cur = ""
+            continue
+        cur += ch
+    if cur.strip() or args:
+        args.append(cur.strip())
+    return args
+
+
+def _escape_text(s):
+    """Sequências de escape do AHK: `n, `t, `;, ``."""
+    return (s.replace("``", "\x00").replace("`n", "\n").replace("`t", "\t")
+            .replace("`r", "").replace("`;", ";").replace("`,", ",")
+            .replace("`%", "%").replace("\x00", "`"))
+
+
+class AhkImport:
+    """Resultado da importação: `macros` (normalizados) e `notes`, cada nota
+    um (linha, texto-fonte, campos), traduzida só na hora de mostrar."""
+
+    def __init__(self, text):
+        self.toks = _ahk_tokens(text)
+        self.notes = []
+        self.macros = []
+        self.labels, self.funcs = {}, {}
+        self.hotkeys = []       # (linha, spec, corpo | None, remap)
+        self.auto = []
+        self.press_ms = 0.0
+        self.send_mode = "input"
+        self._ifwin_noted = False
+        try:
+            self._parse_top()
+            self._analyze()
+        except RecursionError:          # aninhamento absurdo: fica o que deu
+            self.note(0, "the script is nested too deeply, the rest was "
+                         "skipped")
+            self.macros = self.macros[:MAX_MACROS]
+
+    # ------------------------------------------------------ parsing --
+    def note(self, ln, text, **fmt):
+        item = (ln, text, fmt)
+        if item not in self.notes:
+            self.notes.append(item)
+
+    def _is_def(self, t):
+        if t.startswith(":") and "::" in t[1:]:
+            return True
+        return bool(HOTKEY_RE.match(t) or LABEL_RE.match(t))
+
+    def _add_hotkey(self, ln, spec, body, remap, stack):
+        """Atalhos empilhados (F1:: e F2:: na linha de baixo) dividem o corpo
+        do último, como no AutoHotkey."""
+        for sln, sspec in stack:
+            self.hotkeys.append((sln, sspec, body, remap))
+        stack.clear()
+        self.hotkeys.append((ln, spec, body, remap))
+
+    def _parse_top(self):
+        toks, i = self.toks, 0
+        stack = []
+        while i < len(toks):
+            ln, t = toks[i]
+            if t.startswith("#"):
+                self._directive(ln, t)
+                i += 1
+                continue
+            if t.startswith(":") and "::" in t[1:]:
+                self.note(ln, "hotstrings are not supported")
+                i += 1
+                continue
+            m = HOTKEY_RE.match(t)
+            if m and not t.lower().startswith(("if", "while")):
+                spec, rest = m.group(1).strip(), m.group(2).strip()
+                if not rest and i + 1 < len(toks) and toks[i + 1][1] == "{":
+                    node, i = self._block(i + 1)
+                    if i < len(toks) and toks[i][1].lower() == "return":
+                        i += 1
+                    self._add_hotkey(ln, spec, [node], None, stack)
+                elif not rest:
+                    body, j = self._until_return(i + 1)
+                    if not body and j == i + 1 and j < len(toks) \
+                            and HOTKEY_RE.match(toks[j][1]):
+                        stack.append((ln, spec))
+                        i = j
+                        continue
+                    i = j
+                    self._add_hotkey(ln, spec, body, None, stack)
+                else:
+                    remap = self._remap_target(rest)
+                    if remap:
+                        self._add_hotkey(ln, spec, None, remap, stack)
+                    else:
+                        node, _j = self._stmt_from([(ln, rest)], 0)
+                        self._add_hotkey(ln, spec, [node], None, stack)
+                    i += 1
+                continue
+            m = LABEL_RE.match(t)
+            if m:
+                body, i = self._until_return(i + 1)
+                self.labels[m.group(1).lower()] = body
+                continue
+            m = FUNC_RE.match(t)
+            if m and i + 1 < len(toks) and toks[i + 1][1] == "{":
+                node, i = self._block(i + 1)
+                self.funcs[m.group(1).lower()] = [node]
+                continue
+            node, i = self._stmt(i)
+            self.auto.append(node)
+
+    def _directive(self, ln, t):
+        low = t.lower()
+        if low.startswith(("#if", "#hotif")) and len(low.split()) > 1:
+            if not self._ifwin_noted:
+                self._ifwin_noted = True
+                self.note(ln, "window-specific hotkeys (#If) work in every "
+                              "window here")
+
+    def _remap_target(self, rest):
+        """'a::b' remapeia; 'a::Send b' não. O alvo é um nome de tecla só,
+        com modificadores na frente, e sem nada depois."""
+        m = re.fullmatch(r"([#!^+]*)([^\s,(){}\"']+)", rest)
+        if not m:
+            return None
+        name = m.group(2)
+        if name.lower() in ("return", "reload", "exitapp", "suspend", "pause",
+                            "click", "send", "sendinput"):
+            return None
+        code = ahk_key(name)
+        if code is None:
+            return None
+        mods = [AHK_MODS[c] for c in m.group(1)]
+        return code, mods, name
+
+    def _until_return(self, i):
+        body = []
+        while i < len(self.toks):
+            ln, t = self.toks[i]
+            if self._is_def(t) or (FUNC_RE.match(t) and i + 1 < len(self.toks)
+                                   and self.toks[i + 1][1] == "{"):
+                break
+            node, i = self._stmt(i)
+            if node[0] == "return":
+                break
+            body.append(node)
+        return body, i
+
+    def _block(self, i):
+        """tokens[i] é '{': lê até o '}' que fecha."""
+        ln = self.toks[i][0]
+        i += 1
+        nodes = []
+        while i < len(self.toks) and self.toks[i][1] != "}":
+            node, i = self._stmt(i)
+            nodes.append(node)
+        return ("block", nodes, ln), i + 1
+
+    def _stmt_from(self, toks, i):
+        saved = self.toks
+        self.toks = toks
+        try:
+            return self._stmt(i)
+        finally:
+            self.toks = saved
+
+    def _stmt(self, i):
+        ln, t = self.toks[i]
+        low = t.lower()
+        if t == "{":
+            return self._block(i)
+        if t == "}":
+            return ("noop", None, ln), i + 1
+        m = re.match(r"^(if|while)\b\s*(.*)$", t, re.I) \
+            or re.match(r"^(if|while)(\(.*)$", t, re.I)
+        if m:
+            kind, cond = m.group(1).lower(), self._cond(m.group(2))
+            body, i = self._sub(i + 1)
+            if kind == "while":
+                return ("while", cond, body, ln), i
+            other = None
+            if i < len(self.toks) and re.match(r"^else\b", self.toks[i][1], re.I):
+                rest = self.toks[i][1][4:].strip()
+                if rest:
+                    toks = list(self.toks)
+                    toks[i] = (self.toks[i][0], rest)
+                    saved, self.toks = self.toks, toks
+                    try:
+                        other, i = self._stmt(i)
+                    finally:
+                        self.toks = saved
+                else:
+                    other, i = self._sub(i + 1)
+            return ("if", cond, body, other, ln), i
+        m = re.match(r"^loop\b\s*,?\s*(.*)$", t, re.I)
+        if m:
+            arg = m.group(1).strip()
+            if arg and not re.fullmatch(r"\d+", arg):
+                self.note(ln, "{what} is not supported, skipped", what=t)
+                body, i = self._sub(i + 1)
+                return ("noop", None, ln), i
+            body, i = self._sub(i + 1)
+            return ("loop", int(arg) if arg else None, body, ln), i
+        if low in ("break", "continue"):
+            return (low, None, ln), i + 1
+        if low.startswith("return") or low in ("exit",):
+            return ("return", None, ln), i + 1
+        return ("cmd", self._cmd(ln, t), ln), i + 1
+
+    def _sub(self, i):
+        if i >= len(self.toks):
+            return ("block", [], 0), i
+        return self._stmt(i)
+
+    @staticmethod
+    def _cond(expr):
+        e = expr.strip()
+        while e.startswith("(") and e.endswith(")") and \
+                e.count("(") == e.count(")"):
+            e = e[1:-1].strip()
+        neg = False
+        m = re.fullmatch(r"(?:!|not\s+)\s*(.+)", e, re.I)
+        if m:
+            neg, e = True, m.group(1).strip()
+            while e.startswith("(") and e.endswith(")"):
+                e = e[1:-1].strip()
+        m = re.fullmatch(r"GetKeyState\(\s*[\"']?([^\"',)]+)[\"']?\s*"
+                         r"(?:,\s*[\"']?(\w*)[\"']?)?\s*\)", e, re.I)
+        if m:
+            return ("key", m.group(1).strip(), neg)
+        if re.fullmatch(r"(?i:true|1)", e):
+            return ("const", not neg)
+        if re.fullmatch(r"(?i:false|0)", e):
+            return ("const", neg)
+        m = re.fullmatch(r"([A-Za-z_]\w*)", e)
+        if m:
+            return ("var", m.group(1).lower(), not neg)
+        m = re.fullmatch(r"([A-Za-z_]\w*)\s*(=|==|!=|<>)\s*[\"']?(\w+)[\"']?",
+                         e)
+        if m:
+            var, op, val = m.group(1).lower(), m.group(2), m.group(3).lower()
+            want = op in ("=", "==")
+            if neg:
+                want = not want
+            if val in ("u", "d"):
+                return ("state", var, val == "d" if want else val != "d")
+            if val in ("1", "true"):
+                return ("var", var, want)
+            if val in ("0", "false"):
+                return ("var", var, not want)
+        return ("unknown", expr.strip())
+
+    def _cmd(self, ln, t):
+        m = re.fullmatch(r"(?:static\s+|global\s+|local\s+)?([A-Za-z_]\w*)\s*"
+                         r"(:=|=|\^=)\s*(.*)", t, re.I)
+        if m:
+            var, op, val = m.group(1).lower(), m.group(2), m.group(3).strip()
+            if op == "^=" or re.fullmatch(
+                    rf"(?:!|not\s+)\s*\(?\s*{var}\s*\)?", val, re.I) \
+                    or re.fullmatch(rf"{var}\s*\?\s*(0|false)\s*:\s*(1|true)",
+                                    val, re.I):
+                return ("flip", var)
+            r = re.fullmatch(r"Random\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)", val, re.I)
+            if r:
+                return ("random", var, int(r.group(1)), int(r.group(2)))
+            return ("assign", var, val)
+        m = re.fullmatch(r"([A-Za-z_]\w*)\s*\((.*)\)", t)
+        if m:
+            name, args = m.group(1), _split_args(m.group(2))
+        else:
+            m = re.fullmatch(r"([A-Za-z_]\w*)\s*(?:,\s*(.*)|\s+(.*))?", t)
+            if not m:
+                return ("unknown", t)
+            name = m.group(1)
+            rest = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+            rest = rest.strip()
+            if rest.startswith('"') or rest.startswith("'") \
+                    or rest.startswith("% "):
+                args = _split_args(rest)
+            elif name.lower() in ("send", "sendinput", "sendevent", "sendplay",
+                                  "sendraw", "sendtext"):
+                args = [rest]               # v1: o texto vai cru, vírgula e tudo
+            else:
+                args = _split_args(rest) if rest else []
+        low = name.lower()
+        if low in ("send", "sendinput", "sendevent", "sendplay", "sendraw",
+                   "sendtext", "controlsend"):
+            if low == "controlsend":
+                args = args[1:] if len(args) > 1 else args
+            text = _unquote(args[0]) if args else ""
+            return ("send", text, low in ("sendraw", "sendtext"))
+        if low in ("click", "mouseclick"):
+            return (low, [_unquote(a) for a in args])
+        if low == "sleep":
+            return ("sleep", args[0].strip() if args else "")
+        if low == "settimer":
+            return ("settimer", _unquote(args[0]) if args else "",
+                    args[1].strip() if len(args) > 1 else "")
+        if low in ("gosub", "goto"):
+            return ("call", _unquote(args[0]).lower() if args else "")
+        if low == "setkeydelay":
+            return ("keydelay", args)
+        if low == "sendmode":
+            return ("sendmode", _unquote(args[0]).lower() if args else "")
+        if low == "random":
+            if len(args) >= 3:
+                try:
+                    return ("random", args[0].strip().lower(),
+                            int(args[1]), int(args[2]))
+                except ValueError:
+                    pass
+            return ("unknown", t)
+        if low == "getkeystate" and len(args) >= 2:
+            return ("gks", args[0].strip().lower(), _unquote(args[1]))
+        if low == "keywait":
+            return ("keywait", _unquote(args[0]) if args else "")
+        if low == "mousemove":
+            return ("move", args)
+        if low in ("tooltip", "traytip", "soundbeep", "soundplay", "msgbox",
+                   "setbatchlines", "setworkingdir", "setmousedelay",
+                   "coordmode", "settitlematchmode", "detecthiddenwindows",
+                   "setcapslockstate", "setnumlockstate", "setscrolllockstate",
+                   "settimer_", "critical", "thread", "processsetpriority",
+                   "process", "menu", "a_traymenu", "persistent",
+                   "installkeybdhook", "installmousehook", "keyhistory",
+                   "listlines", "sendlevel"):
+            return ("ignore", name)
+        if low in ("pause", "suspend", "reload", "exitapp"):
+            return ("control", name)
+        if not args and (low in self.labels or low in self.funcs
+                         or m and t.endswith(")")):
+            return ("call", low)
+        return ("unknown", t)
+
+    # ---------------------------------------------------- análise --
+    def _body(self, name, depth=0):
+        return self.labels.get(name) or self.funcs.get(name) or []
+
+    def _walk(self, nodes, depth=0):
+        """Todos os nós, entrando em blocos, ifs, laços e chamadas."""
+        for n in nodes:
+            yield n
+            kind = n[0]
+            if kind == "block":
+                yield from self._walk(n[1], depth)
+            elif kind == "if":
+                yield from self._walk([n[2]] + ([n[3]] if n[3] else []), depth)
+            elif kind in ("while", "loop"):
+                yield from self._walk([n[2]], depth)
+            elif kind == "cmd" and n[1][0] == "call" and depth < 4:
+                yield from self._walk(self._body(n[1][1]), depth + 1)
+
+    @staticmethod
+    def _flat(nodes):
+        out = []
+        for n in nodes:
+            if n[0] == "block":
+                out.extend(AhkImport._flat(n[1]))
+            elif n[0] != "noop":
+                out.append(n)
+        return out
+
+    def _analyze(self):
+        for n in self._walk(self.auto):
+            if n[0] != "cmd":
+                continue
+            c = n[1]
+            if c[0] == "keydelay" and len(c[1]) >= 2:
+                try:
+                    self.press_ms = max(0.0, float(c[1][1]))
+                except ValueError:
+                    pass
+            elif c[0] == "sendmode":
+                self.send_mode = c[1]
+        if self.send_mode in ("input", "play"):
+            self.press_ms = 0.0           # SetKeyDelay não vale no SendInput
+        for ln, spec, body, remap in self.hotkeys:
+            m = self._hotkey(ln, spec, body, remap)
+            if m:
+                self.macros.append(normalize_macro(m))
+        for n in self._flat(self.auto):
+            if n[0] == "cmd" and n[1][0] == "settimer":
+                m = self._timer_macro(n[2], n[1], startup=True)
+                if m:
+                    m["mode"] = "always"
+                    self.note(n[2], "{name} starts with the script, imported "
+                                    "as an Always macro", name=m["name"])
+                    self.macros.append(normalize_macro(m))
+        self.macros = self.macros[:MAX_MACROS]
+
+    def _parse_spec(self, ln, spec):
+        s = spec.strip()
+        if re.search(r"\s+up$", s, re.I):
+            self.note(ln, "{hk}: release hotkeys (Up) are not supported",
+                      hk=spec)
+            return None
+        if " & " in s:
+            self.note(ln, "{hk}: two-key combinations are not supported",
+                      hk=spec)
+            return None
+        mods, block, i = set(), True, 0
+        while i < len(s) - 1 and s[i] in "#!^+<>*~$":
+            ch = s[i]
+            if ch in AHK_MODS:
+                mods.add(AHK_MODS[ch])
+            elif ch == "~":
+                block = False
+            i += 1
+        name = s[i:]
+        low = name.lower()
+        if low in AHK_WHEEL:
+            self.note(ln, "{hk}: the mouse wheel cannot be a hotkey here",
+                      hk=spec)
+            return None
+        code = ahk_key(name)
+        if code is None:
+            self.note(ln, "{hk}: key {name} is unknown", hk=spec, name=name)
+            return None
+        label = trigger_label(code) if is_button(code) else \
+            (CODE_NAMES.get(code) or name.upper())
+        # sem nome: a lista mostra o atalho ("Ctrl+J"), mais claro que "^j"
+        return {"code": code, "key": label, "mods": sorted(mods),
+                "block": block, "name": ""}
+
+    def _hotkey(self, ln, spec, body, remap):
+        hk = self._parse_spec(ln, spec)
+        if hk is None:
+            return None
+        base = dict(hk, press_ms=self.press_ms)
+        if remap:
+            code, mods, name = remap
+            steps = [{"op": "down", "code": MOD_KEY[x]} for x in mods]
+            steps.append({"op": "down", "code": code})
+            target = hotkey_label({"code": code, "mods": mods,
+                                   "key": key_label(code)})
+            return dict(base, mode="hold", repeat=False, block=True,
+                        steps=steps, name=f"{hotkey_label(hk)} → {target}")
+        nodes = self._flat(body)
+        flips = {n[1][1] for n in self._walk(nodes)
+                 if n[0] == "cmd" and n[1][0] == "flip"}
+        timers = [n for n in self._walk(nodes)
+                  if n[0] == "cmd" and n[1][0] == "settimer"]
+        m = self._from_timers(ln, spec, base, timers, flips)
+        if m is None:
+            m = self._from_loops(ln, spec, base, nodes, flips, hk)
+        if m is None:
+            m = self._from_toggle_if(ln, base, nodes, flips)
+        if m is None:
+            m = self._from_keywait(ln, base, nodes, hk)
+        if m is None:
+            steps = self._steps(nodes, ln)
+            m = dict(base, mode="once", repeat=False, steps=steps)
+        if not m.get("steps"):
+            self.note(ln, "{hk}: nothing WayClick can do", hk=spec)
+            return None
+        clicks = {s["code"] for s in m["steps"]
+                  if s["op"] in ("tap", "down") and is_button(s.get("code", 0))}
+        if not m["block"] and hk["code"] in clicks:
+            m["block"] = True
+            self.note(ln, "{hk} clicks its own button, so it is hidden from "
+                          "the app even with ~ (otherwise the clicks would be "
+                          "lost)", hk=spec)
+        return m
+
+    def _timer_macro(self, ln, cmd, startup=False):
+        _kind, label, period = cmd
+        label = label.strip()
+        arrow = re.fullmatch(r"\(\s*\)\s*=>\s*(.+)", label)
+        if arrow:
+            node, _j = self._stmt_from([(ln, arrow.group(1))], 0)
+            body, name = [node], "timer"
+        else:
+            body, name = self._body(label.lower()), label
+        p = self._period(period, ln)
+        if p is None or p == "off":
+            return None
+        if not body:
+            self.note(ln, "SetTimer: {name} was not found", name=label)
+            return None
+        steps = self._steps(self._flat(body), ln)
+        if p < 0:
+            return {"name": name, "mode": "once", "repeat": False,
+                    "steps": [{"op": "wait", "ms": -p}] + steps,
+                    "press_ms": self.press_ms, "block": True}
+        return {"name": name, "mode": "toggle", "repeat": True,
+                "period_ms": float(p), "steps": steps,
+                "press_ms": self.press_ms, "block": True}
+
+    def _period(self, text, ln):
+        """'50' -> 50, 'Off'/'0'/'Delete' -> 'off', '' ou 'On' -> 250 (o
+        padrão do AHK), ternário 'toggle ? 1 : 0' -> o lado ligado."""
+        t = _unquote(text.strip()).strip()
+        m = re.fullmatch(r"\(?\s*(?:\(\s*\w+\s*:=\s*!\s*\w+\s*\)|\w+)\s*\)?\s*\?"
+                         r"\s*[\"']?(-?\w+)[\"']?\s*:\s*[\"']?(-?\w+)[\"']?", t)
+        if m:
+            t = m.group(1)
+        low = t.lower()
+        if low in ("off", "delete", "0"):
+            return "off"
+        if low in ("", "on"):
+            return 250
+        try:
+            p = int(float(t))
+        except ValueError:
+            self.note(ln, "SetTimer period {p} is not a number, used 250 ms",
+                      p=text)
+            return 250
+        if 0 < p < 16:
+            self.note(ln, "SetTimer {ms} ms: on Windows AutoHotkey rounds "
+                          "timers up to 10 or 15.6 ms, so the script really "
+                          "ran about every 15 ms. WayClick runs exactly {ms} "
+                          "ms; raise it in the macro if the game drops keys.",
+                      ms=p)
+        return p
+
+    def _from_timers(self, ln, spec, base, timers, flips):
+        starts = [t for t in timers if self._period(t[1][2], t[2]) != "off"]
+        if not starts:
+            if timers:
+                self.note(ln, "{hk} only stops a timer; in WayClick the hotkey "
+                              "that starts a macro also stops it", hk=spec)
+                return {}
+            return None
+        t = starts[0]
+        m = self._timer_macro(t[2], t[1])
+        if not m:
+            return {}
+        toggled = bool(flips) or len(timers) > len(starts) \
+            or "?" in t[1][2]
+        if not toggled and m["mode"] == "toggle":
+            self.note(ln, "{hk} only starts the timer; here the same hotkey "
+                          "also stops it", hk=spec)
+        return dict(base, mode=m["mode"], repeat=m["repeat"],
+                    period_ms=m.get("period_ms", 0.0), steps=m["steps"],
+                    name=m["name"] if m["name"] != "timer" else "")
+
+    def _is_break_if(self, node, flips, hk):
+        """'if !toggle break' ou 'if !GetKeyState(...) break' (ou o estilo v1,
+        'GetKeyState, state, X, P' seguido de 'if state = U break')."""
+        if node[0] != "if":
+            return None
+        inner = self._flat([node[2]])
+        if not inner or inner[0][0] != "break":
+            return None
+        cond = node[1]
+        if cond[0] == "var" and cond[1] in flips and not cond[2]:
+            return "toggle"
+        if cond[0] == "key" and cond[2]:
+            return "hold"
+        if cond[0] == "state" and not cond[2]:
+            return "hold"
+        return None
+
+    def _from_loops(self, ln, spec, base, nodes, flips, hk):
+        idx = next((i for i, n in enumerate(nodes)
+                    if n[0] in ("while", "loop")), None)
+        if idx is None:
+            return None
+        loop = nodes[idx]
+        before = [n for n in nodes[:idx]
+                  if not (n[0] == "cmd" and n[1][0] in ("flip", "assign"))]
+        body = self._flat([loop[2]])
+        mode = None
+        if loop[0] == "while":
+            cond = loop[1]
+            if cond[0] == "var" and cond[2]:
+                mode = "toggle"
+            elif cond[0] == "key" and not cond[2]:
+                mode = "hold"
+            elif cond[0] == "const" and cond[1]:
+                mode = "toggle"
+            else:
+                self.note(loop[3], "while {c} is not understood, skipped",
+                          c=str(cond[-1]))
+                return {}
+        elif loop[1] is not None:
+            reps = max(1, min(loop[1], 1000))
+            steps = self._steps(before, ln)
+            one = self._steps(body, loop[3])
+            if one and len(one) * reps > MAX_STEPS:
+                reps = max(1, MAX_STEPS // len(one))
+                self.note(loop[3], "Loop {n} shortened to {m} repetitions",
+                          n=loop[1], m=reps)
+            steps += one * reps
+            steps += self._steps(nodes[idx + 1:], ln)
+            return dict(base, mode="once", repeat=False, steps=steps)
+        else:
+            body2 = []
+            for n in body:
+                kind = self._is_break_if(n, flips, hk)
+                if kind and mode is None:
+                    mode = kind
+                    continue
+                if n[0] == "cmd" and n[1][0] == "gks":
+                    continue
+                body2.append(n)
+            body = body2
+            if mode is None:
+                mode = "toggle"
+                self.note(loop[3], "{hk}: an endless loop; here the hotkey "
+                                   "turns it on and off", hk=spec)
+        pre = self._steps(before, ln)
+        dropped = [s for s in pre if s["op"] != "down"]
+        if dropped:
+            self.note(ln, "{hk}: what runs before the loop was left out",
+                      hk=spec)
+        steps = [s for s in pre if s["op"] == "down"] + self._steps(body, loop[3])
+        return dict(base, mode=mode, repeat=True, period_ms=0.0, steps=steps)
+
+    def _from_toggle_if(self, ln, base, nodes, flips):
+        for n in nodes:
+            if n[0] == "if" and n[1][0] == "var" and n[1][1] in flips:
+                branch = n[2] if n[1][2] else n[3]
+                steps = self._steps(self._flat([branch]) if branch else [], ln)
+                if steps:
+                    return dict(base, mode="toggle", repeat=False, steps=steps)
+        return None
+
+    def _from_keywait(self, ln, base, nodes, hk):
+        for i, n in enumerate(nodes):
+            if n[0] == "cmd" and n[1][0] == "keywait":
+                steps = self._steps(nodes[:i], ln)
+                if steps:
+                    return dict(base, mode="hold", repeat=False, steps=steps)
+        return None
+
+    # ------------------------------------------------------- passos --
+    def _steps(self, nodes, ln, depth=0, rand=None):
+        rand = {} if rand is None else rand
+        out = []
+        for n in nodes:
+            kind = n[0]
+            if kind == "block":
+                out += self._steps(n[1], ln, depth, rand)
+            elif kind == "cmd":
+                out += self._cmd_steps(n[1], n[2], depth, rand)
+            elif kind == "loop" and n[1]:
+                one = self._steps(self._flat([n[2]]), n[3], depth, rand)
+                reps = min(n[1], max(1, MAX_STEPS // max(1, len(one))))
+                out += one * reps
+            elif kind == "return":
+                break
+            elif kind in ("if", "while", "loop"):
+                self.note(n[-1], "a condition inside the actions was skipped")
+            if len(out) > MAX_STEPS:
+                return out[:MAX_STEPS]
+        return out
+
+    def _cmd_steps(self, c, ln, depth, rand):
+        kind = c[0]
+        if kind == "send":
+            return self._send(c[1], c[2], ln)
+        if kind in ("click", "mouseclick"):
+            return self._click(c[1], ln, kind == "mouseclick")
+        if kind == "sleep":
+            return self._sleep(c[1], ln, rand)
+        if kind == "random":
+            lo, hi = sorted((c[2], c[3]))
+            rand[c[1]] = (lo, hi)
+            return []
+        if kind == "call":
+            if depth < 4 and (c[1] in self.labels or c[1] in self.funcs):
+                return self._steps(self._flat(self._body(c[1])), ln,
+                                   depth + 1, rand)
+            if c[1]:
+                self.note(ln, "{name} was not found", name=c[1])
+            return []
+        if kind == "move":
+            return self._move(c[1], ln)
+        if kind in ("flip", "assign", "settimer", "keydelay", "sendmode",
+                    "gks", "ignore", "keywait"):
+            return []
+        if kind == "control":
+            self.note(ln, "{what} is not supported, skipped", what=c[1])
+            return []
+        self.note(ln, "{what} is not supported, skipped", what=c[1])
+        return []
+
+    def _sleep(self, arg, ln, rand):
+        a = arg.strip().strip("%").strip()
+        m = re.fullmatch(r"Random\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)", a, re.I)
+        if m:
+            lo, hi = sorted((int(m.group(1)), int(m.group(2))))
+            return [{"op": "wait", "ms": max(0, lo), "max": max(0, hi)}]
+        try:
+            return [{"op": "wait", "ms": max(0.0, float(a))}]
+        except ValueError:
+            pass
+        if a.lower() in rand:
+            lo, hi = rand[a.lower()]
+            return [{"op": "wait", "ms": max(0, lo), "max": max(0, hi)}]
+        self.note(ln, "Sleep {a} is not a number, skipped", a=arg)
+        return []
+
+    def _move(self, args, ln):
+        rel = any(a.strip().lower() in ("r", "rel", "relative") for a in args)
+        nums = []
+        for a in args[:2]:
+            try:
+                nums.append(int(float(a)))
+            except ValueError:
+                break
+        if rel and len(nums) == 2:
+            return [{"op": "move", "dx": nums[0], "dy": nums[1]}]
+        self.note(ln, "moving the pointer to a screen position is not "
+                      "possible on Wayland, skipped")
+        return []
+
+    def _click(self, args, ln, mouseclick=False):
+        toks = []
+        for a in args:
+            toks += [x for x in re.split(r"[\s,]+", a.strip()) if x]
+        button, count, state, nums, rel = "left", 1, None, [], False
+        names = {"left": "left", "l": "left", "right": "right", "r": "right",
+                 "middle": "middle", "m": "middle", "x1": "x1", "x2": "x2"}
+        for tk in toks:
+            low = tk.lower()
+            if low in names and not (low == "r" and nums and mouseclick):
+                button = names[low]
+            elif low in AHK_WHEEL:
+                button = AHK_WHEEL[low]
+            elif low in ("down", "d"):
+                state = "down"
+            elif low in ("up", "u"):
+                state = "up"
+            elif low in ("rel", "relative"):
+                rel = True
+            elif re.fullmatch(r"-?\d+", low):
+                nums.append(int(low))
+        steps = []
+        if mouseclick:
+            xy, count = nums[:2], (nums[2] if len(nums) > 2 else 1)
+        else:
+            xy = nums[:2] if len(nums) >= 2 else []
+            count = nums[2] if len(nums) >= 3 else (nums[0] if len(nums) == 1
+                                                    else 1)
+        if len(xy) == 2:
+            if rel:
+                steps.append({"op": "move", "dx": xy[0], "dy": xy[1]})
+            else:
+                self.note(ln, "click coordinates ignored: it clicks where the "
+                              "cursor is")
+        if button in ("up", "down", "left", "right") and button not in \
+                ("left", "right") or button in ("up", "down"):
+            pass
+        if button in AHK_WHEEL.values() and button in ("up", "down") \
+                and state is None and button != "left":
+            steps.append({"op": "wheel", "dir": button, "times": max(1, count)})
+            return steps
+        code = {"left": BTN["Left"], "right": BTN["Right"],
+                "middle": BTN["Middle"], "x1": BTN["Side"],
+                "x2": BTN["Extra"]}.get(button)
+        if code is None:
+            steps.append({"op": "wheel", "dir": button, "times": max(1, count)})
+            return steps
+        if count == 0 and not xy:
+            return steps
+        if state:
+            steps.append({"op": state, "code": code})
+        elif count > 0:
+            steps.append({"op": "tap", "code": code, "times": count})
+        return steps
+
+    def _send(self, text, raw, ln):
+        steps, buf, mods, i = [], "", [], 0
+
+        def flush():
+            nonlocal buf
+            if buf:
+                steps.extend(self._literal(buf))
+                buf = ""
+
+        text = _escape_text(text)
+        while i < len(text):
+            ch = text[i]
+            if raw:
+                buf += ch
+                i += 1
+                continue
+            if ch in AHK_MODS:
+                flush()
+                mods.append(AHK_MODS[ch])
+                i += 1
+                continue
+            if ch == "{":
+                j = text.find("}", i + 2 if text[i + 1:i + 2] == "}" else i + 1)
+                if j < 0:
+                    buf += text[i:]
+                    break
+                inner = text[i + 1:j]
+                i = j + 1
+                if inner.lower() in ("raw", "text"):
+                    flush()
+                    raw = True
+                    continue
+                if inner.lower() in ("blind", ""):
+                    continue
+                if len(inner) == 1 and not mods:
+                    buf += inner
+                    continue
+                flush()
+                key_steps = self._brace(inner, ln)
+                steps.extend(self._wrap(mods, key_steps))
+                mods = []
+                continue
+            if mods:
+                flush()
+                key_steps = self._literal(ch, single=True)
+                steps.extend(self._wrap(mods, key_steps))
+                mods = []
+            else:
+                buf += ch
+            i += 1
+        flush()
+        return steps
+
+    @staticmethod
+    def _wrap(mods, steps):
+        if not mods:
+            return steps
+        downs = [{"op": "down", "code": MOD_KEY[m]} for m in mods]
+        ups = [{"op": "up", "code": MOD_KEY[m]} for m in reversed(mods)]
+        return downs + steps + ups
+
+    @staticmethod
+    def _literal(text, single=False):
+        """Uma letra ou dígito vira "Toque E" (editável pelo campo de tecla);
+        texto de verdade vira um passo "Digitar"."""
+        if len(text) == 1 and (text.islower() or text.isdigit()) \
+                and text in CHAR_KEYS:
+            return [{"op": "tap", "code": CHAR_KEYS[text][0]}]
+        if single and text in CHAR_KEYS:
+            code, shift = CHAR_KEYS[text]
+            if shift:
+                return [{"op": "down", "code": 42}, {"op": "tap", "code": code},
+                        {"op": "up", "code": 42}]
+            return [{"op": "tap", "code": code}]
+        return [{"op": "text", "text": text}]
+
+    def _brace(self, inner, ln):
+        parts = inner.split()
+        name, arg = parts[0], " ".join(parts[1:]).lower()
+        low = name.lower()
+        if low == "click":
+            return self._click([" ".join(parts[1:])], ln)
+        if low in AHK_WHEEL:
+            n = int(arg) if arg.isdigit() else 1
+            return [{"op": "wheel", "dir": AHK_WHEEL[low], "times": n}]
+        code = ahk_key(name)
+        if code is None:
+            self.note(ln, "key {name} is unknown", name=name)
+            return []
+        if arg in ("down", "downr", "downtemp", "d"):
+            return [{"op": "down", "code": code}]
+        if arg in ("up", "u"):
+            return [{"op": "up", "code": code}]
+        n = int(arg) if arg.isdigit() else 1
+        if n <= 0:
+            return []
+        return [{"op": "tap", "code": code, "times": n}]
+
+
+def import_ahk_file(path):
+    with open(path, "rb") as fh:
+        raw = fh.read(2 * 1024 * 1024)
+    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            if "\x00" not in text:
+                break
+        except UnicodeDecodeError:
+            continue
+    return AhkImport(text)
+
+
+def note_text(note):
+    ln, text, fmt = note
+    return _("line {ln}", ln=ln) + ": " + _(text, **fmt)
 
 
 # ------------------------------------------------------------------- som ----
@@ -1122,19 +3288,27 @@ class KeyCatcher(QPushButton):
 
     def _arm(self):
         self._arming = True
+        CAPTURE.set()
         self._refresh()
         self.setFocus()
         self.grabKeyboard()
 
     def _disarm(self):
         self._arming = False
+        CAPTURE.clear()
         self.releaseKeyboard()
         self._refresh()
+
+    def focusOutEvent(self, event):
+        if self._arming:             # clicou fora: desiste, nada fica preso
+            self._disarm()
+        super().focusOutEvent(event)
 
     def set_key(self, code, name=None):
         self.code = code
         self.name = name or trigger_label(code)
         self._arming = False
+        CAPTURE.clear()
         self._refresh()
         self.changed.emit()
 
@@ -1561,6 +3735,198 @@ TRANSLATIONS = {
         "could not grab the mouse": "não foi possível capturar o mouse",
         "Autoclicker for Wayland using /dev/uinput.":
             "Autoclicker para Wayland usando /dev/uinput.",
+        # ---- macros com atalho e importação do AutoHotkey (1.6.0) ----
+        "Hotkeys": "Atalhos",
+        "Enable hotkey macros": "Habilitar os macros com atalho",
+        "Each macro has its own hotkey and works in any window, even with "
+        "WayClick stopped, like an AutoHotkey script. Import AHK converts the "
+        "hotkeys of a .ahk file.":
+            "Cada macro tem o seu atalho e funciona em qualquer janela, mesmo "
+            "com o WayClick parado, como um script do AutoHotkey. Importar AHK "
+            "converte os atalhos de um arquivo .ahk.",
+        "New": "Novo", "Edit": "Editar", "Remove": "Remover",
+        "Import AHK…": "Importar AHK…",
+        "Turn the hotkeys of an AutoHotkey script (.ahk) into macros":
+            "Transforma os atalhos de um script do AutoHotkey (.ahk) em macros",
+        "Hide it from other apps": "Esconder dos outros programas",
+        "The hotkey still arms and disarms, but the game or app in front "
+        "never receives it.":
+            "O atalho continua armando e desarmando, mas o jogo ou programa "
+            "em primeiro plano nunca o recebe.",
+        "Toggle: press to start, again to stop":
+            "Liga e desliga: aperte para começar, de novo para parar",
+        "While held": "Enquanto segura",
+        "Once per press": "Uma vez por aperto",
+        "Always, while enabled": "Sempre, enquanto habilitado",
+        "toggle": "liga e desliga", "while held": "enquanto segura",
+        "once": "uma vez", "always": "sempre",
+        "no hotkey": "sem atalho",
+        "no repeat": "sem repetir",
+        "every {ms} ms": "a cada {ms} ms",
+        "no steps": "sem passos",
+        "Click {btn}": "Clicar {btn}",
+        "Hold {btn} button": "Segurar o botão {btn}",
+        "Release {btn} button": "Soltar o botão {btn}",
+        "Tap {key}": "Tocar {key}",
+        "Hold {key}": "Segurar {key}",
+        "Release {key}": "Soltar {key}",
+        "Wait {a} to {b} ms": "Esperar de {a} a {b} ms",
+        "Wait {ms} ms": "Esperar {ms} ms",
+        "Type “{t}”": "Digitar “{t}”",
+        "Wheel up": "Roda para cima", "Wheel down": "Roda para baixo",
+        "Wheel left": "Roda para a esquerda",
+        "Wheel right": "Roda para a direita",
+        "Move pointer by {dx}, {dy}": "Mover o ponteiro {dx}, {dy}",
+        "Step": "Passo", "Macro": "Macro",
+        "Tap a key or click": "Tocar uma tecla ou clicar",
+        "Hold down": "Segurar", "Release": "Soltar", "Wait": "Esperar",
+        "Type text": "Digitar texto", "Scroll the wheel": "Girar a roda",
+        "Move the pointer": "Mover o ponteiro",
+        "Up": "Cima", "Down": "Baixo",
+        "Key or button:": "Tecla ou botão:", "Times:": "Vezes:",
+        "Wait:": "Esperar:", "Random, up to:": "Aleatório, até:",
+        "Text:": "Texto:", "Direction:": "Direção:",
+        "Right (px):": "Direita (px):", "Down (px):": "Baixo (px):",
+        "no, exact": "não, exato",
+        "Typed with a US keyboard layout: letters, digits and symbols land "
+        "on the same physical keys.":
+            "Digitado no layout de teclado americano: letras, números e "
+            "símbolos caem nas mesmas teclas físicas.",
+        "Moves by an amount, from where the pointer is. Wayland does not let "
+        "a program put the pointer at a screen position.":
+            "Move uma distância, a partir de onde o ponteiro está. O Wayland "
+            "não deixa um programa pôr o ponteiro numa posição da tela.",
+        "Random, up to: each run waits a different time between the two "
+        "values.":
+            "Aleatório, até: cada vez espera um tempo diferente entre os dois "
+            "valores.",
+        "Stays pressed until a Release step, or until the macro stops, which "
+        "releases everything it held.":
+            "Fica apertado até um passo Soltar, ou até o macro parar, o que "
+            "solta tudo o que ele segurou.",
+        "Name:": "Nome:", "optional": "opcional", "Hotkey:": "Atalho:",
+        "With:": "Com:",
+        "Hide the hotkey from other apps":
+            "Esconder o atalho dos outros programas",
+        "Like AutoHotkey: the game never sees the hotkey itself. Without "
+        "this, the key does its normal job too (AutoHotkey's ~ prefix).":
+            "Como no AutoHotkey: o jogo nunca vê a tecla do atalho. Sem isso, "
+            "a tecla também faz o que faria normalmente (o prefixo ~ do "
+            "AutoHotkey).",
+        "Repeat the steps": "Repetir os passos", "every": "a cada",
+        "as soon as they end": "assim que acabarem",
+        "Counted from the start of one run to the start of the next, like "
+        "AutoHotkey's SetTimer. 1000 ms is once a second.":
+            "Contado do início de uma rodada ao início da próxima, como o "
+            "SetTimer do AutoHotkey. 1000 ms é uma vez por segundo.",
+        "auto": "automático",
+        "How long each tap stays down. Auto is 40 ms, or half the repeat "
+        "time when that is shorter: games read keys once per frame and miss "
+        "a tap that is too short.":
+            "Quanto tempo cada toque fica apertado. Automático é 40 ms, ou "
+            "metade do tempo de repetição quando ele é menor: jogos leem as "
+            "teclas uma vez por quadro e perdem um toque curto demais.",
+        "Repeat:": "Repetir:", "Key press time:": "Tempo de cada toque:",
+        "Steps:": "Passos:", "+ Add": "+ Adicionar",
+        "Move up": "Subir", "Move down": "Descer",
+        "Press the hotkey to start, press it again to stop. This is what "
+        "F1:: with a SetTimer does in AutoHotkey.":
+            "Aperte o atalho para começar e de novo para parar. É o que um "
+            "F1:: com SetTimer faz no AutoHotkey.",
+        "Runs while the hotkey is held and stops the moment you let go. "
+        "Without repeat, keys held by the steps stay down until you let go, "
+        "which makes a remap.":
+            "Roda enquanto o atalho está apertado e para assim que você "
+            "solta. Sem repetir, as teclas seguradas pelos passos ficam "
+            "apertadas até você soltar, o que faz um remapeamento.",
+        "Runs the steps once for every press.":
+            "Roda os passos uma vez a cada aperto.",
+        "Runs on its own whenever hotkey macros are enabled, no hotkey "
+        "needed. Use a long repeat time, like an anti idle key.":
+            "Roda sozinho sempre que os macros com atalho estão habilitados, "
+            "sem atalho. Use um tempo de repetição longo, como uma tecla "
+            "contra inatividade.",
+        "Add at least one step.": "Adicione pelo menos um passo.",
+        "An Always macro needs a repeat time of at least 10 ms.":
+            "Um macro Sempre precisa de um tempo de repetição de pelo menos "
+            "10 ms.",
+        "Remove macro": "Remover macro", "Remove {name}?": "Remover {name}?",
+        "Import AutoHotkey": "Importar AutoHotkey",
+        "AutoHotkey scripts": "Scripts do AutoHotkey",
+        "All files": "Todos os arquivos",
+        "1 macro found in {file}:": "1 macro encontrado em {file}:",
+        "{n} macros found in {file}:": "{n} macros encontrados em {file}:",
+        "Notes:": "Observações:",
+        "Only {n} fit: the list holds {max} macros.":
+            "Só cabem {n}: a lista comporta {max} macros.",
+        "Add these macros": "Adicionar estes macros",
+        "Running: {names}": "Rodando: {names}",
+        "Could not read {file}: {err}": "Não foi possível ler {file}: {err}",
+        "WayClick is running (pid {pid}). Import from its Hotkeys tab, or "
+        "quit it and run this again.":
+            "O WayClick está aberto (pid {pid}). Importe pela aba Atalhos, ou "
+            "feche o programa e rode isto de novo.",
+        "Added {n} macros to {cfg}.": "{n} macros adicionados em {cfg}.",
+        "Added 1 macro to {cfg}.": "1 macro adicionado em {cfg}.",
+        "line {ln}": "linha {ln}",
+        "hotstrings are not supported": "hotstrings não são suportadas",
+        "window-specific hotkeys (#If) work in every window here":
+            "atalhos só para uma janela (#If) valem em todas as janelas aqui",
+        "{name} starts with the script, imported as an Always macro":
+            "{name} começa junto com o script, importado como macro Sempre",
+        "{hk}: release hotkeys (Up) are not supported":
+            "{hk}: atalhos de soltar (Up) não são suportados",
+        "{hk}: two-key combinations are not supported":
+            "{hk}: combinações de duas teclas não são suportadas",
+        "{hk}: the mouse wheel cannot be a hotkey here":
+            "{hk}: a roda do mouse não pode ser atalho aqui",
+        "{hk}: key {name} is unknown": "{hk}: tecla {name} desconhecida",
+        "{hk}: nothing WayClick can do": "{hk}: nada que o WayClick consiga "
+                                         "fazer",
+        "{hk} clicks its own button, so it is hidden from the app even with "
+        "~ (otherwise the clicks would be lost)":
+            "{hk} clica o próprio botão, então fica escondido do programa "
+            "mesmo com ~ (senão os cliques se perderiam)",
+        "SetTimer: {name} was not found": "SetTimer: {name} não foi "
+                                          "encontrado",
+        "SetTimer period {p} is not a number, used 250 ms":
+            "o período {p} do SetTimer não é um número, usei 250 ms",
+        "SetTimer {ms} ms: on Windows AutoHotkey rounds timers up to 10 or "
+        "15.6 ms, so the script really ran about every 15 ms. WayClick runs "
+        "exactly {ms} ms; raise it in the macro if the game drops keys.":
+            "SetTimer {ms} ms: no Windows o AutoHotkey arredonda os timers "
+            "para 10 ou 15,6 ms, então o script rodava de verdade a cada uns "
+            "15 ms. O WayClick roda exatamente {ms} ms; aumente no macro se o "
+            "jogo perder teclas.",
+        "{hk} only stops a timer; in WayClick the hotkey that starts a macro "
+        "also stops it":
+            "{hk} só para um timer; no WayClick o atalho que começa um macro "
+            "também o para",
+        "{hk} only starts the timer; here the same hotkey also stops it":
+            "{hk} só liga o timer; aqui o mesmo atalho também desliga",
+        "while {c} is not understood, skipped":
+            "while {c} não foi entendido, ignorado",
+        "Loop {n} shortened to {m} repetitions":
+            "Loop {n} encurtado para {m} repetições",
+        "{hk}: an endless loop; here the hotkey turns it on and off":
+            "{hk}: um laço sem fim; aqui o atalho liga e desliga",
+        "{hk}: what runs before the loop was left out":
+            "{hk}: o que roda antes do laço ficou de fora",
+        "a condition inside the actions was skipped":
+            "uma condição no meio das ações foi ignorada",
+        "{name} was not found": "{name} não foi encontrado",
+        "{what} is not supported, skipped": "{what} não é suportado, ignorado",
+        "Sleep {a} is not a number, skipped":
+            "Sleep {a} não é um número, ignorado",
+        "moving the pointer to a screen position is not possible on Wayland, "
+        "skipped":
+            "mover o ponteiro para uma posição da tela não é possível no "
+            "Wayland, ignorado",
+        "click coordinates ignored: it clicks where the cursor is":
+            "coordenadas do clique ignoradas: clica onde o cursor estiver",
+        "key {name} is unknown": "tecla {name} desconhecida",
+        "the script is nested too deeply, the rest was skipped":
+            "o script tem aninhamento demais, o resto foi ignorado",
     },
 }
 LANGS = {"English": "en_US", "Português (BR)": "pt_BR"}
@@ -1912,6 +4278,410 @@ def set_autostart(on):
         return False
 
 
+# ------------------------------------------------- editor de macros (UI) ----
+STEP_KINDS = (("tap", "Tap a key or click"), ("down", "Hold down"),
+              ("up", "Release"), ("wait", "Wait"), ("text", "Type text"),
+              ("wheel", "Scroll the wheel"), ("move", "Move the pointer"))
+WHEEL_DIRS = (("up", "Up"), ("down", "Down"), ("left", "Left"),
+              ("right", "Right"))
+
+
+class _Rows:
+    """Linhas de um QFormLayout que aparecem e somem juntas com o rótulo.
+    QFormLayout.setRowVisible só existe do Qt 6.4 em diante."""
+
+    def __init__(self, form):
+        self.form, self.rows = form, {}
+
+    def add(self, key, text, widget):
+        lbl = QLabel(_(text))
+        self.form.addRow(lbl, widget)
+        self.rows[key] = (lbl, widget)
+        return widget
+
+    def show_only(self, keys):
+        for key, (lbl, widget) in self.rows.items():
+            lbl.setVisible(key in keys)
+            widget.setVisible(key in keys)
+
+
+class StepDialog(QDialog):
+    """Um passo do macro: apertar, segurar, soltar, esperar, digitar..."""
+
+    def __init__(self, parent=None, step=None):
+        super().__init__(parent)
+        self.setWindowTitle(_("Step"))
+        step = dict(step or {"op": "tap", "code": KEYS["E"]})
+        self.op = QComboBox()
+        for op, label in STEP_KINDS:
+            self.op.addItem(_(label), op)
+        self.op.setCurrentIndex(max(0, self.op.findData(step["op"])))
+        code = step.get("code") or KEYS["E"]
+        self.key = KeyCatcher(code, step.get("name") or trigger_label(code),
+                              allow_mouse=True)
+        self.times = QSpinBox()
+        self.times.setRange(1, 1000)
+        self.times.setValue(step.get("times", 1))
+        self.ms = QDoubleSpinBox()
+        self.ms.setRange(0.0, 3600000.0)
+        self.ms.setDecimals(1)
+        self.ms.setSuffix(" ms")
+        self.ms.setValue(step.get("ms", 100.0))
+        self.max = QDoubleSpinBox()
+        self.max.setRange(0.0, 3600000.0)
+        self.max.setDecimals(1)
+        self.max.setSuffix(" ms")
+        self.max.setSpecialValueText(_("no, exact"))
+        self.max.setValue(step.get("max", 0.0))
+        self.text = QLineEdit(step.get("text", ""))
+        self.text.setMaxLength(500)
+        self.wheel = QComboBox()
+        for d, label in WHEEL_DIRS:
+            self.wheel.addItem(_(label), d)
+        self.wheel.setCurrentIndex(max(0, self.wheel.findData(
+            step.get("dir", "down"))))
+        self.dx, self.dy = QSpinBox(), QSpinBox()
+        for box, key in ((self.dx, "dx"), (self.dy, "dy")):
+            box.setRange(-5000, 5000)
+            box.setValue(step.get(key, 0))
+        form = QFormLayout()
+        self.rows = _Rows(form)
+        form.addRow(QLabel(_("Action:")), self.op)
+        self.rows.add("key", "Key or button:", self.key)
+        self.rows.add("times", "Times:", self.times)
+        self.rows.add("ms", "Wait:", self.ms)
+        self.rows.add("max", "Random, up to:", self.max)
+        self.rows.add("text", "Text:", self.text)
+        self.rows.add("dir", "Direction:", self.wheel)
+        self.rows.add("dx", "Right (px):", self.dx)
+        self.rows.add("dy", "Down (px):", self.dy)
+        self.note = QLabel("")
+        self.note.setWordWrap(True)
+        self.note.setEnabled(False)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                   | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        col = QVBoxLayout(self)
+        col.addLayout(form)
+        col.addWidget(self.note)
+        col.addWidget(buttons)
+        self.op.currentIndexChanged.connect(self._sync)
+        self._sync()
+
+    NOTES = {"text": "Typed with a US keyboard layout: letters, digits and "
+                     "symbols land on the same physical keys.",
+             "move": "Moves by an amount, from where the pointer is. Wayland "
+                     "does not let a program put the pointer at a screen "
+                     "position.",
+             "wait": "Random, up to: each run waits a different time between "
+                     "the two values.",
+             "down": "Stays pressed until a Release step, or until the macro "
+                     "stops, which releases everything it held."}
+
+    def _sync(self, _i=0):
+        op = self.op.currentData()
+        shown = {"tap": ("key", "times"), "down": ("key",), "up": ("key",),
+                 "wait": ("ms", "max"), "text": ("text",),
+                 "wheel": ("dir", "times"), "move": ("dx", "dy")}[op]
+        self.rows.show_only(shown)
+        self.note.setText(_(self.NOTES[op]) if op in self.NOTES else "")
+        self.note.setVisible(op in self.NOTES)
+        self.adjustSize()
+
+    def step(self):
+        op = self.op.currentData()
+        s = {"op": op, "code": self.key.code, "name": self.key.name,
+             "times": self.times.value(), "ms": self.ms.value(),
+             "max": self.max.value(), "text": self.text.text(),
+             "dir": self.wheel.currentData(), "dx": self.dx.value(),
+             "dy": self.dy.value()}
+        if op in ("tap", "down", "up") and is_button(s["code"]):
+            s.pop("name")
+        return normalize_step(s)
+
+
+class MacroDialog(QDialog):
+    """Um macro inteiro: atalho, modo, repetição e a lista de passos."""
+
+    MODIFIER_BOXES = (("ctrl", "Ctrl"), ("shift", "Shift"), ("alt", "Alt"),
+                      ("super", "Super"))
+
+    def __init__(self, parent, macro):
+        super().__init__(parent)
+        self.setWindowTitle(_("Macro"))
+        self.resize(500, 560)
+        m = normalize_macro(macro)
+        self.mid = m["id"]
+        self.enabled = m["enabled"]
+        self.name = QLineEdit(m["name"])
+        self.name.setMaxLength(60)
+        self.name.setPlaceholderText(_("optional"))
+        code = m["code"]
+        self.hotkey = KeyCatcher(code or KEYS["F1"],
+                                 hotkey_label(dict(m, mods=[]))
+                                 if code else "F1", allow_mouse=True)
+        self.mods = {}
+        mod_row = QHBoxLayout()
+        mod_row.setContentsMargins(0, 0, 0, 0)
+        for key, label in self.MODIFIER_BOXES:
+            box = QCheckBox(label)
+            box.setChecked(key in m["mods"])
+            self.mods[key] = box
+            mod_row.addWidget(box)
+        mod_row.addStretch()
+        mod_w = QWidget()
+        mod_w.setLayout(mod_row)
+        self.block = QCheckBox(_("Hide the hotkey from other apps"))
+        self.block.setChecked(m["block"])
+        self.block.setToolTip(_(
+            "Like AutoHotkey: the game never sees the hotkey itself. Without "
+            "this, the key does its normal job too (AutoHotkey's ~ prefix)."))
+        self.mode = QComboBox()
+        for key in MACRO_MODES:
+            self.mode.addItem(_(MACRO_MODE_LABELS[key]), key)
+        self.mode.setCurrentIndex(max(0, self.mode.findData(m["mode"])))
+        self.repeat = QCheckBox(_("Repeat the steps"))
+        self.repeat.setChecked(m["repeat"])
+        self.period = QDoubleSpinBox()
+        self.period.setRange(0.0, 3600000.0)
+        self.period.setDecimals(1)
+        self.period.setSuffix(" ms")
+        self.period.setSpecialValueText(_("as soon as they end"))
+        self.period.setValue(m["period_ms"])
+        self.period.setToolTip(_(
+            "Counted from the start of one run to the start of the next, like "
+            "AutoHotkey's SetTimer. 1000 ms is once a second."))
+        self.press = QDoubleSpinBox()
+        self.press.setRange(0.0, 10000.0)
+        self.press.setDecimals(1)
+        self.press.setSuffix(" ms")
+        self.press.setSpecialValueText(_("auto"))
+        self.press.setValue(m["press_ms"])
+        self.press.setToolTip(_(
+            "How long each tap stays down. Auto is 40 ms, or half the repeat "
+            "time when that is shorter: games read keys once per frame and "
+            "miss a tap that is too short."))
+
+        form = QFormLayout()
+        form.addRow(QLabel(_("Name:")), self.name)
+        self.hk_lbl = QLabel(_("Hotkey:"))
+        form.addRow(self.hk_lbl, self.hotkey)
+        self.mods_lbl = QLabel(_("With:"))
+        form.addRow(self.mods_lbl, mod_w)
+        self.mod_w = mod_w
+        form.addRow("", self.block)
+        form.addRow(QLabel(_("Mode:")), self.mode)
+        rep_row = QHBoxLayout()
+        rep_row.setContentsMargins(0, 0, 0, 0)
+        rep_row.addWidget(self.repeat)
+        self.every = QLabel(_("every"))
+        rep_row.addWidget(self.every)
+        rep_row.addWidget(self.period, 1)
+        rep_w = QWidget()
+        rep_w.setLayout(rep_row)
+        self.rep_lbl = QLabel(_("Repeat:"))
+        form.addRow(self.rep_lbl, rep_w)
+        self.rep_w = rep_w
+        form.addRow(QLabel(_("Key press time:")), self.press)
+
+        self.steps = list(m["steps"])
+        self.step_list = QListWidget()
+        self.step_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.step_list.itemDoubleClicked.connect(lambda _i: self._edit_step())
+        self.step_list.currentRowChanged.connect(self._sync_buttons)
+        btns = QHBoxLayout()
+        self.b_add = QPushButton(_("+ Add"))
+        self.b_edit = QPushButton(_("Edit"))
+        self.b_del = QPushButton(_("Remove"))
+        self.b_up = QPushButton("↑")
+        self.b_down = QPushButton("↓")
+        for b in (self.b_up, self.b_down):
+            b.setFixedWidth(34)
+        self.b_up.setToolTip(_("Move up"))
+        self.b_down.setToolTip(_("Move down"))
+        self.b_add.clicked.connect(self._add_step)
+        self.b_edit.clicked.connect(self._edit_step)
+        self.b_del.clicked.connect(self._del_step)
+        self.b_up.clicked.connect(lambda: self._move_step(-1))
+        self.b_down.clicked.connect(lambda: self._move_step(1))
+        for b in (self.b_add, self.b_edit, self.b_del):
+            btns.addWidget(b)
+        btns.addStretch()
+        btns.addWidget(self.b_up)
+        btns.addWidget(self.b_down)
+
+        self.hint = QLabel("")
+        self.hint.setWordWrap(True)
+        self.hint.setEnabled(False)
+        self.error = QLabel("")
+        self.error.setStyleSheet("color:#d04030;")
+        self.error.setWordWrap(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                   | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._ok)
+        buttons.rejected.connect(self.reject)
+
+        col = QVBoxLayout(self)
+        col.addLayout(form)
+        steps_lbl = QLabel(_("Steps:"))
+        col.addWidget(steps_lbl)
+        col.addWidget(self.step_list, 1)
+        col.addLayout(btns)
+        col.addWidget(self.hint)
+        col.addWidget(self.error)
+        col.addWidget(buttons)
+        self.mode.currentIndexChanged.connect(self._sync)
+        self.repeat.toggled.connect(self._sync)
+        self._fill_steps()
+        self._sync()
+
+    # ------------------------------------------------------------- passos --
+    def _fill_steps(self, row=None):
+        self.step_list.clear()
+        for i, s in enumerate(self.steps, 1):
+            self.step_list.addItem(f"{i}. {step_label(s)}")
+        if self.steps:
+            self.step_list.setCurrentRow(
+                min(len(self.steps) - 1, row if row is not None else 0))
+        self._sync_buttons()
+
+    def _sync_buttons(self, _row=0):
+        row = self.step_list.currentRow()
+        has = 0 <= row < len(self.steps)
+        self.b_edit.setEnabled(has)
+        self.b_del.setEnabled(has)
+        self.b_up.setEnabled(has and row > 0)
+        self.b_down.setEnabled(has and row < len(self.steps) - 1)
+        self.b_add.setEnabled(len(self.steps) < MAX_STEPS)
+
+    def _add_step(self):
+        row = self.step_list.currentRow()
+        base = self.steps[row] if 0 <= row < len(self.steps) else None
+        dlg = StepDialog(self, base and dict(base) if base and base["op"]
+                         in ("tap", "down", "up") else None)
+        if dlg.exec() == QDialog.Accepted and dlg.step():
+            at = row + 1 if 0 <= row < len(self.steps) else len(self.steps)
+            self.steps.insert(at, dlg.step())
+            self._fill_steps(at)
+
+    def _edit_step(self):
+        row = self.step_list.currentRow()
+        if not 0 <= row < len(self.steps):
+            return
+        dlg = StepDialog(self, self.steps[row])
+        if dlg.exec() == QDialog.Accepted and dlg.step():
+            self.steps[row] = dlg.step()
+            self._fill_steps(row)
+
+    def _del_step(self):
+        row = self.step_list.currentRow()
+        if 0 <= row < len(self.steps):
+            del self.steps[row]
+            self._fill_steps(max(0, row - 1))
+
+    def _move_step(self, delta):
+        row = self.step_list.currentRow()
+        to = row + delta
+        if 0 <= row < len(self.steps) and 0 <= to < len(self.steps):
+            self.steps[row], self.steps[to] = self.steps[to], self.steps[row]
+            self._fill_steps(to)
+
+    # -------------------------------------------------------------- modo --
+    HINTS = {"toggle": "Press the hotkey to start, press it again to stop. "
+                       "This is what F1:: with a SetTimer does in AutoHotkey.",
+             "hold": "Runs while the hotkey is held and stops the moment you "
+                     "let go. Without repeat, keys held by the steps stay "
+                     "down until you let go, which makes a remap.",
+             "once": "Runs the steps once for every press.",
+             "always": "Runs on its own whenever hotkey macros are enabled, "
+                       "no hotkey needed. Use a long repeat time, like an "
+                       "anti idle key."}
+
+    def _sync(self, _x=None):
+        mode = self.mode.currentData()
+        keyed = mode != "always"
+        for w in (self.hk_lbl, self.hotkey, self.mods_lbl, self.mod_w,
+                  self.block):
+            w.setEnabled(keyed)
+        looping = mode != "once"
+        self.rep_lbl.setEnabled(looping)
+        self.rep_w.setEnabled(looping)
+        self.every.setEnabled(looping and self.repeat.isChecked())
+        self.period.setEnabled(looping and self.repeat.isChecked())
+        self.hint.setText(_(self.HINTS[mode]))
+
+    def _ok(self):
+        m = self.macro()
+        if not m["steps"]:
+            self.error.setText(_("Add at least one step."))
+            return
+        if m["mode"] == "always" and m["repeat"] and m["period_ms"] < 10:
+            self.error.setText(_("An Always macro needs a repeat time of at "
+                                 "least 10 ms."))
+            return
+        self.accept()
+
+    def macro(self):
+        mode = self.mode.currentData()
+        keyed = mode != "always"
+        code = self.hotkey.code if keyed else 0
+        return normalize_macro({
+            "id": self.mid, "name": self.name.text().strip(),
+            "enabled": self.enabled, "code": code,
+            "key": "" if is_button(code) else self.hotkey.name,
+            "mods": [k for k, b in self.mods.items() if b.isChecked()]
+            if keyed else [],
+            "mode": mode, "repeat": self.repeat.isChecked(),
+            "period_ms": self.period.value(),
+            "press_ms": self.press.value(),
+            "block": self.block.isChecked(), "steps": self.steps})
+
+
+def import_report(imp, source):
+    """Texto do que um .ahk vira: um macro por linha e as observações."""
+    n = len(imp.macros)
+    name = os.path.basename(source)
+    if n == 1:
+        lines = [_("1 macro found in {file}:", file=name)]
+    else:
+        lines = [_("{n} macros found in {file}:", n=n, file=name)]
+    for m in imp.macros:
+        head = f"{m['name']}  " if m["name"] else ""
+        lines.append(f"  • {head}[{macro_summary(m, 6)}]")
+    if imp.notes:
+        lines += ["", _("Notes:")]
+        lines += ["  " + note_text(x) for x in sorted(imp.notes,
+                                                      key=lambda x: x[0])]
+    return "\n".join(lines)
+
+
+class ImportDialog(QDialog):
+    """Mostra o que o script vira antes de acrescentar."""
+
+    def __init__(self, parent, imp, source, room):
+        super().__init__(parent)
+        self.setWindowTitle(_("Import AutoHotkey"))
+        self.resize(560, 380)
+        text = QPlainTextEdit(import_report(imp, source))
+        text.setReadOnly(True)
+        col = QVBoxLayout(self)
+        col.addWidget(text, 1)
+        if len(imp.macros) > room:
+            lbl = QLabel(_("Only {n} fit: the list holds {max} macros.",
+                           n=room, max=MAX_MACROS))
+            lbl.setStyleSheet("color:#c86000;")
+            col.addWidget(lbl)
+        buttons = QDialogButtonBox()
+        self.add = buttons.addButton(_("Add these macros"),
+                                     QDialogButtonBox.AcceptRole)
+        buttons.addButton(QDialogButtonBox.Cancel)
+        self.add.setEnabled(bool(imp.macros) and room > 0)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        col.addWidget(buttons)
+
+
 # ------------------------------------------------------------------ UI ------
 # "Runs" e não "Clicks": o modo gateia tudo o que estiver ligado — clique,
 # macro de teclado e tecla direcionada —, não só o clique.
@@ -1919,6 +4689,9 @@ def set_autostart(on):
 # modo com gatilhos diferentes, e obrigavam a escolher o modo certo antes de
 # poder escolher o gatilho — que é onde todo mundo tropeçava. Agora o campo
 # Gatilho aceita os dois e o modo só diz se ele segura ou não.
+MACRO_TAB_HINT = ("Each macro has its own hotkey and works in any window, even "
+                  "with WayClick stopped, like an AutoHotkey script. Import "
+                  "AHK converts the hotkeys of a .ahk file.")
 MODES = {"No trigger (hotkey toggles)": "toggle",
          "Runs while the trigger is held": "hold"}
 CFG = os.path.join(XDG_CONFIG, "wayclick.json")
@@ -1936,6 +4709,7 @@ class App(QWidget):
         self.keymacros = []
         self.antiafk = None
         self.running = False
+        self._macro_editing = False
 
         cfg = {}
         # aproveita a config do nome antigo do projeto, se existir
@@ -2003,6 +4777,14 @@ class App(QWidget):
         self.hk = KeyCatcher(cfg.get("hotkey_code")
                              or KEYNAMES.get(cfg.get("hotkey", "F8"), 66),
                              cfg.get("hotkey", "F8"))
+        # o AutoHotkey esconde o atalho do programa (F1:: some com o F1 do
+        # jogo); aqui é opcional, porque o atalho de armar sempre deixou a
+        # tecla passar e quem já usa não deve ser surpreendido
+        self.hk_block = QCheckBox(_("Hide it from other apps"))
+        self.hk_block.setChecked(bool(cfg.get("hotkey_block", False)))
+        self.hk_block.setToolTip(_(
+            "The hotkey still arms and disarms, but the game or app in front "
+            "never receives it."))
         self.mode = QComboBox()
         for label, key in MODES.items():
             self.mode.addItem(_(label), key)
@@ -2087,8 +4869,46 @@ class App(QWidget):
         self.scope_lbl = self._row(form, "Trigger holds:", scope_row)
         self._row(form, "Start delay:", self.delay)
         self._row(form, "Auto-stop after:", self.duration)
-        self._row(form, "Arm/disarm hotkey:", self.hk)
+        hk_row = QHBoxLayout()
+        hk_row.addWidget(self.hk, 1)
+        hk_row.addWidget(self.hk_block)
+        self._row(form, "Arm/disarm hotkey:", hk_row)
         trigger_form = form
+
+        # --- macros com atalho, como scripts do AutoHotkey ---
+        self.macros = [normalize_macro(m) for m in
+                       (cfg.get("macros") or [])
+                       if isinstance(m, dict)][:MAX_MACROS]
+        self.macro_box = QCheckBox(_("Enable hotkey macros"))
+        self.macro_box.setChecked(bool(cfg.get("macros_enabled", True)))
+        self.macro_list = QListWidget()
+        self.macro_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.macro_list.itemChanged.connect(self._macro_item_changed)
+        self.macro_list.itemDoubleClicked.connect(
+            lambda _i: self._edit_macro())
+        self.macro_list.currentRowChanged.connect(self._sync_macro_buttons)
+        self.m_new = QPushButton(_("New"))
+        self.m_edit = QPushButton(_("Edit"))
+        self.m_del = QPushButton(_("Remove"))
+        self.m_import = QPushButton(_("Import AHK…"))
+        self.m_import.setToolTip(_("Turn the hotkeys of an AutoHotkey script "
+                                   "(.ahk) into macros"))
+        self.m_new.clicked.connect(self._new_macro)
+        self.m_edit.clicked.connect(self._edit_macro)
+        self.m_del.clicked.connect(self._remove_macro)
+        self.m_import.clicked.connect(self._import_ahk)
+        mrow = QHBoxLayout()
+        for b in (self.m_new, self.m_edit, self.m_del):
+            mrow.addWidget(b)
+        mrow.addStretch()
+        mrow.addWidget(self.m_import)
+        self.macro_state = QLabel("")
+        self.macro_state.setWordWrap(True)
+        macro_form = QVBoxLayout()
+        macro_form.setContentsMargins(0, 0, 0, 0)
+        macro_form.addWidget(self.macro_list, 1)
+        macro_form.addLayout(mrow)
+        macro_form.addWidget(self.macro_state)
 
         # --- injeção direcionada a uma janela (beta) ---
         self.win_sel = QComboBox()
@@ -2162,13 +4982,17 @@ class App(QWidget):
         self.tabs.addTab(self._page(self.key_box, key_form,
                                     _("Click the key field and press the key "
                                       "you want.")), "")
+        self.tabs.addTab(self._page(self.macro_box, macro_form,
+                                    _(MACRO_TAB_HINT), grow=True), "")
         self.tabs.addTab(self._page(self.target_box, target_form, None,
                                     extra=self.win_warn), "")
         self.tabs.addTab(self._page(None, trigger_form, None,
                                     extra=[afk_row, checks]), "")
-        self._tab_names = ["Click", "Keyboard", "Window", "Trigger"]
+        self._tab_names = ["Click", "Keyboard", "Hotkeys", "Window",
+                           "Trigger"]
         self._sync_tabs()
-        for w_ in (self.click_box, self.key_box, self.target_box):
+        for w_ in (self.click_box, self.key_box, self.target_box,
+                   self.macro_box):
             w_.toggled.connect(self._sync_tabs)
 
         # barra de atualização: escondida até existir versão nova
@@ -2203,11 +5027,19 @@ class App(QWidget):
         self._paint_status()
 
         # atalho global
-        self.watcher = HotkeyWatcher(self.hk.code)
+        self.watcher = HotkeyWatcher(self.hk.code,
+                                     block=self.hk_block.isChecked())
         self.watcher.pressed.connect(self.on_press)
         self.watcher.released.connect(self.on_release)
         self.watcher.start()
         self.hk.changed.connect(self.on_hotkey_change)
+        self.hk_block.toggled.connect(self.watcher.set_block)
+
+        # macros com atalho: vivem independentes do Start
+        self.engine = MacroEngine(self._macro_outputs, hub=self.watcher.hub)
+        self.engine.changed.connect(self._macros_ran)
+        self.engine.toggled.connect(self._macro_toggled)
+        self.macro_box.toggled.connect(lambda _on: self._apply_macros())
 
         # fallback só com a janela em foco; desligado quando o global funciona,
         # senão a mesma tecla dispararia duas vezes e se anularia
@@ -2239,6 +5071,8 @@ class App(QWidget):
         # cria o mouse virtual já no início: o UI_DEV_CREATE precisa de ~0,4 s
         # de settle e travaria a UI se fosse feito no clique de Start
         self.ensure_mouse()
+        self._fill_macros()
+        self._apply_macros()
 
         if not self.watcher.ok:
             member = input_access()[1]
@@ -2304,7 +5138,7 @@ class App(QWidget):
                 "in any window. Pick a key that types nothing (F6-F12, Insert, "
                 "Pause, ScrollLock).", hk=hk))
 
-    def _page(self, enable, form, hint=None, extra=None):
+    def _page(self, enable, form, hint=None, extra=None, grow=False):
         """Uma aba: caixa de habilitar (quando a aba é uma engine), o
         formulário, e o que mais vier. Desabilitar a caixa apaga os campos,
         como o QGroupBox marcável fazia antes."""
@@ -2314,7 +5148,7 @@ class App(QWidget):
             col.addWidget(enable)
         fields = QWidget()
         fields.setLayout(form)
-        col.addWidget(fields)
+        col.addWidget(fields, 1 if grow else 0)
         if enable is not None:
             enable.toggled.connect(fields.setEnabled)
             fields.setEnabled(enable.isChecked())
@@ -2329,7 +5163,8 @@ class App(QWidget):
                 col.addWidget(item)
             elif item is not None:
                 col.addLayout(item)
-        col.addStretch()
+        if not grow:
+            col.addStretch()
         self.tab_pages.append(page)
         return page
 
@@ -2339,6 +5174,8 @@ class App(QWidget):
         # decide se as outras três chegam a rodar, e isso precisa ser visível
         # sem abrir a aba
         on = [self.click_box.isChecked(), self.key_box.isChecked(),
+              self.macro_box.isChecked() and any(
+                  m["enabled"] for m in getattr(self, "macros", [])),
               self.target_box.isChecked(), self.mode_key() != "toggle"]
         for i, name in enumerate(self._tab_names):
             mark = "● " if on[i] else ""
@@ -2473,6 +5310,17 @@ class App(QWidget):
             lbl.setText(_(src))
         self.click_box.setText(_("Enable clicking"))
         self.key_box.setText(_("Enable the keyboard macro"))
+        self.macro_box.setText(_("Enable hotkey macros"))
+        self.hk_block.setText(_("Hide it from other apps"))
+        self.hk_block.setToolTip(_(
+            "The hotkey still arms and disarms, but the game or app in front "
+            "never receives it."))
+        for b, src in ((self.m_new, "New"), (self.m_edit, "Edit"),
+                       (self.m_del, "Remove"), (self.m_import, "Import AHK…")):
+            b.setText(_(src))
+        self.m_import.setToolTip(_("Turn the hotkeys of an AutoHotkey script "
+                                   "(.ahk) into macros"))
+        self._fill_macros()
         self.target_box.setText(_("Enable sending the key"))
         self.afk.setText(_("Anti-AFK: nudge the cursor every"))
         for lbl, src in self._hints:
@@ -2570,8 +5418,15 @@ class App(QWidget):
             self.activateWindow()
         self._sync_tray()
 
+    def _tray_state(self):
+        state = getattr(self, "_state", "")
+        if not state and getattr(self, "engine", None) is not None \
+                and self.engine.running():
+            return "run"            # um macro com atalho rodando sozinho
+        return state
+
     def _tray_pixmap(self):
-        return tray_icon(getattr(self, "_state", ""), self._pulse,
+        return tray_icon(self._tray_state(), self._pulse,
                          self.tray_style, self.tray_color, self._burst)
 
     def _pulse_tick(self):
@@ -2610,7 +5465,7 @@ class App(QWidget):
     def _sync_tray(self):
         if not getattr(self, "tray", None):   # _paint_status roda antes da tray
             return
-        state = getattr(self, "_state", "")
+        state = self._tray_state()
         if state in ("run", "armed"):         # anima só enquanto trabalha
             if not self.pulse_timer.isActive():
                 self.pulse_timer.start()
@@ -2757,15 +5612,25 @@ class App(QWidget):
         if self.antiafk:            # a thread guarda o fd antigo
             self.antiafk.stop()
             self.antiafk = None
+        self.engine.stop_all()      # os macros também
         if self.mouse:
             self.mouse.close()
             self.mouse = None
         self.ensure_mouse()
         self._afk_restart()
+        self._apply_macros()
 
     def ensure_mouse(self):
         if self.mouse is not None:
             return True
+        ok = self._create_mouse()
+        if ok and hasattr(self, "engine"):
+            path = self.selected_mouse()[0]
+            if path:
+                self.engine.hub.set_output(path, self.mouse)
+        return ok
+
+    def _create_mouse(self):
         # clona o mouse escolhido para herdar velocidade/perfil de aceleração
         # que o usuário configurou; sem mouse acessível, cai no genérico
         path = self.selected_mouse()[0]
@@ -3125,7 +5990,8 @@ class App(QWidget):
             self._stop_key_macros()
             # a janela alvo pura Wayland injeta pelo mesmo teclado virtual:
             # só fechar o device quando ninguém mais depende dele
-            if self.keyboard and not self.target_box.isChecked():
+            if self.keyboard and not self.target_box.isChecked() \
+                    and not self._macros_need_keyboard():
                 self.keyboard.close()
                 self.keyboard = None
         self._show_status()
@@ -3315,6 +6181,11 @@ class App(QWidget):
             txt += ("   ⌨ " + self.win_key.name
                     + f" ×{self.target_hits}"
                     + (f" ({self.target_ms:.0f} ms)" if self.target_ms else ""))
+        running = self.engine.running() if hasattr(self, "engine") else []
+        if running:
+            txt += "   ⚡ " + ", ".join(m.name for m in running[:3])
+            if len(running) > 3:
+                txt += f" +{len(running) - 3}"
         self.status.setText(txt)
 
     def _tick_autostop(self):
@@ -3352,6 +6223,171 @@ class App(QWidget):
         self.warn.setText("")
         self._hint()
 
+    # ---------------------------------------------------- macros (atalhos) --
+    def _macro_outputs(self):
+        """Por onde os macros escrevem. Chamado da thread do hub, então só
+        devolve o que existe: criar device aqui travaria o relay 0,4 s."""
+        return self.keyboard, self.mouse
+
+    def _macros_need_keyboard(self):
+        if not self.macro_box.isChecked():
+            return False
+        return any(CompiledMacro(m).uses_keys for m in self.macros
+                   if m["enabled"] and m["steps"])
+
+    def _apply_macros(self):
+        """Entrega a lista ao motor. Roda a cada mudança: é barato, e só o
+        macro que mudou é parado."""
+        if not hasattr(self, "engine"):
+            return
+        active = self.macro_box.isChecked() and not self._macro_editing
+        if active and self._macros_need_keyboard():
+            self.ensure_keyboard()
+        path = self.selected_mouse()[0]
+        if path and self.mouse is not None:
+            # botão do mouse como atalho escondido: o relay sai pelo mesmo
+            # device por onde o Clicker clica
+            self.engine.hub.set_output(path, self.mouse)
+        self.engine.configure(self.macros, active)
+        self._sync_tabs()
+        self._macros_ran()
+
+    def _fill_macros(self):
+        if not hasattr(self, "macro_list"):
+            return
+        row = self.macro_list.currentRow()
+        self.macro_list.blockSignals(True)
+        self.macro_list.clear()
+        for m in self.macros:
+            title = m["name"] or hotkey_label(m)
+            item = QListWidgetItem(f"{title}\n{macro_summary(m)}")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if m["enabled"] else Qt.Unchecked)
+            item.setData(Qt.UserRole, m["id"])
+            self.macro_list.addItem(item)
+        self.macro_list.blockSignals(False)
+        if self.macros:
+            self.macro_list.setCurrentRow(max(0, min(row,
+                                                     len(self.macros) - 1)))
+        self._sync_macro_buttons()
+
+    def _sync_macro_buttons(self, _row=0):
+        row = self.macro_list.currentRow()
+        has = 0 <= row < len(self.macros)
+        self.m_edit.setEnabled(has)
+        self.m_del.setEnabled(has)
+        self.m_new.setEnabled(len(self.macros) < MAX_MACROS)
+        self.m_import.setEnabled(len(self.macros) < MAX_MACROS)
+
+    def _macro_item_changed(self, item):
+        row = self.macro_list.row(item)
+        if 0 <= row < len(self.macros):
+            self.macros[row]["enabled"] = item.checkState() == Qt.Checked
+            self._apply_macros()
+
+    def _run_macro_dialog(self, macro):
+        """O editor pausa os macros: escolher F1 como atalho de um macro que
+        já usa F1 seria impossível com ele rodando."""
+        self._macro_editing = True
+        self._apply_macros()
+        try:
+            dlg = MacroDialog(self, macro)
+            ok = dlg.exec() == QDialog.Accepted
+            return dlg.macro() if ok else None
+        finally:
+            self._macro_editing = False
+            self._apply_macros()
+
+    def _new_macro(self):
+        if len(self.macros) >= MAX_MACROS:
+            return
+        m = self._run_macro_dialog({
+            "code": KEYS["F1"], "key": "F1", "mode": "toggle",
+            "repeat": True, "period_ms": 100.0,
+            "steps": [{"op": "tap", "code": KEYS["E"]}]})
+        if m:
+            self.macros.append(m)
+            self._fill_macros()
+            self.macro_list.setCurrentRow(len(self.macros) - 1)
+            self._apply_macros()
+
+    def _edit_macro(self):
+        row = self.macro_list.currentRow()
+        if not 0 <= row < len(self.macros):
+            return
+        m = self._run_macro_dialog(self.macros[row])
+        if m:
+            self.macros[row] = m
+            self._fill_macros()
+            self._apply_macros()
+
+    def _remove_macro(self):
+        row = self.macro_list.currentRow()
+        if not 0 <= row < len(self.macros):
+            return
+        m = self.macros[row]
+        ask = QMessageBox.question(
+            self, _("Remove macro"),
+            _("Remove {name}?", name=m["name"] or hotkey_label(m)))
+        if ask != QMessageBox.Yes:
+            return
+        del self.macros[row]
+        self._fill_macros()
+        self._apply_macros()
+
+    def _import_ahk(self):
+        path, _f = QFileDialog.getOpenFileName(
+            self, _("Import AutoHotkey"), os.path.expanduser("~"),
+            _("AutoHotkey scripts") + " (*.ahk *.ah2 *.txt);;"
+            + _("All files") + " (*)")
+        if path:
+            self.import_ahk_path(path)
+
+    def import_ahk_path(self, path, ask=True):
+        """Lê o script, mostra no que ele vira e acrescenta os macros."""
+        try:
+            imp = import_ahk_file(path)
+        except OSError as e:
+            QMessageBox.warning(self, _("Import AutoHotkey"),
+                                _("Could not read {file}: {err}",
+                                  file=os.path.basename(path),
+                                  err=e.strerror or e))
+            return 0
+        room = MAX_MACROS - len(self.macros)
+        if ask:
+            dlg = ImportDialog(self, imp, path, room)
+            if dlg.exec() != QDialog.Accepted:
+                return 0
+        new = imp.macros[:max(0, room)]
+        self.macros += new
+        self._fill_macros()
+        if new:
+            self.macro_list.setCurrentRow(len(self.macros) - len(new))
+            self.macro_box.setChecked(True)
+        self._apply_macros()
+        return len(new)
+
+    def _macros_ran(self):
+        """Algum macro começou ou terminou (sinal vindo de outra thread)."""
+        if not hasattr(self, "macro_state"):
+            return
+        running = self.engine.running()
+        if running:
+            self.macro_state.setText("⚡ " + _("Running: {names}", names=", ".join(
+                m.name for m in running)))
+            self.macro_state.setStyleSheet("color:#27ae60;font-weight:bold;")
+        else:
+            self.macro_state.setText("")
+        # vazio e com quebra de linha, o QLabel comeria a altura da lista
+        self.macro_state.setVisible(bool(running))
+        if hasattr(self, "status"):
+            self._show_status()
+            self._sync_tray()
+
+    def _macro_toggled(self, on):
+        self._burst_start()
+        self._beep("on" if on else "off")
+
     # Limpeza via aboutToQuit e não closeEvent: sobrescrever closeEvent faz o
     # shiboken embrulhar o QCloseEvent, o que segfaulta no PySide6 + Python
     # 3.15rc do Fedora 45 quando a janela é fechada pelo botão do compositor.
@@ -3366,10 +6402,12 @@ class App(QWidget):
         self.target_timer.stop()
         if self.bridge:
             self.bridge.cleanup()
+        self.engine.close()
         self.watcher.stop()
         if self.trig_watcher:
             self.trig_watcher.stop()
             self.trig_watcher = None
+        self.watcher.hub.stop()      # solta toda captura antes de fechar
         if self.keyboard:
             self.keyboard.close()
             self.keyboard = None
@@ -3404,6 +6442,9 @@ class App(QWidget):
                            "target_key": self.win_key.name,
                            "target_key_code": self.win_key.code,
                            "target_seconds": self.win_secs.value(),
+                           "hotkey_block": self.hk_block.isChecked(),
+                           "macros": self.macros,
+                           "macros_enabled": self.macro_box.isChecked(),
                            "update_check": self.update_auto,
                            "update_tag": self._update_tag,
                            "update_url": self._update_url,
@@ -3424,13 +6465,82 @@ class App(QWidget):
 
 USAGE = f"""WayClick {VERSION} — autoclicker for Wayland, via /dev/uinput
 
-usage: wayclick [--tray] [--version] [--help]
+usage: wayclick [--tray] [--import FILE.ahk [--dry-run]] [--version] [--help]
 
-  --tray      start hidden in the system tray
-  --version   print the version and exit
-  --help      show this help and exit
+  --tray            start hidden in the system tray
+  --import FILE     turn the hotkeys of an AutoHotkey script into macros and
+                    add them to the config (WayClick must not be running)
+  --dry-run         with --import: only show what the script would become
+  --version         print the version and exit
+  --help            show this help and exit
 
 {HOMEPAGE}"""
+
+
+def _other_instance():
+    """Outro WayClick rodando? Ele grava a própria lista ao sair, então
+    importar por fora com ele aberto seria perdido."""
+    me = os.getpid()
+    for d in glob.glob("/proc/[0-9]*"):
+        try:
+            pid = int(os.path.basename(d))
+            if pid == me:
+                continue
+            with open(f"{d}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+        except (OSError, ValueError):
+            continue
+        if any(os.path.basename(x).startswith(b"wayclick") for x in argv[:2]) \
+                and b"--import" not in argv:
+            return pid
+    return None
+
+
+def cli_import(argv):
+    """wayclick --import arquivo.ahk [--dry-run]"""
+    global LANG
+    i = argv.index("--import")
+    if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+        print("usage: wayclick --import FILE.ahk [--dry-run]", file=sys.stderr)
+        return 2
+    path, dry = argv[i + 1], "--dry-run" in argv
+    cfg = {}
+    if os.path.exists(CFG):
+        try:
+            with open(CFG) as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError):
+            cfg = {}
+    LANG = cfg.get("language") or default_language()
+    try:
+        imp = import_ahk_file(path)
+    except OSError as e:
+        print(_("Could not read {file}: {err}", file=path,
+                err=e.strerror or e), file=sys.stderr)
+        return 1
+    print(import_report(imp, path))
+    if dry or not imp.macros:
+        return 0 if imp.macros else 1
+    pid = _other_instance()
+    if pid:
+        print("\n" + _("WayClick is running (pid {pid}). Import from its "
+                        "Hotkeys tab, or quit it and run this again.",
+                        pid=pid), file=sys.stderr)
+        return 1
+    old = [normalize_macro(m) for m in (cfg.get("macros") or [])
+           if isinstance(m, dict)]
+    room = MAX_MACROS - len(old)
+    cfg["macros"] = old + imp.macros[:max(0, room)]
+    cfg["macros_enabled"] = True
+    os.makedirs(os.path.dirname(CFG), exist_ok=True)
+    tmp = CFG + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(cfg, fh)
+    os.replace(tmp, CFG)
+    added = min(len(imp.macros), max(0, room))
+    print("\n" + (_("Added 1 macro to {cfg}.", cfg=CFG) if added == 1 else
+                   _("Added {n} macros to {cfg}.", n=added, cfg=CFG)))
+    return 0
 
 
 if __name__ == "__main__":
@@ -3440,6 +6550,8 @@ if __name__ == "__main__":
     if "--version" in sys.argv[1:] or "-V" in sys.argv[1:]:
         print(f"WayClick {VERSION}")
         sys.exit(0)
+    if "--import" in sys.argv[1:]:
+        sys.exit(cli_import(sys.argv[1:]))
     reexec_with_input_group()   # antes do Qt: pode substituir o processo
     app = QApplication(sys.argv)
     w = App()

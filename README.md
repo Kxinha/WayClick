@@ -21,6 +21,10 @@ running as root.
 - **Hold mode** — clicks only while you physically hold the mouse button
 - **Keyboard macro** — up to eight keys at once, each captured the way
   shortcuts are set, each with its own interval; repeat or hold
+- **Hotkey macros, AutoHotkey style**: each macro with its own hotkey (key or
+  mouse button, with modifiers), toggle, while held, once or always, a list of
+  steps, and the hotkey hidden from the game like AutoHotkey does. **Import
+  AHK** turns a `.ahk` script into macros
 - **Send key to a window** — pick an open window and feed it a key; for X11
   targets it arrives with no focus change, even minimized
 - **Anti-AFK** — nudges the pointer and puts it back, with zero drift
@@ -130,12 +134,14 @@ python3 wayclick.py
 ```bash
 wayclick            # normal
 wayclick --tray     # start hidden in the system tray
+wayclick --import script.ahk --dry-run   # what an AutoHotkey script becomes
 wayclick --version
 ```
 
-Four tabs: **Click**, **Keyboard** and **Window** are the three things it can
-run — each has an *enable* box, and the tab shows a dot when it is on, so you
-can see what is armed without opening it. Enable any combination. **Trigger** is
+Five tabs. **Hotkeys** holds the AutoHotkey style macros, which run on their
+own hotkeys and do not need Start. **Click**, **Keyboard** and **Window** are
+the three things Start can run. Each has an *enable* box, and the tab shows a
+dot when it is on, so you can see what is armed without opening it. Enable any combination. **Trigger** is
 how it all starts and stops, plus Anti-AFK, which runs on its own outside
 Start/Stop. Status and the Start button stay visible below the tabs, and the
 window is small enough for a 1366×768 screen.
@@ -197,6 +203,89 @@ One thing to expect in `Hold`: holding a normal key makes the system's own key
 repeat kick in, exactly as if you held it on your keyboard. Modifiers (Shift,
 Ctrl, Alt, Super) do not repeat, so they stay cleanly held.
 
+### Hotkeys (AutoHotkey style)
+
+What AutoHotkey does on Windows, for Wayland: each **macro** has its own
+hotkey and runs from any window, whatever has focus, even with WayClick
+stopped. Several live side by side, like several `.ahk` scripts running at
+once, and each one shows a mark in the list while it runs (plus a ⚡ in the
+status line and an animated tray icon).
+
+A macro is
+
+- a **hotkey**: any key or mouse button, set by pressing it, optionally with
+  Ctrl, Shift, Alt or Super. Extra modifiers do not get in the way: an `F1`
+  macro still fires while you hold Shift to sprint. When two macros share a
+  key, `Ctrl+F1` beats `F1` while Ctrl is down.
+- **Hide the hotkey from other apps**: on by default, as in AutoHotkey, so the
+  game never sees the `F1` you pressed. Turn it off and the key also does its
+  usual job (AutoHotkey's `~` prefix).
+- a **mode**: *Toggle* (press to start, again to stop), *While held* (stops the
+  moment you let go), *Once per press*, or *Always* (no hotkey, runs whenever
+  macros are enabled; good for an anti idle key every minute).
+- **Repeat the steps every N ms**, counted start to start like `SetTimer`, or
+  as soon as they end. **Key press time** is how long each tap stays down;
+  *auto* is 40 ms or half the repeat time, because games read keys once per
+  frame and miss a tap that is too short.
+- **steps**, in order: tap a key or click (N times), hold down, release, wait
+  (exact, or a random time between two values), type text, scroll the wheel,
+  move the pointer by an amount.
+
+Whatever a macro holds is released when it stops, when you disable it and when
+WayClick quits. A modifier you are holding for the hotkey is let go before the
+steps run, as AutoHotkey does, so `Alt+A` sending `Ctrl+C` arrives as `Ctrl+C`
+and not `Ctrl+Alt+C`. Opening the editor pauses the macros, so you can pick a
+hotkey that a running macro already uses.
+
+**Import AHK…** reads a `.ahk` file (v1 or v2) and turns its hotkeys into
+macros, showing first what each one became and what it could not convert, by
+line number. It is not an AutoHotkey interpreter; it recognises the patterns
+game scripts use:
+
+| In the script | Becomes |
+|---|---|
+| `F1::` + `toggle := !toggle` + `SetTimer, Label, 50` / `Off` | Toggle, every 50 ms |
+| `SetTimer(Func, t ? 50 : 0)`, `% toggle ? 1 : "Off"` | Toggle, every 50 / 1 ms |
+| `while toggle { ... }`, `Loop { if !toggle break ... }` | Toggle, steps in a loop |
+| `while GetKeyState("X", "P") { ... }`, `if state = U break` | While held |
+| `Send {RButton down}`, `KeyWait`, `{RButton up}` | While held, button held down |
+| `a::b`, `CapsLock::Ctrl` | While held, a remap |
+| `F5:: Send ..., Click, Sleep, Loop 3 { }` | Once per press |
+| `SetTimer` in the auto-execute section | Always |
+| `Send` with `{Key down}`, `{Key up}`, `{Key N}`, `^!+#`, text, `{Click}`, `{WheelDown N}`; `Click`, `Sleep`, `Random`, `MouseMove ..., R`, `Gosub`, functions, stacked hotkeys, `$`, `*`, `~`, `sc`/`vk` names, `SetKeyDelay` | the matching steps |
+
+Hotstrings, `Key Up` hotkeys, `A & B` combinations, `#If` window conditions
+(the hotkey works in every window instead), clicks at screen coordinates
+(Wayland does not allow positioning the pointer) and general scripting are
+reported and skipped.
+
+The script attached to the first request for this feature imports as *F1,
+toggle, every 1 ms, tap E*:
+
+```ahk
+F1::
+toggle := !toggle
+if (toggle)
+        SetTimer, SpamE, 1
+else
+        SetTimer, SpamE, Off
+return
+
+SpamE:
+Send, e
+return
+```
+
+One honest difference: on Windows, AutoHotkey rounds `SetTimer` up to 10 or
+15.6 ms, so that script really pressed E about 64 times a second. WayClick runs
+the 1 ms you asked for, 1,000 times a second (measured: median 1.000 ms between
+taps). The import report says so; raise the time in the macro if a game drops
+keys at that rate.
+
+From a terminal, `wayclick --import script.ahk --dry-run` prints the same
+report, and without `--dry-run` adds the macros to the config (with WayClick
+closed, since a running WayClick saves its own list on exit).
+
 ### Trigger
 
 **Mode**
@@ -233,6 +322,9 @@ first, otherwise the autoclicker clicks its own Stop button.
 Set by pressing it, same as everything else, so any key works; the field warns
 when you pick one that also types, since it would arm and disarm every time you
 pressed it anywhere. `Esc` always stops when the window is focused.
+**Hide it from other apps** keeps arming and disarming but stops the key from
+reaching the game, the way AutoHotkey hides its hotkeys; off by default, so
+nothing changes for whoever already uses it.
 
 It is not the trigger. Arming makes the trigger live, and the trigger is what
 runs things — which is what lets "arm with F8, run while holding left click"
@@ -324,12 +416,25 @@ one layer below the compositor.
 picks it up, the compositor treats it as hardware, and clicks land wherever your
 cursor is. To reach 10,000 clicks/s the press/SYN/release/SYN sequence goes out
 in a single `write()`, and the loop uses an absolute deadline: it sleeps for the
-bulk of the interval and busy-waits the last ~100 µs, because OS sleep
-granularity alone cannot hit sub-millisecond timing.
+bulk of the interval and, only below 1 ms, busy-waits the last few hundred µs,
+because OS sleep granularity alone cannot hit sub-millisecond timing. From 1 ms
+up it only sleeps (median period measured at 1.000 ms), since a busy-wait holds
+Python's GIL and would starve the thread that relays your keyboard.
 
 **Global hotkey** — reads `/dev/input/event*` directly, the only way to see keys
 that are not focused on your window. Keyboards created by remappers (keyd,
 kmonad, input-remapper) count as valid sources.
+
+**Hiding a hotkey.** The compositor has no API to swallow a key, so WayClick
+does it the way hold mode does with the mouse: one input thread reads every
+keyboard, and when some hotkey has to be hidden it takes an `EVIOCGRAB` on that
+keyboard and relays everything else through a virtual clone with the same name,
+ids, keys and LEDs (so KDE keeps your layout and Caps Lock still lights up).
+The grab only happens while no key is down, otherwise the compositor would see
+a press and never the release, and keys still down when it lets go are released
+on the clone. Relay latency measured at 0.04 ms median, also while a 1 ms macro
+runs. Every macro, the arm hotkey and hold mode share that one reader, which is
+why grabbing the keyboard does not deafen the others.
 
 **Per-window key** — Wayland gives input to whoever has focus and offers no way
 to address a surface; KWin's `fake_input`, the only injection protocol it
@@ -381,7 +486,24 @@ press a movement key too.
 ## Tests
 
 The files in `tests/` are runnable checks, not unit tests — they create fake
-input devices and measure real behaviour. Run them from the project root:
+input devices and measure real behaviour.
+
+These four are isolated and safe to run while you use the desktop, even with a
+game open: WayClick only opens devices named `wctest`, the fake keyboard and
+mouse are grabbed before their first event, and every virtual device WayClick
+creates is grabbed by the test the instant it appears, which is also how the
+test reads what would have reached the compositor (see `tests/harness.py`). No
+root needed.
+
+```bash
+python3 tests/t_ahk_import.py                       # the importer on the scripts in tests/ahk
+sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk at 1 ms, every mode, hiding, relay
+sg input -c "python3 tests/t_hotkeys_ui.py"         # the Hotkeys tab end to end, config, --import
+sg input -c "python3 tests/t_clicker_timing.py"     # Clicker period and keyboard relay together
+```
+
+Run them with `QT_QPA_PLATFORM=offscreen`. The rest need the compositor; run
+them from the project root:
 
 ```bash
 sg input -c "python3 tests/t_hold.py"        # hold mode end to end, with a fake mouse
