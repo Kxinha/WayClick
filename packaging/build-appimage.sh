@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Builds WayClick-<version>-x86_64.AppImage into dist/.
+# Needs curl and rsvg-convert (librsvg).
 #
 # Bundles a portable CPython plus PySide6-Essentials, so it runs on any distro
 # without installing anything. Qt modules WayClick does not use are stripped;
@@ -11,11 +12,16 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 VERSION=$(grep -oP '^VERSION = "\K[^"]+' wayclick.py)
 PYVER=3.12
-PY_RELEASE=python3.12.14-cp312-cp312-manylinux2014_x86_64.AppImage
+# python-appimage replaces the file on every CPython patch release, so the
+# name is looked up instead of pinned (the newest 3.12.x manylinux2014 build)
+PY_RELEASE=$(curl -fsSL "https://api.github.com/repos/niess/python-appimage/releases/tags/python$PYVER" \
+  | grep -oP "\"name\":\s*\"\Kpython$PYVER\.[0-9]+-cp${PYVER/./}-cp${PYVER/./}-manylinux2014_x86_64\.AppImage" \
+  | sort -V | tail -n1)
+[ -n "$PY_RELEASE" ] || { echo "no python$PYVER AppImage found" >&2; exit 1; }
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-echo "== fetching tools"
+echo "== fetching tools ($PY_RELEASE)"
 curl -fsSL -o "$WORK/appimagetool" \
   https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
 curl -fsSL -o "$WORK/python.AppImage" \
@@ -39,10 +45,14 @@ rm -f "$PS"/Qt/lib/libQt6{Quick,Qml,Designer,Labs}*.so.6*
 
 rm -f "$APPDIR"/AppRun "$APPDIR"/*.desktop "$APPDIR"/python.png "$APPDIR"/.DirIcon
 install -Dm755 wayclick.py "$APPDIR/usr/bin/wayclick.py"
-install -Dm644 packaging/wayclick.svg "$APPDIR/wayclick.svg"
+# appimagetool wants a PNG for .DirIcon (thumbnailers cannot be expected to
+# read SVG); the SVG stays in hicolor for the desktop entry
+rsvg-convert -w 256 -h 256 packaging/wayclick.svg -o "$APPDIR/wayclick.png"
+install -Dm644 packaging/wayclick.svg \
+    "$APPDIR/usr/share/icons/hicolor/scalable/apps/wayclick.svg"
 sed 's|^Exec=.*|Exec=wayclick|; s|^Icon=.*|Icon=wayclick|' packaging/wayclick.desktop \
     > "$APPDIR/wayclick.desktop"
-ln -sf wayclick.svg "$APPDIR/.DirIcon"
+ln -sf wayclick.png "$APPDIR/.DirIcon"
 cat > "$APPDIR/AppRun" <<APPRUN
 #!/bin/bash
 HERE="\$(dirname "\$(readlink -f "\$0")")"
@@ -54,6 +64,9 @@ APPRUN
 chmod +x "$APPDIR/AppRun"
 
 echo "== packing"
+# mktemp and the extracted Python leave some folders at 0700, which
+# appimagetool rejects: whoever runs the AppImage must be able to read it all
+chmod -R a+rX "$APPDIR"
 mkdir -p dist
 ARCH=x86_64 "$WORK/appimagetool" --no-appstream "$APPDIR" \
     "dist/WayClick-$VERSION-x86_64.AppImage" >/dev/null

@@ -376,15 +376,17 @@ class AntiAfk(threading.Thread):
     def __init__(self, mouse, seconds):
         super().__init__(daemon=True)
         self.mouse, self.seconds = mouse, max(seconds, 1)
-        self._stop = threading.Event()
+        # not "_stop": up to Python 3.12 that is a Thread method join() and
+        # is_alive() call, and shadowing it makes them raise TypeError
+        self._halt = threading.Event()
         self.count = 0
 
     def run(self):
         step = self.STEP
-        while not self._stop.wait(self.seconds):
+        while not self._halt.wait(self.seconds):
             try:
                 self.mouse.move(step)
-                stopping = self._stop.wait(self.GAP)
+                stopping = self._halt.wait(self.GAP)
                 self.mouse.move(-step)
                 if stopping:
                     return
@@ -394,7 +396,7 @@ class AntiAfk(threading.Thread):
                 return                      # device recriado/fechado
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
 
 class KeyMacro(threading.Thread):
@@ -407,25 +409,25 @@ class KeyMacro(threading.Thread):
         self.kb, self.code, self.hold = kb, keycode, hold
         self.interval = max(interval_ms, 1) / 1000.0
         self.press_time = min(self.HOLD_S, self.interval * 0.5)
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self.count = 0
 
     def run(self):
         try:
             if self.hold:
                 self.kb.set(self.code, True)
-                self._stop.wait()
+                self._halt.wait()
             else:
                 nxt = time.perf_counter()
-                while not self._stop.is_set():
+                while not self._halt.is_set():
                     self.kb.set(self.code, True)
-                    self._stop.wait(self.press_time)
+                    self._halt.wait(self.press_time)
                     self.kb.set(self.code, False)
                     self.count += 1
                     nxt += self.interval
                     rest = nxt - time.perf_counter()
                     if rest > 0:
-                        self._stop.wait(rest)
+                        self._halt.wait(rest)
                     else:
                         nxt = time.perf_counter()
         except OSError:
@@ -438,7 +440,7 @@ class KeyMacro(threading.Thread):
                     pass
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
 
 class Clicker(threading.Thread):
@@ -470,14 +472,14 @@ class Clicker(threading.Thread):
         self.hold = min(self.HOLD_S, self.interval * 0.5)
         self.press = VirtualMouse.edge(button, 1)
         self.release = VirtualMouse.edge(button, 0)
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self.count = 0
 
     def _until(self, deadline):
         """Dorme o grosso e queima o resto em busy-wait."""
         rest = deadline - time.perf_counter() - self.spin
         if rest > 0:
-            self._stop.wait(rest)
+            self._halt.wait(rest)
         while time.perf_counter() < deadline:
             pass
 
@@ -490,7 +492,7 @@ class Clicker(threading.Thread):
         # atalho global respondendo enquanto clicamos em alta frequência
         sys.setswitchinterval(0.002)
         write, fd = os.write, self.mouse.fd
-        clock, stop = time.perf_counter, self._stop
+        clock, stop = time.perf_counter, self._halt
         interval, hold = self.interval, self.hold
         nxt = clock()
         while not stop.is_set():
@@ -506,7 +508,7 @@ class Clicker(threading.Thread):
                 nxt = clock()
 
     def stop(self):
-        self._stop.set()
+        self._halt.set()
 
 
 # ------------------------------------------------------- hotkey global ------
@@ -1631,19 +1633,19 @@ class MacroRunner(threading.Thread):
         self.m, self.kb, self.mouse = macro, kb, mouse
         self.loop, self.keep = loop, keep
         self.on_done = on_done
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self.stopping = False
         self.count = 0
         self.held = []
 
     def stop(self):
         self.stopping = True
-        self._stop.set()
+        self._halt.set()
 
     def _until(self, deadline):
         rest = deadline - time.perf_counter()
         if rest > 0:
-            self._stop.wait(rest)
+            self._halt.wait(rest)
 
     def _sleep(self, seconds):
         if seconds > 0:
@@ -1661,7 +1663,7 @@ class MacroRunner(threading.Thread):
 
     def _tap(self, code, times=1):
         for i in range(times):
-            if i and self._stop.is_set():
+            if i and self._halt.is_set():
                 return
             self._set(code, True)
             self._sleep(self.m.press)
@@ -1696,7 +1698,7 @@ class MacroRunner(threading.Thread):
             self._sleep(ms / 1000.0)
         elif op == "text":
             for ch in st["text"]:
-                if self._stop.is_set():
+                if self._halt.is_set():
                     return
                 code, shift = CHAR_KEYS.get(ch, (0, False))
                 if not code:
@@ -1715,14 +1717,14 @@ class MacroRunner(threading.Thread):
         clock = time.perf_counter
         try:
             nxt = clock()
-            while not self._stop.is_set():
+            while not self._halt.is_set():
                 began = clock()
                 for st in self.m.steps:
-                    if self._stop.is_set():
+                    if self._halt.is_set():
                         break
                     self._step(st)
                 self.count += 1
-                if not self.loop or self._stop.is_set():
+                if not self.loop or self._halt.is_set():
                     break
                 if self.m.period > 0:
                     nxt += self.m.period
@@ -1732,7 +1734,7 @@ class MacroRunner(threading.Thread):
                 elif clock() - began < self.MIN_LOOP_S:
                     self._until(began + self.MIN_LOOP_S)
             if self.keep:
-                self._stop.wait()      # sem repetir: segura até mandarem parar
+                self._halt.wait()      # sem repetir: segura até mandarem parar
         except OSError:
             pass                         # device fechado no meio
         finally:

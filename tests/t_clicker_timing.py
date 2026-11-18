@@ -5,7 +5,7 @@ thread do hub, que repassa o teclado capturado, não fica sem a GIL. Mede o
 período real em 1 ms e 10 ms, que 0,1 ms ainda passa de 5.000 cliques/s, e o
 atraso do relay de teclado com o Clicker rodando.
 """
-import os, statistics, sys, time
+import inspect, os, statistics, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness as h                                         # noqa: E402
@@ -58,6 +58,15 @@ c.join()
 om.poll(0.05)
 n = len(om.keys(LEFT, 1))
 check("0.1 ms still clicks over 5,000 times a second", n > 5000, f"{n}/s")
+
+# até o Python 3.12, Thread._stop é um método que join() e is_alive() chamam;
+# um atributo com esse nome faz os dois darem TypeError (o AppImage e o
+# Ubuntu 24.04 usam 3.12, então isto pega o erro mesmo rodando num 3.13+)
+threads = [v for v in vars(a).values() if isinstance(v, type)
+           and issubclass(v, a.threading.Thread) and v.__module__ == a.__name__]
+bad = [t.__name__ for t in threads if "self._stop " in inspect.getsource(t)]
+check("no thread class shadows Thread._stop", threads and not bad,
+      f"{len(threads)} classes" + (f", bad {bad}" if bad else ""))
 
 hub.stop()
 vm.close()
