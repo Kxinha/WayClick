@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.6.0
+Version:        1.7.0
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -19,6 +19,11 @@ BuildRequires:  desktop-file-utils
 Requires:       python3 >= 3.9
 Requires:       python3-pyside6
 Recommends:     (python3-pyside6-multimedia or python3-pyside6)
+# os passos que olham a tela: achar imagem, cor de um ponto
+Recommends:     python3-numpy
+Recommends:     python3-gobject
+Recommends:     pipewire-gstreamer
+Recommends:     gstreamer1-plugins-base
 
 %description
 An autoclicker that works on Wayland. It creates a virtual mouse in the kernel
@@ -71,6 +76,20 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Fri Nov 20 2026 gabrielmf1998 <noreply@github.com> - 1.7.0-1
+- Screen steps in hotkey macros: go to an exact screen position and click,
+  find an image on screen, check a pixel color, send a notification or a
+  Discord webhook with screenshots, open a link or file
+- Image and color steps can wait until something appears or disappears,
+  and choose what comes next: continue, stop, start over or go to a step
+- Pick on screen takes a position, a color or a picture from the screen,
+  through the ScreenCast portal, remembered with a restore token
+- An absolute pointer device puts the cursor on an exact pixel, with an
+  optional curved, hand like movement and a random offset
+- Import AHK turns Click X, Y and MouseMove X, Y into screen positions
+- Image search checks every candidate in color, and keeps fine textures at
+  full size, so look alikes in another color are not taken for the picture
+
 * Wed Nov 18 2026 gabrielmf1998 <noreply@github.com> - 1.6.0-1
 - Hotkey macros in the AutoHotkey style: each with its own hotkey, toggle,
   while held, once or always, and a list of steps

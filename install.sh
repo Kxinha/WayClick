@@ -63,6 +63,27 @@ install_deps() {
         || die "PySide6 still not importable — install it manually, see $REPO"
 }
 
+# os passos que olham a tela (achar imagem, cor de um ponto) são opcionais:
+# o instalador só avisa o que falta, não instala nada a mais
+check_screen_deps() {
+    if python3 -c 'import numpy, gi
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst
+Gst.init(None)
+raise SystemExit(0 if all(Gst.ElementFactory.find(n) for n in
+    ("pipewiresrc", "videoconvert", "appsink")) else 1)' 2>/dev/null; then
+        info "screen steps ready (numpy, PyGObject, GStreamer PipeWire)"
+        return
+    fi
+    warn "optional: the screen steps (find an image, check a pixel color) need"
+    case "$FAMILY" in
+        arch)   info "sudo pacman -S python-numpy python-gobject gst-plugin-pipewire gst-plugins-base" ;;
+        fedora) info "sudo dnf install python3-numpy python3-gobject pipewire-gstreamer gstreamer1-plugins-base" ;;
+        debian) info "sudo apt install python3-numpy python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-pipewire gstreamer1.0-plugins-base" ;;
+        *)      info "numpy, PyGObject, GStreamer with its PipeWire plugin (pipewiresrc)" ;;
+    esac
+}
+
 # ------------------------------------------------------------ permissions ---
 setup_uinput() {
     # atualizar não deveria pedir senha: se a regra já existe e o device está
@@ -175,6 +196,7 @@ info "distro: $DISTRO_ID (${FAMILY} family)"
 [ "${XDG_SESSION_TYPE:-}" = "wayland" ] || warn "not a Wayland session right now"
 
 install_deps
+check_screen_deps
 setup_uinput
 setup_group
 fetch_app

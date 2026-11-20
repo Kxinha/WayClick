@@ -25,6 +25,11 @@ running as root.
   mouse button, with modifiers), toggle, while held, once or always, a list of
   steps, and the hotkey hidden from the game like AutoHotkey does. **Import
   AHK** turns a `.ahk` script into macros
+- **Screen steps** in those macros, like AutoHotkey's `ImageSearch` and
+  `PixelGetColor`. Go to an exact spot and click, find an image, check a pixel
+  color, wait until it shows up or goes away and choose what comes next, post
+  to a Discord webhook with a screenshot, open a link. **Pick on screen** takes
+  the spot, the color or the picture from your own screen
 - **Send key to a window** — pick an open window and feed it a key; for X11
   targets it arrives with no focus change, even minimized
 - **Anti-AFK** — nudges the pointer and puts it back, with zero drift
@@ -44,6 +49,7 @@ running as root.
 | Python | 3.9 or newer |
 | Qt bindings | PySide6 (`QtMultimedia` optional — only for the beeps) |
 | Permissions | your user in the `input` group, and `/dev/uinput` writable by it |
+| Screen steps (optional) | numpy, PyGObject and GStreamer with its PipeWire plugin, plus the desktop portal (`xdg-desktop-portal-kde` on Plasma) |
 
 ## Install
 
@@ -63,6 +69,13 @@ group once: `sudo usermod -aG input $USER`, then log out and back in. The
 AppImage carries its own Python and Qt and needs no dependencies at all — only
 the hotkey beeps are missing there, since PySide6-Essentials leaves out
 QtMultimedia; it falls back to `paplay` from your system.
+
+The steps that look at the screen (find an image, check a pixel color, a
+screenshot in a webhook) use numpy, PyGObject and GStreamer from your system,
+which the AppImage's own Python cannot load. There they report what is missing
+and take their *If not* path, and you type positions by hand instead of
+picking them. The rpm and deb recommend those packages, and the Arch package
+lists them as optional.
 
 ### One command
 
@@ -229,7 +242,7 @@ A macro is
   frame and miss a tap that is too short.
 - **steps**, in order: tap a key or click (N times), hold down, release, wait
   (exact, or a random time between two values), type text, scroll the wheel,
-  move the pointer by an amount.
+  move the pointer by an amount, and the [screen steps](#screen-steps).
 
 Whatever a macro holds is released when it stops, when you disable it and when
 WayClick quits. A modifier you are holding for the hotkey is let go before the
@@ -255,9 +268,10 @@ game scripts use:
 | `Send` with `{Key down}`, `{Key up}`, `{Key N}`, `^!+#`, text, `{Click}`, `{WheelDown N}`; `Click`, `Sleep`, `Random`, `MouseMove ..., R`, `Gosub`, functions, stacked hotkeys, `$`, `*`, `~`, `sc`/`vk` names, `SetKeyDelay` | the matching steps |
 
 Hotstrings, `Key Up` hotkeys, `A & B` combinations, `#If` window conditions
-(the hotkey works in every window instead), clicks at screen coordinates
-(Wayland does not allow positioning the pointer) and general scripting are
-reported and skipped.
+(the hotkey works in every window instead) and general scripting are reported
+and skipped. `Click X, Y` and `MouseMove X, Y` become
+[Go to a screen position](#screen-steps) steps, with a note when the script
+measured them from the active window, which is AutoHotkey's default.
 
 The script attached to the first request for this feature imports as *F1,
 toggle, every 1 ms, tap E*:
@@ -285,6 +299,54 @@ keys at that rate.
 From a terminal, `wayclick --import script.ahk --dry-run` prints the same
 report, and without `--dry-run` adds the macros to the config (with WayClick
 closed, since a running WayClick saves its own list on exit).
+
+### Screen steps
+
+Five more kinds of step cover what AutoHotkey scripts do with `Click X, Y`,
+`ImageSearch`, `PixelGetColor` and `Run`.
+
+| Step | What it does |
+|---|---|
+| **Go to a screen position** | Puts the pointer on an exact pixel, then clicks (left, right, middle or double) or only moves. *Curved, like a hand* glides there in the time you set instead of jumping, and *Random offset* lands up to that many pixels away each time. |
+| **Find an image on screen** | Looks for a picture on every screen, or only inside an area you mark, at a *Similarity* from 50 to 100 % (85 by default). When found it can point at it or click its center. |
+| **Check a pixel color** | Reads one point and compares it with a color, red, green and blue each within the *Tolerance*. |
+| **Send a notification** | A desktop notification. With a Discord webhook (channel settings, Integrations) it posts in that channel instead, and can attach a screenshot of each screen. |
+| **Open a link or file** | Opens it with the default program, so web pages, `roblox://` and `steam://` links and files all work. |
+
+The image and color steps can wait. *Wait until it* appears or disappears
+(for a color, has it or loses it), for up to the time you set, or *check
+once*. *If it happens* and *If not* then choose what comes next, which is to
+continue, stop the macro, start over from step 1 or go to a step by number.
+That is enough for the usual game loop of waiting for a button, clicking it,
+waiting for the round to end, collecting and starting over. By default a step
+that does not see what it waits for stops the macro, so nothing gets clicked
+blind.
+
+**Pick on screen…** fills the step from your own screen. After a countdown
+(*Capture after*, 3 s by default) that gives you time to switch to the game,
+WayClick takes one picture of every screen and shows it. Click the spot, and
+for a color step its color comes along, or drag a box around the picture to
+look for. Pictures are saved in `~/.local/share/wayclick/images`, and *Open
+file…* takes a PNG, JPEG, BMP or WebP instead.
+
+The first time a step needs the screen, the system asks which screens WayClick
+may see, in the same screen sharing dialog video calls use. WayClick asks the
+portal to remember the answer and keeps the token it gets back in
+`~/.config/wayclick/screen-token`, readable only by you, so where the desktop
+supports that, later runs skip the question. The share is open only while a
+macro needs it and closes after 30 s without use, so the screen sharing
+indicator in the panel only shows while something is looking.
+
+Positions follow the layout in Display Configuration, every screen together,
+with 0, 0 at the top left corner of the whole layout. With scaling they are in
+scaled units, so a 4K screen at 150 % counts as 2560 wide. AutoHotkey measures
+`Click X, Y` from the active window by default, which comes out the same for a
+fullscreen game on the leftmost screen.
+
+One limit to know about. While a game keeps the cursor locked, in a first
+person camera or while you drag to turn, KWin does not move the pointer at
+all, so a position step does nothing there. Use positions where the game shows
+a free cursor, such as menus, lobbies, shops and build screens.
 
 ### Trigger
 
@@ -459,6 +521,35 @@ The trigger is only swallowed when clicking is enabled, since that is when the
 autoclicker reemits it. Hold the button to drive just the keyboard macro and it
 is relayed as usual — you keep your button and get the macro.
 
+**Going to a position.** A relative mouse can only say how far to move, and
+pointer acceleration changes how far. So for screen steps WayClick creates one
+more device, an absolute pointer like the mouse a virtual machine gives its
+guest, with `ABS_X` and `ABS_Y` from 0 to 65535 and three buttons. udev tags
+it as a mouse, libinput hands it to KWin as absolute motion, and KWin spreads
+that range over the whole desktop, every screen together. WayClick turns the
+position into the value that lands on the center of that pixel, from the
+screen layout Qt reports, and follows the layout when screens change. Checked
+through libinput itself on three layouts, every corner and edge lands on its
+exact pixel. The kernel drops a value equal to the last one, so going to the
+same spot again first steps one unit aside. The device is only created when
+an enabled macro needs it.
+
+**Seeing the screen.** On Wayland only the compositor has the picture, and the
+way in for an ordinary program is the ScreenCast desktop portal, the one video
+calls use. WayClick talks to it on its own D-Bus connection, asks for every
+screen with the cursor left out, and reads the frames through PipeWire and
+GStreamer (`pipewiresrc`, `videoconvert`, `appsink`), ten per second. Finding
+an image is normalized cross correlation (OpenCV's `TM_CCOEFF_NORMED`) written
+in numpy with FFTs. Candidates come from the gray picture, at half or a
+quarter of the size when the template survives that (fine text and noise do
+not, and are searched at full size), and each one is then scored in all three
+colors and against its average color, so the same button greyed out, or the
+same icon in another color, does not count. Measured on synthetic 1920×1080
+screens (`tests/bench_find_image.py`), 284 of 288 random cuts from 16×16 to
+300×150 were found at their exact spot, with a median between about 30 and
+60 ms per screen. The other four landed on an equal copy, two flat areas of
+the same color and two 16 px cuts with a 0.999 twin.
+
 ## Troubleshooting
 
 **"Global hotkey OFF"** — you are not in the `input` group, or the session
@@ -483,12 +574,31 @@ watches pointer movement, not clicks. Turn on Anti-AFK. Some games go further
 and check whether your character moved, in which case use the keyboard macro to
 press a movement key too.
 
+**A position step does not move the cursor in a game.** The game has the
+pointer locked (a first person camera, or while you turn), and KWin does not
+move a locked pointer. Use the step where the game shows its cursor.
+
+**An image step never finds the picture.** Capture it again with the game at
+the resolution and scaling it runs at, since the search does not resize, and
+leave out parts that change, like counters or animated backgrounds. Lowering
+*Similarity* a little helps with compression and glow effects, and marking a
+search area makes it faster and keeps look alikes elsewhere out.
+
+**Screen steps say what to install.** Install the packages the message lists
+and restart WayClick. The AppImage cannot load them, so for screen steps use a
+package or `install.sh`.
+
+**The screen sharing question comes back every time.** The desktop did not
+keep the permission, or it refused the saved token. WayClick saves whatever
+token comes back each time, and deleting `~/.config/wayclick/screen-token`
+makes it ask afresh.
+
 ## Tests
 
 The files in `tests/` are runnable checks, not unit tests — they create fake
 input devices and measure real behaviour.
 
-These four are isolated and safe to run while you use the desktop, even with a
+These are isolated and safe to run while you use the desktop, even with a
 game open: WayClick only opens devices named `wctest`, the fake keyboard and
 mouse are grabbed before their first event, and every virtual device WayClick
 creates is grabbed by the test the instant it appears, which is also how the
@@ -499,8 +609,20 @@ root needed.
 python3 tests/t_ahk_import.py                       # the importer on the scripts in tests/ahk
 sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk at 1 ms, every mode, hiding, relay
 sg input -c "python3 tests/t_hotkeys_ui.py"         # the Hotkeys tab end to end, config, --import
+sg input -c "python3 tests/t_hotkeys_dialogs.py"    # the macro and step editors
 sg input -c "python3 tests/t_clicker_timing.py"     # Clicker period and keyboard relay together
+sg input -c "python3 tests/t_screen_macros.py"      # screen steps on a fake screen, positions, webhook
+sg input -c "python3 tests/t_screen_ui.py"          # step editor, Pick on screen, screen layout
+sg input -c "python3 tests/t_abs_pointer_libinput.py"  # the absolute pointer as libinput reads it
+python3 tests/t_screen_portal.py                    # the real portal, inside bubblewrap
+python3 tests/bench_find_image.py                   # image search, found or not and how fast
 ```
+
+`t_screen_portal.py` runs the real `xdg-desktop-portal` inside `bwrap` with
+its own D-Bus, its own PipeWire and a fake ScreenCast backend that serves
+synthetic screens, so no dialog appears and nothing of your screen is shared.
+It needs `bwrap`, `dbus-run-session`, `pipewire` and `wireplumber`, and skips
+when one is missing.
 
 Run them with `QT_QPA_PLATFORM=offscreen`. The rest need the compositor; run
 them from the project root:
@@ -540,7 +662,11 @@ partial translation still works. Strings with `{name}` placeholders keep them.
 
 Settings live in `~/.config/wayclick.json`. Nothing runs as root, nothing is
 installed system-wide except the udev rule, and the virtual devices disappear
-when the process exits.
+when the process exits. Pictures for image steps are kept in
+`~/.local/share/wayclick/images`, and the screen sharing token in
+`~/.config/wayclick/screen-token`. The screen is only shared while a macro
+needs it, and frames never leave the machine unless a step posts a screenshot
+to the webhook you gave it.
 
 Use it where automation is allowed. Plenty of online games ban input automation.
 

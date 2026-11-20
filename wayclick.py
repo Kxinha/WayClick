@@ -9,7 +9,7 @@ try:
     from PySide6.QtCore import (Qt, QObject, QPointF, QRectF, QTimer, QUrl, Signal,
                                 Slot)
     from PySide6.QtGui import (QAction, QBrush, QColor, QDesktopServices, QIcon,
-                               QLinearGradient,
+                               QImage, QLinearGradient,
                                QKeySequence, QPainter, QPainterPath, QPen,
                                QPixmap,
                                QShortcut)
@@ -31,7 +31,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -98,6 +98,7 @@ class UpdateCheck(QObject):
 # ---------------------------------------------------------------- uinput ----
 UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_RELBIT = 0x40045564, 0x40045565, 0x40045566
 UI_SET_MSCBIT = 0x40045568
+UI_SET_ABSBIT = 0x40045567
 UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
 UI_GET_SYSNAME = (2 << 30) | (64 << 16) | (ord("U") << 8) | 44
 EV_SYN, EV_KEY, EV_REL, EV_ABS, EV_MSC = 0, 1, 2, 3, 4
@@ -257,6 +258,115 @@ class VirtualMouse:
         except OSError:
             pass
         os.close(fd)
+
+
+ABS_X, ABS_Y = 0, 1
+ABS_RANGE = 65535
+PTR_NAME = b"wayclick-absolute-pointer"
+
+
+class AbsolutePointer:
+    """Ponteiro absoluto: põe o cursor num ponto exato da área de trabalho.
+
+    O Wayland não deixa um programa posicionar o cursor, e o mouse relativo
+    não chega lá (aceleração, borda da tela). Um device com ABS_X/ABS_Y e
+    botões, sem BTN_TOUCH, é o mouse absoluto das VMs (o tablet USB do QEMU e
+    do VMware): o udev o marca como mouse, o libinput entrega movimento
+    absoluto e o compositor estica a faixa 0..65535 sobre a área de trabalho
+    inteira, todas as telas juntas. É assim que o cursor de uma VM acompanha o
+    do host.
+    """
+    BUTTONS = (BTN["Left"], BTN["Right"], BTN["Middle"])
+
+    def __init__(self):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_ABS)
+        for code in self.BUTTONS:
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
+        for axis in (ABS_X, ABS_Y):
+            fcntl.ioctl(self.fd, UI_SET_ABSBIT, axis)
+        absmax = [0] * 64
+        absmax[ABS_X] = absmax[ABS_Y] = ABS_RANGE
+        os.write(self.fd, struct.pack("80s", PTR_NAME)
+                 + struct.pack("HHHH", 0x03, 0x1234, 0x5679, 1)
+                 + struct.pack("i", 0) + struct.pack("64i", *absmax)
+                 + b"\x00" * (3 * 64 * 4))     # absmin, absfuzz, absflat
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        self.node = uinput_node(self.fd)
+        _own(self.node)
+        self.pos = None          # onde pusemos o cursor da última vez
+        self._sent = (0, 0)      # valores dos eixos no kernel; nascem em 0
+        time.sleep(SETTLE_S)
+
+    @staticmethod
+    def axis(v, origin, size):
+        """Coordenada lógica -> valor do eixo. O libinput converte com
+        valor * tamanho / 65536; mirar no meio do pixel evita que o
+        arredondamento caia no vizinho."""
+        if size <= 0:
+            return 0
+        return max(0, min(ABS_RANGE, int((v - origin + 0.5)
+                                         * (ABS_RANGE + 1) / size)))
+
+    def warp(self, x, y, ws):
+        """Cursor em (x, y), nas coordenadas lógicas do compositor (as da
+        Configuração de Telas). ws: retângulo da área de trabalho.
+
+        O kernel descarta um valor absoluto igual ao anterior, e aí não sai
+        evento nenhum: se a pessoa mexeu o mouse desde o último warp para o
+        mesmo ponto, o cursor ficaria onde ela deixou e o clique cairia lá.
+        Por isso o mesmo ponto vai precedido de um vizinho no eixo X."""
+        ax, ay = self.axis(x, ws[0], ws[2]), self.axis(y, ws[1], ws[3])
+        data = b""
+        if (ax, ay) == self._sent:
+            data = _ev(EV_ABS, ABS_X, ax + 1 if ax < ABS_RANGE else ax - 1) \
+                + SYN
+        os.write(self.fd, data + _ev(EV_ABS, ABS_X, ax)
+                 + _ev(EV_ABS, ABS_Y, ay) + SYN)
+        self._sent = (ax, ay)
+        self.pos = (x, y)
+
+    def button(self, code, down):
+        os.write(self.fd, _ev(EV_KEY, code, 1 if down else 0) + SYN)
+
+    def close(self):
+        if self.fd < 0:
+            return
+        OWN_NODES.discard(self.node)
+        fd, self.fd = self.fd, -1
+        try:
+            fcntl.ioctl(fd, UI_DEV_DESTROY)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def human_path(start, end, n, rnd=random):
+    """n pontos de start a end numa curva de Bézier cúbica, acelerando no
+    começo e freando no fim, como a mão faz. O último é exatamente end."""
+    (x0, y0), (x1, y1) = start, end
+    dx, dy = x1 - x0, y1 - y0
+    dist = math.hypot(dx, dy)
+    if dist < 2 or n < 2:
+        return [end]
+    nx, ny = -dy / dist, dx / dist          # perpendicular ao caminho
+    bend = dist * rnd.uniform(0.04, 0.18) * rnd.choice((-1, 1))
+    a, b = rnd.uniform(0.2, 0.4), rnd.uniform(0.6, 0.8)
+    c1 = (x0 + dx * a + nx * bend, y0 + dy * a + ny * bend)
+    k = rnd.uniform(0.2, 0.9)
+    c2 = (x0 + dx * b + nx * bend * k, y0 + dy * b + ny * bend * k)
+    pts = []
+    for i in range(1, n + 1):
+        t = i / n
+        t = t * t * (3 - 2 * t)
+        u = 1 - t
+        pts.append((u * u * u * x0 + 3 * u * u * t * c1[0]
+                    + 3 * u * t * t * c2[0] + t * t * t * x1,
+                    u * u * u * y0 + 3 * u * u * t * c1[1]
+                    + 3 * u * t * t * c2[1] + t * t * t * y1))
+    pts[-1] = end
+    return pts
 
 
 # teclado completo para a macro (códigos de linux/input-event-codes.h).
@@ -1420,6 +1530,883 @@ class MouseHold(QObject):
         self.hub.remove(self)
 
 
+# ------------------------------------------------- tela: captura e imagens --
+# Passos que olham a tela (achar uma imagem, conferir a cor de um ponto)
+# precisam de quadros dela. No Wayland só o compositor tem a imagem, e o
+# caminho de um programa comum é o portal ScreenCast: o sistema pergunta uma
+# vez quais telas compartilhar e, com persist_mode=2, devolve um token que
+# pula a pergunta nas vezes seguintes. Os quadros vêm pelo PipeWire, e o
+# GStreamer (pipewiresrc -> appsink) os entrega ao numpy. Tudo opcional: sem
+# numpy, PyGObject ou o plugin PipeWire do GStreamer, só esses passos param,
+# dizendo o que instalar.
+SCREEN_FPS = 10          # quadros por segundo pedidos ao compositor
+SCREEN_IDLE_S = 30.0     # sem uso por esse tempo, a captura fecha
+SCREEN_ASK_S = 120.0     # quanto esperar a pessoa responder ao portal
+DEPS_HINT = ("Arch: sudo pacman -S python-numpy python-gobject "
+             "gst-plugin-pipewire gst-plugins-base\n"
+             "Fedora: sudo dnf install python3-numpy python3-gobject "
+             "pipewire-gstreamer gstreamer1-plugins-base\n"
+             "Debian/Ubuntu: sudo apt install python3-numpy python3-gi "
+             "gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 "
+             "gstreamer1.0-pipewire gstreamer1.0-plugins-base")
+
+
+class VisionError(Exception):
+    """Falta algo para olhar a tela; a mensagem diz o quê."""
+
+
+_NP = None
+
+
+def _numpy():
+    global _NP
+    if _NP is None:
+        try:
+            import numpy
+        except ImportError:
+            raise VisionError(_("Image and color steps need numpy.") + "\n"
+                              + DEPS_HINT) from None
+        _NP = numpy
+    return _NP
+
+
+class Frame:
+    """Um quadro de uma tela. rgb: array (altura, largura, 3) uint8; x, y, w,
+    h: o retângulo lógico que ele cobre, nas coordenadas do compositor. Com
+    escala de 150%, o quadro tem 1,5 pixel por unidade lógica."""
+    __slots__ = ("rgb", "x", "y", "w", "h")
+
+    def __init__(self, rgb, x=0, y=0, w=0, h=0):
+        self.rgb = rgb
+        self.x, self.y = int(x), int(y)
+        self.w = int(w) or rgb.shape[1]
+        self.h = int(h) or rgb.shape[0]
+
+    def to_global(self, px, py):
+        return (self.x + px * self.w / self.rgb.shape[1],
+                self.y + py * self.h / self.rgb.shape[0])
+
+    def to_pixel(self, gx, gy):
+        px = math.floor((gx - self.x) * self.rgb.shape[1] / self.w)
+        py = math.floor((gy - self.y) * self.rgb.shape[0] / self.h)
+        if 0 <= px < self.rgb.shape[1] and 0 <= py < self.rgb.shape[0]:
+            return px, py
+        return None
+
+    def crop(self, rect):
+        """A parte do quadro dentro de rect (lógico): (pixels, x0, y0)."""
+        x, y, w, h = rect
+        sx, sy = self.rgb.shape[1] / self.w, self.rgb.shape[0] / self.h
+        x0 = max(0, math.floor((x - self.x) * sx))
+        y0 = max(0, math.floor((y - self.y) * sy))
+        x1 = min(self.rgb.shape[1], math.ceil((x + w - self.x) * sx))
+        y1 = min(self.rgb.shape[0], math.ceil((y + h - self.y) * sy))
+        if x1 <= x0 or y1 <= y0:
+            return None, 0, 0
+        return self.rgb[y0:y1, x0:x1], x0, y0
+
+
+def _fast_len(n):
+    """Menor 2^a 3^b 5^c >= n: a FFT do numpy é rápida nesses tamanhos."""
+    best = 1 << max(0, (n - 1).bit_length())
+    p5 = 1
+    while p5 < best:
+        p35 = p5
+        while p35 < best:
+            q = p35
+            while q < n:
+                q *= 2
+            best = min(best, q)
+            p35 *= 3
+        p5 *= 5
+    return best
+
+
+def _box(np, a, h, w):
+    """Soma de cada janela h x w, por imagem integral (float64)."""
+    c = np.zeros((a.shape[0] + 1, a.shape[1] + 1))
+    np.cumsum(a, 0, out=c[1:, 1:])
+    np.cumsum(c[1:, 1:], 1, out=c[1:, 1:])
+    return c[h:, w:] - c[:-h, w:] - c[h:, :-w] + c[:-h, :-w]
+
+
+def _ncc(np, img, tpl):
+    """Correlação normalizada (o TM_CCOEFF_NORMED do OpenCV) de tpl em cada
+    posição de img, as duas em cinza. A correlação sai pela FFT e as somas
+    de cada janela pela imagem integral: custa o mesmo para qualquer tamanho
+    de template."""
+    H, W = img.shape
+    h, w = tpl.shape
+    t = tpl.astype(np.float64)
+    t -= t.mean()
+    tn = float(np.sqrt((t * t).sum()))
+    fs = (_fast_len(H), _fast_len(W))
+    corr = np.fft.irfft2(np.fft.rfft2(img, fs)
+                         * np.fft.rfft2(t[::-1, ::-1].astype(np.float32), fs),
+                         fs)[h - 1:H, w - 1:W]
+    i64 = img.astype(np.float64)
+    s1 = _box(np, i64, h, w)
+    var = _box(np, i64 * i64, h, w) - s1 * s1 / (h * w)
+    den = np.sqrt(np.maximum(var, 0.0)) * tn
+    out = np.zeros(corr.shape, np.float32)
+    # janela quase lisa não casa com nada: dividir ali só amplifica ruído
+    ok = den > max(1e-6, tn * 0.5 * math.sqrt(h * w))
+    out[ok] = corr[ok] / den[ok]
+    return out
+
+
+def _pool(np, a, f):
+    """Média de cada bloco f x f (f = 1, 2 ou 4), em cinza ou RGB. Somas com
+    passo 2 em vez de mean() sobre eixos: umas 5 vezes mais rápido."""
+    H, W = a.shape[0] // f * f, a.shape[1] // f * f
+    out = a[:H, :W].astype(np.float32)
+    while f > 1:
+        out = (out[0::2, 0::2] + out[1::2, 0::2] + out[0::2, 1::2]
+               + out[1::2, 1::2]) * 0.25
+        f //= 2
+    return out
+
+
+def _gray(np, rgb):
+    return rgb.astype(np.float32) @ np.array([0.299, 0.587, 0.114],
+                                             np.float32)
+
+
+def _peaks(np, score, k, floor, sh, sw):
+    """Até k máximos acima de floor, afastados uns dos outros. Primeiro o
+    melhor de cada bloco sh x sw, depois os k melhores blocos: um platô de
+    valores altos (textura repetida, degradê) não ocupa a lista inteira."""
+    H, W = score.shape
+    bh, bw = max(1, sh), max(1, sw)
+    Hb, Wb = -(-H // bh), -(-W // bw)
+    pad = np.full((Hb * bh, Wb * bw), -np.inf, np.float32)
+    pad[:H, :W] = score
+    blocks = pad.reshape(Hb, bh, Wb, bw).transpose(0, 2, 1, 3).reshape(
+        Hb, Wb, bh * bw)
+    arg = blocks.argmax(-1)
+    top = np.take_along_axis(blocks, arg[..., None], -1)[..., 0].ravel()
+    n = min(top.size, k * 4)
+    idx = np.argpartition(top, -n)[-n:]
+    idx = idx[np.argsort(top[idx])[::-1]]
+    out = []
+    for i in idx:
+        if top[i] < floor or len(out) >= k:
+            break
+        by, bx = divmod(int(i), Wb)
+        a = int(arg.flat[i])
+        y, x = by * bh + a // bw, bx * bw + a % bw
+        if all(abs(y - py) >= sh or abs(x - px) >= sw for py, px in out):
+            out.append((y, x))
+    return out
+
+
+FLAT_STD = 3.0           # template mais liso que isso é comparado por cor
+PHASE_MIN = 0.8          # abaixo disso a busca reduzida perderia o encaixe
+POOL2_MIN = 24           # lado menor do template para buscar a 1/2
+POOL4_MIN = 96           # e a 1/4
+
+
+def _phase_worst(np, tg, f):
+    """O score que um encaixe perfeito teria na busca reduzida, no pior caso.
+    A grade 1/f da tela cai em qualquer fase do template, e textura fina
+    (texto miúdo, ruído) muda muito de uma fase para outra: um template de
+    ruído a uma posição ímpar cai de 1,0 para 0,4 e some dos candidatos.
+    Formas e áreas de cor quase não mudam."""
+    h, w = tg.shape
+    hp, wp = (h - f + 1) // f, (w - f + 1) // f
+    if hp < 2 or wp < 2:
+        return 0.0
+    base = None
+    worst = 1.0
+    for dy in range(f):
+        for dx in range(f):
+            b = _pool(np, tg[dy:dy + hp * f, dx:dx + wp * f], f).ravel()
+            b = b - b.mean()
+            if base is None:
+                base, bn = b, float(np.sqrt((b * b).sum()))
+                continue
+            den = bn * float(np.sqrt((b * b).sum()))
+            worst = min(worst, float((base * b).sum()) / den
+                        if den > 1e-9 else 0.0)
+    return worst
+
+
+def _color_gate(np, diff):
+    """O quanto a cor média afasta do template tira do score: até 10 níveis
+    num canal não contam, depois cada nível tira 1/255."""
+    return 1.0 - np.maximum(0.0, diff - 10.0) / 255.0
+
+
+def _rgb_score(np, win, tc, tcn, tmean):
+    """Correlação nas três cores (o TM_CCOEFF_NORMED do OpenCV em imagem
+    colorida) de uma janela com o template já centrado (tc, norma tcn),
+    vezes o peso da cor média."""
+    a = win.reshape(-1, 3).astype(np.float64)
+    mean = a.mean(0)
+    a -= mean
+    den = tcn * float(np.sqrt((a * a).sum()))
+    s = float((a * tc).sum()) / den if den > 1e-9 else 0.0
+    return s * float(_color_gate(np, float(np.abs(mean - tmean).max())))
+
+
+def find_image(img, tpl, conf=0.85):
+    """Melhor lugar de tpl dentro de img (arrays RGB): (x, y, score) do
+    canto de cima à esquerda, ou None abaixo de conf.
+
+    Os candidatos saem da correlação em cinza, numa versão reduzida (1/2 ou
+    1/4) quando o template aguenta a redução, e são refinados no tamanho
+    real. A correlação ignora brilho e contraste, então a cor média de cada
+    janela já pesa na escolha dos candidatos, e o score final é a
+    correlação nas três cores (o TM_CCOEFF_NORMED do OpenCV em imagem
+    colorida) vezes essa cor média: o mesmo botão apagado, de outra cor ou
+    com o texto de outra cor perde pontos."""
+    np = _numpy()
+    H, W = img.shape[:2]
+    h, w = tpl.shape[:2]
+    if h < 1 or w < 1 or h > H or w > W:
+        return None
+    tg = _gray(np, tpl)
+    tmean = tpl.reshape(-1, 3).mean(0)
+    if float(tg.std()) < FLAT_STD:
+        # template liso (um pedaço de cor só): distância RMS da cor, por janela
+        ms = np.zeros((H - h + 1, W - w + 1))
+        for c in range(3):
+            ch = img[..., c].astype(np.float64)
+            m = float(tmean[c])
+            ms += (_box(np, ch * ch, h, w) - 2 * m * _box(np, ch, h, w)) \
+                / (h * w) + m * m
+        score = 1.0 - np.sqrt(np.maximum(ms / 3, 0)) / 100.0
+        y, x = np.unravel_index(int(np.argmax(score)), score.shape)
+        s = float(score[y, x])
+        return (int(x), int(y), s) if s >= conf else None
+
+    def centered(rgb):
+        c = rgb.reshape(-1, 3).astype(np.float64)
+        c -= c.mean(0)
+        return c, float(np.sqrt((c * c).sum()))
+
+    f = 4 if min(h, w) >= POOL4_MIN else 2 if min(h, w) >= POOL2_MIN else 1
+    stable = 1.0
+    while f > 1 and H * W >= 250000:
+        stable = _phase_worst(np, tg, f)
+        if stable >= PHASE_MIN:
+            break
+        f //= 2                 # textura fina: menos redução, ou nenhuma
+    if f == 1 or H * W < 250000:
+        f, stable = 1, 1.0
+        rgb = img
+        src, tsrc = _gray(np, img), tg
+    else:
+        rgb = _pool(np, img, f)
+        src, tsrc = _gray(np, rgb), _pool(np, tg, f)
+    th, tw = tsrc.shape
+    score = _ncc(np, src, tsrc)
+    # a correlação em cinza acha a forma e não vê cor: o mesmo ícone em outra
+    # cor, ou um traço igual de outra cor, dá 1,0 também, e esses empates
+    # enchem a lista. Cada candidato é conferido nas três cores ainda nesta
+    # escala, quantos couberem em ~2 milhões de contas
+    tq, tqn = centered(tpl if f == 1 else _pool(np, tpl, f))
+    budget = int(min(512, max(16, 2_000_000 // (th * tw * 3))))
+    ranked = sorted(((_rgb_score(np, rgb[cy:cy + th, cx:cx + tw], tq, tqn,
+                                 tmean), cy, cx)
+                     for cy, cx in _peaks(np, score, budget,
+                                          min(conf - 0.25,
+                                              conf * stable - 0.15),
+                                          max(1, th // 2), max(1, tw // 2))),
+                    reverse=True)
+    if f == 1:
+        if ranked and ranked[0][0] >= conf:
+            return (ranked[0][2], ranked[0][1], ranked[0][0])
+        return None
+    tc, tcn = centered(tpl)
+    best = None
+    for _s, cy, cx in ranked[:16]:
+        y0, x0 = max(0, cy * f - f), max(0, cx * f - f)
+        y1, x1 = min(H, cy * f + h + f), min(W, cx * f + w + f)
+        loc = _ncc(np, _gray(np, img[y0:y1, x0:x1]), tg)
+        ly, lx = np.unravel_index(int(np.argmax(loc)), loc.shape)
+        y, x = y0 + int(ly), x0 + int(lx)
+        sc = _rgb_score(np, img[y:y + h, x:x + w], tc, tcn, tmean)
+        if sc >= conf and (best is None or sc > best[2]):
+            best = (x, y, sc)
+    return best
+
+
+def locate(frames, tpl, conf, region=None):
+    """tpl em todas as telas: centro lógico (x, y) do melhor lugar e o
+    score, ou None. region (x, y, w, h) lógico limita a busca."""
+    best = None
+    th, tw = tpl.shape[:2]
+    for f in frames:
+        sub, ox, oy = f.crop(region) if region else (f.rgb, 0, 0)
+        if sub is None:
+            continue
+        hit = find_image(sub, tpl, conf)
+        if hit and (best is None or hit[2] > best[2]):
+            gx, gy = f.to_global(ox + hit[0] + tw / 2.0, oy + hit[1] + th / 2.0)
+            best = (gx, gy, hit[2])
+    return best
+
+
+def pixel_at(frames, x, y):
+    for f in frames:
+        p = f.to_pixel(x + 0.5, y + 0.5)
+        if p:
+            return tuple(int(c) for c in f.rgb[p[1], p[0]])
+    return None
+
+
+def parse_color(text):
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", str(text or "").strip())
+    if not m:
+        return None
+    v = int(m.group(1), 16)
+    return (v >> 16, (v >> 8) & 255, v & 255)
+
+
+def color_hex(rgb):
+    return "#%02x%02x%02x" % tuple(rgb)
+
+
+def color_close(a, b, tol):
+    return a is not None and max(abs(a[i] - b[i]) for i in range(3)) <= tol
+
+
+def qimage_rgb(img):
+    """QImage -> array RGB (altura, largura, 3)."""
+    np = _numpy()
+    img = img.convertToFormat(QImage.Format_RGB888)
+    w, h, bpl = img.width(), img.height(), img.bytesPerLine()
+    raw = np.frombuffer(bytes(img.constBits())[:bpl * h], np.uint8)
+    return raw.reshape(h, bpl)[:, :w * 3].reshape(h, w, 3).copy()
+
+
+def rgb_qimage(rgb):
+    np = _numpy()
+    h, w = rgb.shape[:2]
+    data = np.ascontiguousarray(rgb, np.uint8).tobytes()
+    return QImage(data, w, h, 3 * w, QImage.Format_RGB888).copy()
+
+
+def png_bytes(rgb):
+    """Array RGB -> PNG, só com zlib: serve em qualquer thread."""
+    import zlib
+    np = _numpy()
+    h, w = rgb.shape[:2]
+    raw = np.zeros((h, w * 3 + 1), np.uint8)       # filtro 0 em cada linha
+    raw[:, 1:] = np.ascontiguousarray(rgb, np.uint8).reshape(h, w * 3)
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw.tobytes(), 6))
+            + chunk(b"IEND", b""))
+
+
+_IMAGES = {}
+
+
+def load_image(path):
+    """Template de um passo, em cache até o arquivo mudar."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _IMAGES.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    img = QImage(path)
+    if img.isNull():
+        return None
+    rgb = qimage_rgb(img)
+    _IMAGES[path] = (key, rgb)
+    return rgb
+
+
+def images_dir():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+        "~/.local/share")
+    return os.path.join(base, "wayclick", "images")
+
+
+_GST = None
+
+
+def _gst_modules():
+    global _GST
+    if _GST is None:
+        try:
+            import gi
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gio, GLib, Gst
+        except (ImportError, ValueError):
+            raise VisionError(_("Seeing the screen needs PyGObject and "
+                                "GStreamer.") + "\n" + DEPS_HINT) from None
+        Gst.init(None)
+        for name in ("pipewiresrc", "videoconvert", "appsink"):
+            if Gst.ElementFactory.find(name) is None:
+                raise VisionError(_("Seeing the screen needs the GStreamer "
+                                    "element {name}.", name=name) + "\n"
+                                  + DEPS_HINT)
+        try:
+            gi.require_version("GstVideo", "1.0")
+            from gi.repository import GstVideo
+        except (ImportError, ValueError):
+            GstVideo = None
+        _GST = (Gio, GLib, Gst, GstVideo)
+    return _GST
+
+
+class _Stream:
+    """Uma tela do portal: pipewiresrc -> appsink, e o último quadro."""
+
+    def __init__(self, gst, fd, node, props):
+        _Gio, _GLib, self.Gst, self.GstVideo = gst
+        pos = props.get("position") or (0, 0)
+        size = props.get("size") or (0, 0)
+        self.x, self.y = int(pos[0]), int(pos[1])
+        self.w, self.h = int(size[0]), int(size[1])
+        self.last = None
+        self.pipe = self.sink = None
+        err = ""
+        # o limite de quadros alivia o compositor (no jogo a tela muda a cada
+        # quadro); se a negociação não aceitar, vai sem ele
+        for rate in (f"video/x-raw,max-framerate={SCREEN_FPS}/1 ! ", ""):
+            pipe = self.Gst.parse_launch(
+                f"pipewiresrc fd={fd} path={int(node)} do-timestamp=true "
+                f"! {rate}videoconvert "
+                "! video/x-raw,format={BGRx,BGRA,RGBx,RGBA} "
+                "! appsink name=sink max-buffers=1 drop=true sync=false")
+            sink = pipe.get_by_name("sink")
+            pipe.set_state(self.Gst.State.PLAYING)
+            sample = sink.emit("try-pull-sample", 5 * self.Gst.SECOND)
+            if sample is not None:
+                self.pipe, self.sink = pipe, sink
+                self.last = self._convert(sample)
+                return
+            msg = pipe.get_bus().pop_filtered(self.Gst.MessageType.ERROR)
+            if msg is not None:
+                err = msg.parse_error()[0].message
+            pipe.set_state(self.Gst.State.NULL)
+        raise VisionError(_("No picture came from the screen.")
+                          + (f" ({err})" if err else ""))
+
+    def latest(self):
+        sample = self.sink.emit("try-pull-sample", 0)
+        if sample is not None:
+            f = self._convert(sample)
+            if f is not None:
+                self.last = f
+        return self.last
+
+    def _convert(self, sample):
+        np = _numpy()
+        caps = sample.get_caps()
+        buf = sample.get_buffer()
+        if caps is None or buf is None:
+            return None
+        s = caps.get_structure(0)
+        fmt = s.get_value("format")
+        w, h = s.get_value("width"), s.get_value("height")
+        data = buf.extract_dup(0, buf.get_size())
+        stride, offset = w * 4, 0
+        meta = None
+        if self.GstVideo is not None:
+            try:
+                meta = self.GstVideo.buffer_get_video_meta(buf)
+            except (AttributeError, TypeError):
+                meta = None
+        if meta is not None:
+            stride, offset = int(meta.stride[0]), int(meta.offset[0])
+        elif h and len(data) % h == 0 and len(data) // h >= w * 4:
+            stride = len(data) // h
+        need = stride * h
+        raw = np.frombuffer(data, np.uint8)[offset:offset + need]
+        if raw.size < need - (stride - w * 4):
+            return None
+        if raw.size < need:
+            raw = np.concatenate([raw, np.zeros(need - raw.size, np.uint8)])
+        px = raw.reshape(h, stride)[:, :w * 4].reshape(h, w, 4)
+        rgb = px[..., [2, 1, 0]] if fmt.startswith("BGR") else px[..., :3]
+        return Frame(np.ascontiguousarray(rgb), self.x, self.y, self.w or w,
+                     self.h or h)
+
+    def broken(self):
+        msg = self.pipe.get_bus().pop_filtered(
+            self.Gst.MessageType.ERROR | self.Gst.MessageType.EOS)
+        return msg is not None
+
+    def close(self):
+        if self.pipe is not None:
+            self.pipe.set_state(self.Gst.State.NULL)
+            self.pipe = self.sink = None
+
+
+class ScreenCapture:
+    """Quadros das telas pelo portal ScreenCast; uma instância para o app.
+
+    ensure() liga a captura (na primeira vez o sistema pergunta quais telas
+    compartilhar) e espera; frames() devolve o quadro mais recente de cada
+    tela. Serve a qualquer thread: os macros pedem quadros das deles. Sessão
+    do portal e GStreamer vivem numa thread própria, com GLib.MainContext
+    próprio, sem depender do laço do Qt. Sem uso por SCREEN_IDLE_S, fecha, e
+    o aviso de compartilhamento do sistema some.
+    """
+    BUS = "org.freedesktop.portal.Desktop"
+    PATH = "/org/freedesktop/portal/desktop"
+    IFACE = "org.freedesktop.portal.ScreenCast"
+
+    def __init__(self, token_file=None):
+        self.token_file = token_file
+        self.token = ""
+        if token_file:
+            try:
+                with open(token_file) as fh:
+                    self.token = fh.read().strip()[:200]
+            except OSError:
+                pass
+        self.lock = threading.RLock()
+        self.state = "off"           # off, starting, on, failed
+        self.error = ""
+        self.users = 0
+        self.used = 0.0
+        self.streams = []
+        self._ready = threading.Event()
+        self._halt = threading.Event()
+        self._thread = None
+
+    # ------------------------------------------------------------ uso --
+    def acquire(self):
+        with self.lock:
+            self.users += 1
+            self.used = time.monotonic()
+
+    def release(self):
+        with self.lock:
+            self.users = max(0, self.users - 1)
+            self.used = time.monotonic()
+
+    def start(self):
+        """Pede a captura e volta na hora; ensure() é quem espera."""
+        with self.lock:
+            self.used = time.monotonic()
+            if self.state in ("starting", "on"):
+                return
+            self.state, self.error = "starting", ""
+            self._ready.clear()
+            self._halt.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name="wayclick-screen")
+            self._thread.start()
+
+    def ensure(self, timeout=SCREEN_ASK_S):
+        self.start()
+        self._ready.wait(timeout)
+        return self.state == "on"
+
+    def frames(self):
+        with self.lock:
+            if self.state != "on":
+                return []
+            self.used = time.monotonic()
+            out = []
+            for st in self.streams:
+                f = st.latest()
+                if f is not None:
+                    out.append(f)
+            return out
+
+    def stop(self, join=True):
+        self._halt.set()
+        t = self._thread
+        if join and t is not None and t is not threading.current_thread():
+            t.join(timeout=3.0)
+
+    # --------------------------------------------------------- portal --
+    def _save_token(self, token):
+        self.token = token
+        if not self.token_file:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.token_file), exist_ok=True)
+            fd = os.open(self.token_file, os.O_WRONLY | os.O_CREAT
+                         | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(token)
+        except OSError:
+            pass
+
+    def _prop(self, bus, gst, name):
+        Gio, GLib = gst[0], gst[1]
+        try:
+            v = bus.call_sync(self.BUS, self.PATH,
+                              "org.freedesktop.DBus.Properties", "Get",
+                              GLib.Variant("(ss)", (self.IFACE, name)),
+                              GLib.VariantType.new("(v)"),
+                              Gio.DBusCallFlags.NONE, 5000, None)
+        except GLib.Error:
+            return None
+        return v.unpack()[0]
+
+    def _request(self, bus, ctx, gst, method, sig, values, opts, wait_s):
+        """Método do portal que responde pelo sinal Request.Response."""
+        Gio, GLib = gst[0], gst[1]
+        token = "wayclick_" + os.urandom(6).hex()
+        sender = bus.get_unique_name()[1:].replace(".", "_")
+        path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+        box = {}
+
+        def got(_conn, _snd, _path, _iface, _sig, params, *_x):
+            box["r"] = params.unpack()
+        sid = bus.signal_subscribe(None, "org.freedesktop.portal.Request",
+                                   "Response", path, None,
+                                   Gio.DBusSignalFlags.NONE, got)
+        try:
+            opts = dict(opts, handle_token=GLib.Variant("s", token))
+            bus.call_sync(self.BUS, self.PATH, self.IFACE, method,
+                          GLib.Variant("(" + sig + "a{sv})",
+                                       tuple(values) + (opts,)),
+                          GLib.VariantType.new("(o)"),
+                          Gio.DBusCallFlags.NONE, 30000, None)
+            deadline = time.monotonic() + wait_s
+            while "r" not in box:
+                if self._halt.is_set() or time.monotonic() > deadline:
+                    try:
+                        bus.call_sync(self.BUS, path,
+                                      "org.freedesktop.portal.Request",
+                                      "Close", None, None,
+                                      Gio.DBusCallFlags.NONE, 3000, None)
+                    except GLib.Error:
+                        pass
+                    raise VisionError(_("Stopped.") if self._halt.is_set()
+                                      else _("The system did not answer the "
+                                             "screen sharing request."))
+                while ctx.pending():
+                    ctx.iteration(False)
+                if "r" not in box:
+                    self._halt.wait(0.02)
+        finally:
+            bus.signal_unsubscribe(sid)
+        code, results = box["r"]
+        if code == 1:
+            raise VisionError(_("Screen sharing was not allowed."))
+        if code != 0:
+            raise VisionError(_("The screen sharing request failed."))
+        return results
+
+    def _handshake(self, bus, ctx, gst):
+        Gio, GLib = gst[0], gst[1]
+        V = GLib.Variant
+        version = self._prop(bus, gst, "version")
+        if version is None:
+            raise VisionError(_("No screen sharing portal answered. "
+                                "xdg-desktop-portal and the one for your "
+                                "desktop (KDE, GNOME, wlr) must be "
+                                "installed."))
+        cursors = self._prop(bus, gst, "AvailableCursorModes") or 0
+        res = self._request(bus, ctx, gst, "CreateSession", "", (), {
+            "session_handle_token": V("s", "wayclick_"
+                                      + os.urandom(6).hex())}, 30)
+        session = str(res.get("session_handle") or "")
+        if not session:
+            raise VisionError(_("The screen sharing request failed."))
+        self._session = session
+        opts = {"types": V("u", 1), "multiple": V("b", True)}
+        if cursors & 1:                  # sem o cursor: ele atrapalha a busca
+            opts["cursor_mode"] = V("u", 1)
+        if version >= 4:
+            opts["persist_mode"] = V("u", 2)
+            if self.token:
+                opts["restore_token"] = V("s", self.token)
+        self._request(bus, ctx, gst, "SelectSources", "o", (session,), opts,
+                      30)
+        res = self._request(bus, ctx, gst, "Start", "os", (session, ""), {},
+                            SCREEN_ASK_S)
+        if res.get("restore_token"):
+            # o token vale uma vez só: cada Start devolve outro
+            self._save_token(str(res["restore_token"]))
+        streams = res.get("streams") or []
+        if not streams:
+            raise VisionError(_("No screen was shared."))
+        out, fds = bus.call_with_unix_fd_list_sync(
+            self.BUS, self.PATH, self.IFACE, "OpenPipeWireRemote",
+            V("(oa{sv})", (session, {})), GLib.VariantType.new("(h)"),
+            Gio.DBusCallFlags.NONE, 10000, None, None)
+        return session, streams, fds.get(out.unpack()[0])
+
+    def _run(self):
+        bus = ctx = None
+        fd = None
+        self._session = None
+        streams = []
+        failed = ""
+        try:
+            gst = _gst_modules()
+            Gio, GLib = gst[0], gst[1]
+            ctx = GLib.MainContext.new()
+            ctx.push_thread_default()
+            try:
+                bus = Gio.DBusConnection.new_for_address_sync(
+                    Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION,
+                                                      None),
+                    Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+                    | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+                    None, None)
+            except GLib.Error as e:
+                raise VisionError(_("No session D-Bus: {err}",
+                                    err=e.message)) from None
+            session, nodes, fd = self._handshake(bus, ctx, gst)
+            for node, props in nodes:
+                streams.append(_Stream(gst, fd, node, props))
+            with self.lock:
+                self.streams = streams
+                self.state = "on"
+                # o ócio conta daqui: a pessoa pode ter levado minutos no
+                # diálogo, e quem pediu ainda nem pegou a captura
+                self.used = time.monotonic()
+            self._ready.set()
+            self._watch(bus, ctx, gst, session)
+        except VisionError as e:
+            failed = str(e)
+        except Exception as e:          # GLib.Error e afins: vira mensagem
+            failed = _("Screen capture failed: {err}",
+                       err=getattr(e, "message", None) or str(e))
+        finally:
+            with self.lock:
+                self.streams = []
+                self.state = "failed" if failed else "off"
+                self.error = failed
+            for st in streams:
+                st.close()
+            if bus is not None:
+                if self._session:
+                    try:
+                        bus.call_sync(self.BUS, self._session,
+                                      "org.freedesktop.portal.Session",
+                                      "Close", None, None,
+                                      _GST[0].DBusCallFlags.NONE, 3000, None)
+                    except Exception:
+                        pass
+                try:
+                    bus.close_sync(None)
+                except Exception:
+                    pass
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if ctx is not None:
+                ctx.pop_thread_default()
+            self._ready.set()
+
+    def _watch(self, bus, ctx, gst, session):
+        Gio = gst[0]
+        closed = []
+        sid = bus.signal_subscribe(None, "org.freedesktop.portal.Session",
+                                   "Closed", session, None,
+                                   Gio.DBusSignalFlags.NONE,
+                                   lambda *a: closed.append(1))
+        try:
+            while not self._halt.is_set():
+                while ctx.pending():
+                    ctx.iteration(False)
+                if closed:
+                    self._session = None
+                    break
+                with self.lock:
+                    if any(st.broken() for st in self.streams):
+                        break
+                    if self.users == 0 and \
+                            time.monotonic() - self.used > SCREEN_IDLE_S:
+                        break
+                self._halt.wait(0.25)
+        finally:
+            bus.signal_unsubscribe(sid)
+
+
+_SCREEN = None
+
+
+def SCREEN():
+    """A captura do app, criada na primeira vez que alguém precisa."""
+    global _SCREEN
+    if _SCREEN is None:
+        _SCREEN = ScreenCapture(os.path.join(
+            os.environ.get("XDG_CONFIG_HOME")
+            or os.path.expanduser("~/.config"), "wayclick", "screen-token"))
+    return _SCREEN
+
+
+def notify_desktop(title, body):
+    """Notificação do sistema pelo D-Bus, sem depender de bandeja."""
+    def lit(text):
+        return "'" + str(text).replace("\\", "\\\\").replace(
+            "'", "\\'").replace("\n", "\\n") + "'"
+    try:
+        subprocess.Popen(
+            ["gdbus", "call", "--session", "--dest",
+             "org.freedesktop.Notifications", "--object-path",
+             "/org/freedesktop/Notifications", "--method",
+             "org.freedesktop.Notifications.Notify", lit("WayClick"), "0",
+             lit("wayclick"), lit(title), lit(body), "[]", "{}", "8000"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def post_webhook(url, text, images=()):
+    """Mensagem num webhook do Discord (ou compatível), com prints. Devolve o
+    status HTTP, ou a exceção."""
+    payload = {"content": text[:2000], "username": "WayClick"}
+    headers = {"User-Agent": f"WayClick/{VERSION} (+{HOMEPAGE})"}
+    if images:
+        bound = "wayclick" + os.urandom(12).hex()
+        parts = [(f'--{bound}\r\nContent-Disposition: form-data; '
+                  f'name="payload_json"\r\nContent-Type: application/json'
+                  f'\r\n\r\n').encode() + json.dumps(payload).encode()]
+        for i, png in enumerate(images[:10]):
+            parts.append((f'--{bound}\r\nContent-Disposition: form-data; '
+                          f'name="files[{i}]"; filename="screen{i + 1}.png"'
+                          f'\r\nContent-Type: image/png\r\n\r\n').encode()
+                         + png)
+        body = b"\r\n".join(parts) + f"\r\n--{bound}--\r\n".encode()
+        headers["Content-Type"] = f"multipart/form-data; boundary={bound}"
+    else:
+        body = json.dumps(payload).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers,
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status
+    except Exception as e:
+        return e
+
+
+def open_link(url):
+    """Abre link ou arquivo com o programa padrão (xdg-open), sem esperar."""
+    if not url or url.startswith("-"):
+        return
+    try:
+        proc = subprocess.Popen(["xdg-open", url], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except OSError:
+        return
+    threading.Thread(target=proc.wait, daemon=True).start()
+
+
+OPENER = open_link       # os testes trocam: nada se abre de verdade
+WEBHOOK = post_webhook   # idem, a suíte não pode depender de rede
+
+
+
 # ------------------------------------------------------ macros com atalho --
 # O que o AutoHotkey faz e o Linux não tinha: cada macro com o seu atalho,
 # independente do Start. "F1 liga e desliga um E a cada 1 ms" é um macro:
@@ -1432,7 +2419,12 @@ MACRO_MODE_LABELS = {"toggle": "Toggle: press to start, again to stop",
                      "always": "Always, while enabled"}
 MACRO_MODE_SHORT = {"toggle": "toggle", "hold": "while held",
                     "once": "once", "always": "always"}
-STEP_OPS = ("tap", "down", "up", "wait", "text", "wheel", "move")
+STEP_OPS = ("tap", "down", "up", "wait", "text", "wheel", "move",
+            "point", "image", "pixel", "notify", "open")
+POINT_CLICKS = ("none", "left", "right", "middle", "double")
+SEEN_ACTS = ("none", "move", "left", "right", "middle", "double")
+FLOWS = ("next", "stop", "restart", "jump")
+COORD = 100000                   # |x|, |y| máximos de uma posição na tela
 MAX_MACROS = 50
 MAX_STEPS = 2000
 REL_WHEEL, REL_HWHEEL = 8, 6
@@ -1500,9 +2492,77 @@ def normalize_step(s):
             else "down"
         return {"op": "wheel", "dir": d,
                 "times": _num(s.get("times", 1), 1, 1, 100, int)}
-    dx = _num(s.get("dx", 0), 0, -5000, 5000, int)
-    dy = _num(s.get("dy", 0), 0, -5000, 5000, int)
-    return {"op": "move", "dx": dx, "dy": dy} if (dx or dy) else None
+    if op == "move":
+        dx = _num(s.get("dx", 0), 0, -5000, 5000, int)
+        dy = _num(s.get("dy", 0), 0, -5000, 5000, int)
+        return {"op": "move", "dx": dx, "dy": dy} if (dx or dy) else None
+    if op == "point":
+        step = {"op": "point", "x": _num(s.get("x"), 0, -COORD, COORD, int),
+                "y": _num(s.get("y"), 0, -COORD, COORD, int),
+                "click": s.get("click") if s.get("click") in POINT_CLICKS
+                else "none"}
+        _human(step, s)
+        spread = _num(s.get("spread", 0), 0, 0, 500, int)
+        if spread:
+            step["spread"] = spread
+        return step
+    if op in ("image", "pixel"):
+        step = {"op": op,
+                "want": s.get("want") if s.get("want") in ("seen", "gone")
+                else "seen",
+                "wait": _num(s.get("wait", 5000.0), 5000.0, 0.0, 3600000.0)}
+        if op == "image":
+            path = str(s.get("path") or "")[:4096]
+            if not path:
+                return None
+            step["path"] = path
+            step["conf"] = round(_num(s.get("conf", 0.85), 0.85, 0.5, 1.0), 3)
+            region = _rect(s.get("region"))
+            if region:
+                step["region"] = region
+        else:
+            color = parse_color(s.get("color"))
+            if color is None:
+                return None
+            step.update(x=_num(s.get("x"), 0, -COORD, COORD, int),
+                        y=_num(s.get("y"), 0, -COORD, COORD, int),
+                        color=color_hex(color),
+                        tol=_num(s.get("tol", 16), 16, 0, 255, int))
+        default = "left" if op == "image" else "none"
+        step["act"] = s.get("act") if s.get("act") in SEEN_ACTS else default
+        _human(step, s)
+        for key, dflt in (("ok", "next"), ("fail", "stop")):
+            step[key] = s.get(key) if s.get(key) in FLOWS else dflt
+            if step[key] == "jump":
+                step[key + "_to"] = _num(s.get(key + "_to", 1), 1, 1,
+                                         MAX_STEPS, int)
+        return step
+    if op == "notify":
+        text = str(s.get("text") or "")[:1000]
+        url = str(s.get("url") or "").strip()[:500]
+        step = {"op": "notify", "text": text}
+        if url.startswith(("https://", "http://")):
+            step["url"] = url
+        if s.get("shot"):
+            step["shot"] = True
+        return step if text or step.get("shot") else None
+    url = str(s.get("url") or "").strip()[:2000]
+    return {"op": "open", "url": url} if url and not url.startswith("-") \
+        else None
+
+
+def _human(step, s):
+    """Movimento em curva, de quem mexe a mão, e quanto ele dura."""
+    if s.get("human"):
+        step["human"] = True
+        step["ms"] = _num(s.get("ms", 300.0), 300.0, 20.0, 10000.0)
+
+
+def _rect(r):
+    if not isinstance(r, (list, tuple)) or len(r) != 4:
+        return None
+    x, y, w, h = (_num(v, 0, -COORD, COORD, int) for v in r)
+    return [x, y, w, h] if w > 0 and h > 0 else None
 
 
 def normalize_macro(m):
@@ -1569,7 +2629,56 @@ def step_label(s):
     if op == "wheel":
         return _({"up": "Wheel up", "down": "Wheel down", "left": "Wheel left",
                   "right": "Wheel right"}[s["dir"]]) + f" ×{s['times']}"
-    return _("Move pointer by {dx}, {dy}", dx=s["dx"], dy=s["dy"])
+    if op == "move":
+        return _("Move pointer by {dx}, {dy}", dx=s["dx"], dy=s["dy"])
+    if op == "point":
+        text = {"none": _("Move to {x}, {y}", x=s["x"], y=s["y"]),
+                "left": _("Click at {x}, {y}", x=s["x"], y=s["y"]),
+                "right": _("Right click at {x}, {y}", x=s["x"], y=s["y"]),
+                "middle": _("Middle click at {x}, {y}", x=s["x"], y=s["y"]),
+                "double": _("Double click at {x}, {y}", x=s["x"], y=s["y"])
+                }[s["click"]]
+        if s.get("spread"):
+            text += f" ±{s['spread']}"
+        return text + (", " + _("curved") if s.get("human") else "")
+    if op in ("image", "pixel"):
+        if op == "image":
+            name = os.path.splitext(os.path.basename(s["path"]))[0]
+            text = (_("Find “{img}”", img=name) if s["want"] == "seen" else
+                    _("Wait until “{img}” is gone", img=name))
+        else:
+            where = f"{s['x']}, {s['y']}"
+            text = (_("Pixel {at} is {color}", at=where, color=s["color"])
+                    if s["want"] == "seen" else
+                    _("Pixel {at} is not {color}", at=where,
+                      color=s["color"]))
+        parts = [text, _("up to {s} s", s=_ms(s["wait"] / 1000.0))
+                 if s["wait"] else _("once")]
+        if s["want"] == "seen" and s["act"] != "none":
+            parts.append({"move": _("point at it"), "left": _("click it"),
+                          "right": _("right click it"),
+                          "middle": _("middle click it"),
+                          "double": _("double click it")}[s["act"]])
+        if s["ok"] != "next":
+            parts.append(_("then {what}", what=flow_label(s, "ok")))
+        text = ", ".join(parts)
+        if s["fail"] != "next":
+            text += "; " + _("else {what}", what=flow_label(s, "fail"))
+        return text
+    if op == "notify":
+        text = _("Notify “{t}”", t=s["text"]) if s["text"] else _("Notify")
+        if s.get("shot"):
+            text += " + " + _("screenshot")
+        return text + (" (webhook)" if s.get("url") else "")
+    return _("Open {url}", url=s["url"])
+
+
+def flow_label(s, key):
+    how = s[key]
+    if how == "jump":
+        return _("go to step {n}", n=s[key + "_to"])
+    return {"next": _("continue"), "stop": _("stop"),
+            "restart": _("start over")}[how]
 
 
 def macro_summary(m, limit=4):
@@ -1611,6 +2720,15 @@ class CompiledMacro:
         self.clicks = {st["code"] for st in self.steps
                        if st["op"] in ("tap", "down", "up")
                        and is_button(st["code"])}
+        # ponteiro absoluto e tela, que a App só cria para quem usa
+        self.uses_pointer = any(
+            st["op"] == "point" or (st["op"] in ("image", "pixel")
+                                    and st["act"] != "none")
+            for st in self.steps)
+        self.uses_screen = any(
+            st["op"] in ("image", "pixel")
+            or (st["op"] == "notify" and st.get("shot"))
+            for st in self.steps)
 
 
 class MacroRunner(threading.Thread):
@@ -1627,16 +2745,25 @@ class MacroRunner(threading.Thread):
     qualquer caminho de saída.
     """
     MIN_LOOP_S = 0.001           # laço sem espera nenhuma não vira enxurrada
+    STOP = -1
+    HOVER_S = 0.03               # o jogo vê o cursor chegar antes do clique
+    POLL_S = 0.1                 # de quanto em quanto olha a tela, esperando
+    MIN_JUMP_S = 0.005           # voltar passos sem espera não gira solto
 
-    def __init__(self, macro, kb, mouse, loop, keep, on_done=None):
+    def __init__(self, macro, kb, mouse, loop, keep, on_done=None, env=None):
         super().__init__(daemon=True, name=f"macro-{macro.id}")
         self.m, self.kb, self.mouse = macro, kb, mouse
         self.loop, self.keep = loop, keep
         self.on_done = on_done
+        self.env = env       # o motor: ponteiro absoluto, tela, avisos
         self._halt = threading.Event()
         self.stopping = False
         self.count = 0
         self.held = []
+        self.pheld = []      # botões apertados no ponteiro absoluto
+        self._seeing = False
+        self._blind = False  # a tela falhou: não pergunta de novo nesta vez
+        self._told = set()
 
     def stop(self):
         self.stopping = True
@@ -1683,7 +2810,161 @@ class MacroRunner(threading.Thread):
             os.write(self.mouse.fd, _ev(EV_REL, lo, sign)
                      + _ev(EV_REL, hi, 120 * sign) + SYN)
 
+    # ------------------------------------------- ponteiro absoluto e tela --
+    def _report(self, text):
+        """Uma vez por problema: um macro em laço não enche a tela de aviso."""
+        if text in self._told:
+            return
+        self._told.add(text)
+        report = getattr(self.env, "report", None)
+        if report:
+            report(f"{self.m.name}: {text}")
+
+    def _pointer(self):
+        return getattr(self.env, "pointer", None)
+
+    def _go(self, x, y, human=False, ms=0.0):
+        """Cursor até (x, y); em curva e no tempo pedido, se human."""
+        p, ws = self._pointer(), getattr(self.env, "workspace", None)
+        if p is None or not ws:
+            self._report(_("there is no absolute pointer, so moving to a "
+                           "screen position was skipped."))
+            return False
+        if human and p.pos is not None and ms > 0:
+            path = human_path(p.pos, (x, y), max(2, min(500, int(ms / 8))))
+            t0 = time.perf_counter()
+            for k, (px, py) in enumerate(path, 1):
+                if self._halt.is_set():
+                    return False
+                p.warp(px, py, ws)
+                self._until(t0 + ms / 1000.0 * k / len(path))
+        else:
+            p.warp(x, y, ws)
+        return True
+
+    def _pset(self, code, down):
+        p = self._pointer()
+        if p is None:
+            return
+        p.button(code, down)
+        if down:
+            self.pheld.append(code)
+        elif code in self.pheld:
+            self.pheld.remove(code)
+
+    def _pclick(self, how):
+        code = {"left": BTN["Left"], "right": BTN["Right"],
+                "middle": BTN["Middle"], "double": BTN["Left"]}.get(how)
+        if code is None or self._pointer() is None:
+            return
+        self._sleep(self.HOVER_S)
+        double = how == "double"
+        press = min(self.m.press, 0.05) if double else self.m.press
+        for i in range(2 if double else 1):
+            if self._halt.is_set():
+                return
+            if i:
+                self._sleep(0.06)
+            self._pset(code, True)
+            self._sleep(press)
+            self._pset(code, False)
+
+    def _screen(self):
+        """A captura, ligada na primeira vez que um passo precisa dela."""
+        cap = getattr(self.env, "screen", None)
+        if cap is None or self._blind:
+            return None
+        if not self._seeing:
+            try:
+                if not cap.ensure():
+                    raise VisionError(cap.error
+                                      or _("The screen is not available."))
+            except VisionError as e:
+                self._blind = True
+                self._report(str(e))
+                return None
+            cap.acquire()
+            self._seeing = True
+        return cap
+
+    def _check(self, st, frames):
+        """Onde está agora o que o passo procura (ponto lógico), ou None."""
+        if st["op"] == "image":
+            tpl = load_image(st["path"])
+            if tpl is None:
+                raise VisionError(_("The image {path} could not be read.",
+                                    path=st["path"]))
+            hit = locate(frames, tpl, st["conf"], st.get("region"))
+            return hit[:2] if hit else None
+        if color_close(pixel_at(frames, st["x"], st["y"]),
+                       parse_color(st["color"]), st["tol"]):
+            return (st["x"], st["y"])
+        return None
+
+    def _look(self, st):
+        """Espera a condição do passo: (aconteceu, ponto achado)."""
+        cap = self._screen()
+        if cap is None:
+            return False, None
+        want = st["want"] == "seen"
+        deadline = time.perf_counter() + st["wait"] / 1000.0
+        while True:
+            frames = cap.frames()
+            if not frames:
+                # compartilhamento encerrado no meio: nada de "sumiu" falso
+                self._blind = True
+                self._report(cap.error or _("Screen sharing stopped."))
+                return False, None
+            try:
+                hit = self._check(st, frames)
+            except VisionError as e:
+                self._report(str(e))
+                return False, None
+            if (hit is not None) == want:
+                return True, hit
+            left = deadline - time.perf_counter()
+            if left <= 0 or self._halt.is_set():
+                return False, None
+            self._sleep(min(self.POLL_S, left))
+
+    def _flow(self, st, ok):
+        key = "ok" if ok else "fail"
+        how = st[key]
+        if how == "stop":
+            return self.STOP
+        if how == "restart":
+            return 0
+        if how == "jump":
+            return st[key + "_to"] - 1
+        return None
+
+    def _notify(self, st):
+        text = st["text"] or self.m.name
+        if not st.get("url"):
+            say = getattr(self.env, "say", None)
+            if say:
+                say(self.m.name, text)
+            return
+        shots = []
+        if st.get("shot"):
+            cap = self._screen()
+            if cap is not None:
+                try:
+                    shots = [png_bytes(f.rgb) for f in cap.frames()]
+                except VisionError as e:
+                    self._report(str(e))
+
+        def send():
+            r = WEBHOOK(st["url"], text, shots)
+            if not (isinstance(r, int) and 200 <= r < 300):
+                self._report(_("the webhook did not take the message ({err}).",
+                               err=getattr(r, "reason", None) or r))
+        threading.Thread(target=send, daemon=True,
+                         name="wayclick-webhook").start()
+
     def _step(self, st):
+        """Faz o passo. Devolve para onde ir (índice) quando não é o
+        próximo, ou STOP."""
         op = st["op"]
         if op == "tap":
             self._tap(st["code"], st.get("times", 1))
@@ -1712,17 +2993,44 @@ class MacroRunner(threading.Thread):
             self._wheel(st["dir"], st["times"])
         elif op == "move" and self.mouse is not None:
             self.mouse.move(st["dx"], st["dy"])
+        elif op == "point":
+            x, y, r = st["x"], st["y"], st.get("spread", 0)
+            if r:
+                x, y = x + random.randint(-r, r), y + random.randint(-r, r)
+            if self._go(x, y, st.get("human"), st.get("ms", 0.0)):
+                self._pclick(st["click"])
+        elif op in ("image", "pixel"):
+            ok, at = self._look(st)
+            if ok and at is not None and st["want"] == "seen" \
+                    and st["act"] != "none" and not self._halt.is_set():
+                if self._go(at[0], at[1], st.get("human"),
+                            st.get("ms", 0.0)):
+                    self._pclick(st["act"])
+            return self._flow(st, ok)
+        elif op == "notify":
+            self._notify(st)
+        elif op == "open":
+            OPENER(st["url"])
+        return None
 
     def run(self):
         clock = time.perf_counter
+        steps = self.m.steps
         try:
             nxt = clock()
             while not self._halt.is_set():
                 began = clock()
-                for st in self.m.steps:
-                    if self._halt.is_set():
-                        break
-                    self._step(st)
+                i = 0
+                while i < len(steps) and not self._halt.is_set():
+                    to = self._step(steps[i])
+                    if to is None:
+                        i += 1
+                    elif to == self.STOP:
+                        self.stop()
+                    else:
+                        if to <= i:
+                            self._sleep(self.MIN_JUMP_S)
+                        i = max(0, to)
                 self.count += 1
                 if not self.loop or self._halt.is_set():
                     break
@@ -1744,6 +3052,15 @@ class MacroRunner(threading.Thread):
                 except OSError:
                     pass
             self.held = []
+            for code in reversed(self.pheld[:]):
+                try:
+                    self._pset(code, False)
+                except OSError:
+                    pass
+            self.pheld = []
+            if self._seeing:
+                self._seeing = False
+                self.env.screen.release()
             if self.on_done:
                 self.on_done(self)
 
@@ -1757,10 +3074,15 @@ class MacroEngine(QObject):
     """
     changed = Signal()
     toggled = Signal(bool)
+    message = Signal(str, str)      # (título, texto) de um passo Notificar
+    problem = Signal(str)           # algo impediu um passo de acontecer
 
     def __init__(self, outputs, hub=None):
         super().__init__()
         self.outputs = outputs          # () -> (teclado virtual, mouse virtual)
+        self.pointer = None             # AbsolutePointer, que a App cria
+        self.screen = None              # ScreenCapture
+        self.workspace = None           # (x, y, w, h) lógico de todas as telas
         self.hub = hub or HUB()
         self.lock = threading.Lock()
         self.active = False
@@ -1800,6 +3122,13 @@ class MacroEngine(QObject):
 
     def needs_keyboard(self):
         return self.active and any(c.uses_keys for c in self.macros)
+
+    # chamados das threads dos macros; os sinais chegam na da UI
+    def report(self, text):
+        self.problem.emit(text)
+
+    def say(self, title, text):
+        self.message.emit(title, text)
 
     def wants_grab(self, d):
         if not self.active:
@@ -1867,7 +3196,7 @@ class MacroEngine(QObject):
         with self.lock:
             if only_if_idle and self._alive(m.id):
                 return None
-            r = MacroRunner(m, kb, mouse, loop, keep, self._done)
+            r = MacroRunner(m, kb, mouse, loop, keep, self._done, env=self)
             self.runners[m.id] = r
         r.start()
         self.changed.emit()
@@ -2090,6 +3419,11 @@ class AhkImport:
         self.press_ms = 0.0
         self.send_mode = "input"
         self._ifwin_noted = False
+        # Click X, Y e MouseMove X, Y contam da janela ativa no AutoHotkey,
+        # a não ser com CoordMode Mouse, Screen
+        self.screen_coords = bool(re.search(
+            r"^\s*CoordMode\b[\s,(]*[\"']?Mouse[\"']?\s*,\s*[\"']?Screen",
+            text, re.I | re.M))
         try:
             self._parse_top()
             self._analyze()
@@ -2762,9 +4096,18 @@ class AhkImport:
                 break
         if rel and len(nums) == 2:
             return [{"op": "move", "dx": nums[0], "dy": nums[1]}]
-        self.note(ln, "moving the pointer to a screen position is not "
-                      "possible on Wayland, skipped")
+        if len(nums) == 2:
+            return [self._point(nums, ln)]
+        self.note(ln, "MouseMove without a position, skipped")
         return []
+
+    def _point(self, xy, ln):
+        if not self.screen_coords:
+            self.note(ln, "positions are used as screen positions; "
+                          "AutoHotkey measured them from the active window "
+                          "(the same for a fullscreen game on the leftmost "
+                          "screen)")
+        return {"op": "point", "x": xy[0], "y": xy[1]}
 
     def _click(self, args, ln, mouseclick=False):
         toks = []
@@ -2798,8 +4141,7 @@ class AhkImport:
             if rel:
                 steps.append({"op": "move", "dx": xy[0], "dy": xy[1]})
             else:
-                self.note(ln, "click coordinates ignored: it clicks where the "
-                              "cursor is")
+                steps.append(self._point(xy, ln))
         if button in ("up", "down", "left", "right") and button not in \
                 ("left", "right") or button in ("up", "down"):
             pass
@@ -3794,10 +5136,10 @@ TRANSLATIONS = {
         "on the same physical keys.":
             "Digitado no layout de teclado americano: letras, números e "
             "símbolos caem nas mesmas teclas físicas.",
-        "Moves by an amount, from where the pointer is. Wayland does not let "
-        "a program put the pointer at a screen position.":
-            "Move uma distância, a partir de onde o ponteiro está. O Wayland "
-            "não deixa um programa pôr o ponteiro numa posição da tela.",
+        "Moves by an amount, from where the pointer is. To go to an exact "
+        "position, use Go to a screen position.":
+            "Move uma distância, a partir de onde o ponteiro está. Para ir a "
+            "uma posição exata, use Ir a uma posição da tela.",
         "Random, up to: each run waits a different time between the two "
         "values.":
             "Aleatório, até: cada vez espera um tempo diferente entre os dois "
@@ -3920,12 +5262,154 @@ TRANSLATIONS = {
         "{what} is not supported, skipped": "{what} não é suportado, ignorado",
         "Sleep {a} is not a number, skipped":
             "Sleep {a} não é um número, ignorado",
-        "moving the pointer to a screen position is not possible on Wayland, "
-        "skipped":
-            "mover o ponteiro para uma posição da tela não é possível no "
-            "Wayland, ignorado",
-        "click coordinates ignored: it clicks where the cursor is":
-            "coordenadas do clique ignoradas: clica onde o cursor estiver",
+        "MouseMove without a position, skipped":
+            "MouseMove sem posição, ignorado",
+        "positions are used as screen positions; AutoHotkey measured them "
+        "from the active window (the same for a fullscreen game on the "
+        "leftmost screen)":
+            "as posições valem como posições da tela; o AutoHotkey as media a "
+            "partir da janela ativa (dá no mesmo para um jogo em tela cheia "
+            "na tela mais à esquerda)",
+        # passos que olham a tela, ponteiro absoluto, avisos
+        "Go to a screen position": "Ir a uma posição da tela",
+        "Find an image on screen": "Achar uma imagem na tela",
+        "Check a pixel color": "Conferir a cor de um pixel",
+        "Send a notification": "Enviar um aviso",
+        "Open a link or file": "Abrir um link ou arquivo",
+        "Only move": "Só mover", "Left click": "Clique esquerdo",
+        "Right click": "Clique direito", "Middle click": "Clique do meio",
+        "Double click": "Clique duplo", "Nothing": "Nada",
+        "Point at it": "Apontar", "Click it": "Clicar",
+        "Right click it": "Clique direito", "Middle click it": "Clique do meio",
+        "Double click it": "Clique duplo", "Continue": "Seguir",
+        "Stop the macro": "Parar o macro",
+        "Start over from step 1": "Recomeçar do passo 1",
+        "Go to step": "Ir ao passo", "appears": "aparecer",
+        "disappears": "sumir", "has the color": "ter a cor",
+        "loses the color": "perder a cor",
+        "Move to {x}, {y}": "Ir até {x}, {y}",
+        "Click at {x}, {y}": "Clicar em {x}, {y}",
+        "Right click at {x}, {y}": "Clique direito em {x}, {y}",
+        "Middle click at {x}, {y}": "Clique do meio em {x}, {y}",
+        "Double click at {x}, {y}": "Clique duplo em {x}, {y}",
+        "curved": "em curva", "Find “{img}”": "Achar “{img}”",
+        "Wait until “{img}” is gone": "Esperar “{img}” sumir",
+        "Pixel {at} is {color}": "Pixel {at} é {color}",
+        "Pixel {at} is not {color}": "Pixel {at} não é {color}",
+        "up to {s} s": "até {s} s", "point at it": "apontar ali",
+        "click it": "clicar ali", "right click it": "clique direito ali",
+        "middle click it": "clique do meio ali",
+        "double click it": "clique duplo ali", "then {what}": "depois {what}",
+        "else {what}": "senão {what}", "Notify “{t}”": "Avisar “{t}”",
+        "Notify": "Avisar", "screenshot": "print da tela",
+        "Open {url}": "Abrir {url}", "go to step {n}": "ir ao passo {n}",
+        "continue": "seguir", "stop": "parar", "start over": "recomeçar",
+        "there is no absolute pointer, so moving to a screen position was "
+        "skipped.":
+            "não há ponteiro absoluto, então ir a uma posição da tela foi "
+            "pulado.",
+        "The screen is not available.": "A tela não está disponível.",
+        "The image {path} could not be read.":
+            "Não deu para ler a imagem {path}.",
+        "Screen sharing stopped.": "O compartilhamento da tela parou.",
+        "the webhook did not take the message ({err}).":
+            "o webhook não aceitou a mensagem ({err}).",
+        "Image and color steps need numpy.":
+            "Passos de imagem e de cor precisam do numpy.",
+        "Seeing the screen needs PyGObject and GStreamer.":
+            "Ver a tela precisa do PyGObject e do GStreamer.",
+        "Seeing the screen needs the GStreamer element {name}.":
+            "Ver a tela precisa do elemento {name} do GStreamer.",
+        "No picture came from the screen.": "Nenhuma imagem veio da tela.",
+        "Stopped.": "Parado.",
+        "The system did not answer the screen sharing request.":
+            "O sistema não respondeu ao pedido de compartilhar a tela.",
+        "Screen sharing was not allowed.":
+            "O compartilhamento da tela não foi permitido.",
+        "The screen sharing request failed.":
+            "O pedido de compartilhar a tela falhou.",
+        "No screen sharing portal answered. xdg-desktop-portal and the one "
+        "for your desktop (KDE, GNOME, wlr) must be installed.":
+            "Nenhum portal de compartilhamento de tela respondeu. O "
+            "xdg-desktop-portal e o do seu desktop (KDE, GNOME, wlr) precisam "
+            "estar instalados.",
+        "No screen was shared.": "Nenhuma tela foi compartilhada.",
+        "No session D-Bus: {err}": "Sem D-Bus de sessão: {err}",
+        "Screen capture failed: {err}": "A captura da tela falhou: {err}",
+        "Position:": "Posição:", "Then:": "Depois:", "Image:": "Imagem:",
+        "Similarity:": "Semelhança:", "Search in:": "Procurar em:",
+        "Color:": "Cor:", "Tolerance:": "Tolerância:",
+        "Wait until it:": "Esperar até:", "Wait up to:": "Esperar no máximo:",
+        "When found:": "Ao achar:", "Movement:": "Movimento:",
+        "Random offset:": "Desvio aleatório:",
+        "If it happens:": "Se acontecer:", "If not:": "Se não:",
+        "Capture after:": "Capturar após:", "Message:": "Mensagem:",
+        "Discord webhook:": "Webhook do Discord:",
+        "Link or file:": "Link ou arquivo:",
+        "Pick on screen…": "Escolher na tela…",
+        "Curved, like a hand": "Em curva, como a mão", "none": "nenhum",
+        "Capture from screen…": "Capturar da tela…",
+        "Open file…": "Abrir arquivo…",
+        "How alike the screen must be to the picture. Lower finds more, and "
+        "also finds wrong places.":
+            "O quanto a tela precisa parecer com a imagem. Mais baixo acha "
+            "mais, e também acha lugares errados.",
+        "Pick area…": "Marcar área…", "Whole screen": "Tela inteira",
+        "How far red, green and blue may each be from the color, 0 to 255.":
+            "O quanto vermelho, verde e azul podem se afastar da cor, de 0 a "
+            "255.",
+        "check once": "olhar uma vez",
+        "Time to switch to the game window before the screen is captured.":
+            "Tempo para trocar para a janela do jogo antes de capturar a "
+            "tela.",
+        "Attach a screenshot": "Anexar print da tela",
+        "No image yet": "Nenhuma imagem ainda", "Image": "Imagem",
+        "Images": "Imagens",
+        "That file is not an image.": "Esse arquivo não é uma imagem.",
+        "Waiting for screen sharing…": "Esperando o compartilhamento da tela…",
+        "Capturing in {n} s, switch to the game window…":
+            "Capturando em {n} s, vá para a janela do jogo…",
+        "Could not save {path}.": "Não deu para salvar {path}.",
+        "Pick an image first.": "Escolha uma imagem antes.",
+        "The color must look like #ff8800.":
+            "A cor precisa estar no formato #ff8800.",
+        "Type a message, or attach a screenshot to a webhook.":
+            "Digite uma mensagem, ou anexe um print a um webhook.",
+        "Type a link or a file.": "Digite um link ou um arquivo.",
+        "Type the text.": "Digite o texto.",
+        "Right or down must not be zero.":
+            "Direita ou baixo precisa ser diferente de zero.",
+        "This step is not complete.": "Este passo não está completo.",
+        "Puts the pointer at an exact position. 0, 0 is the top left corner "
+        "of the leftmost screen, and all screens count together, as in "
+        "Display Configuration.":
+            "Põe o ponteiro numa posição exata. 0, 0 é o canto de cima à "
+            "esquerda da tela mais à esquerda, e todas as telas contam "
+            "juntas, como na Configuração de Telas.",
+        "Looks for the picture on screen, like ImageSearch in AutoHotkey. "
+        "The first time, the system asks which screens WayClick may see, and "
+        "remembers the answer.":
+            "Procura a imagem na tela, como o ImageSearch do AutoHotkey. Na "
+            "primeira vez o sistema pergunta quais telas o WayClick pode ver, "
+            "e guarda a resposta.",
+        "Reads the color of one point, like PixelGetColor in AutoHotkey.":
+            "Lê a cor de um ponto, como o PixelGetColor do AutoHotkey.",
+        "Without a webhook it shows a desktop notification. With a Discord "
+        "webhook (channel settings, Integrations) it posts in that channel.":
+            "Sem webhook, mostra uma notificação do sistema. Com um webhook "
+            "do Discord (configurações do canal, Integrações), posta naquele "
+            "canal.",
+        "Opens with the default program. Web pages, roblox:// and steam:// "
+        "links, files.":
+            "Abre com o programa padrão. Páginas da web, links roblox:// e "
+            "steam://, arquivos.",
+        "Pick on screen": "Escolher na tela", "Screen {n}": "Tela {n}",
+        "{w}×{h} at {x}, {y}": "{w}×{h} em {x}, {y}", "Fit": "Ajustar",
+        "Click the point.": "Clique no ponto.",
+        "Drag a rectangle around it. Ctrl and the wheel zoom.":
+            "Arraste um retângulo em volta. Ctrl e a roda dão zoom.",
+        "Screen:": "Tela:", "Zoom:": "Zoom:",
+        "Selected {w}×{h}": "Selecionado {w}×{h}",
         "key {name} is unknown": "tecla {name} desconhecida",
         "the script is nested too deeply, the rest was skipped":
             "o script tem aninhamento demais, o resto foi ignorado",
@@ -4283,7 +5767,24 @@ def set_autostart(on):
 # ------------------------------------------------- editor de macros (UI) ----
 STEP_KINDS = (("tap", "Tap a key or click"), ("down", "Hold down"),
               ("up", "Release"), ("wait", "Wait"), ("text", "Type text"),
-              ("wheel", "Scroll the wheel"), ("move", "Move the pointer"))
+              ("wheel", "Scroll the wheel"), ("move", "Move the pointer"),
+              ("point", "Go to a screen position"),
+              ("image", "Find an image on screen"),
+              ("pixel", "Check a pixel color"),
+              ("notify", "Send a notification"),
+              ("open", "Open a link or file"))
+POINT_CLICK_LABELS = (("none", "Only move"), ("left", "Left click"),
+                      ("right", "Right click"), ("middle", "Middle click"),
+                      ("double", "Double click"))
+SEEN_ACT_LABELS = (("none", "Nothing"), ("move", "Point at it"),
+                   ("left", "Click it"), ("right", "Right click it"),
+                   ("middle", "Middle click it"),
+                   ("double", "Double click it"))
+FLOW_LABELS = (("next", "Continue"), ("stop", "Stop the macro"),
+               ("restart", "Start over from step 1"), ("jump", "Go to step"))
+WANT_LABELS = {"image": (("seen", "appears"), ("gone", "disappears")),
+               "pixel": (("seen", "has the color"),
+                         ("gone", "loses the color"))}
 WHEEL_DIRS = (("up", "Up"), ("down", "Down"), ("left", "Left"),
               ("right", "Right"))
 
@@ -4305,6 +5806,232 @@ class _Rows:
         for key, (lbl, widget) in self.rows.items():
             lbl.setVisible(key in keys)
             widget.setVisible(key in keys)
+
+
+def _hrow(*widgets, stretch=True):
+    w = QWidget()
+    row = QHBoxLayout(w)
+    row.setContentsMargins(0, 0, 0, 0)
+    for x in widgets:
+        row.addWidget(x)
+    if stretch:
+        row.addStretch()
+    return w
+
+
+def _combo(items, current):
+    box = QComboBox()
+    for key, label in items:
+        box.addItem(_(label), key)
+    box.setCurrentIndex(max(0, box.findData(current)))
+    return box
+
+
+class FlowEdit(QWidget):
+    """Para onde o macro vai depois: seguir, parar, recomeçar, ir a um passo."""
+
+    def __init__(self, how, to):
+        super().__init__()
+        self.how = _combo(FLOW_LABELS, how)
+        self.to = QSpinBox()
+        self.to.setRange(1, MAX_STEPS)
+        self.to.setValue(to)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.how)
+        row.addWidget(self.to)
+        row.addStretch()
+        self.how.currentIndexChanged.connect(self._sync)
+        self._sync()
+
+    def _sync(self, _i=0):
+        self.to.setVisible(self.how.currentData() == "jump")
+
+    def value(self):
+        return self.how.currentData(), self.to.value()
+
+
+class _PickCanvas(QWidget):
+    """O quadro capturado, com zoom. Clicar escolhe um pixel, arrastar marca
+    um retângulo; tudo em pixels do quadro."""
+    hovered = Signal(int, int)
+    released = Signal()
+    zoom_step = Signal(int)
+
+    def __init__(self, image):
+        super().__init__()
+        self.image = image
+        self.zoom = 1.0
+        self.start = self.end = None
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CrossCursor)
+        self.set_zoom(1.0)
+
+    def set_zoom(self, z):
+        self.zoom = z
+        self.setFixedSize(max(1, round(self.image.width() * z)),
+                          max(1, round(self.image.height() * z)))
+        self.update()
+
+    def _px(self, pos):
+        return (min(self.image.width() - 1, max(0, int(pos.x() / self.zoom))),
+                min(self.image.height() - 1, max(0, int(pos.y() / self.zoom))))
+
+    def selection(self):
+        """(x0, y0, x1, y1), fim exclusivo; um clique dá um pixel só."""
+        if self.start is None or self.end is None:
+            return None
+        (ax, ay), (bx, by) = self.start, self.end
+        return min(ax, bx), min(ay, by), max(ax, bx) + 1, max(ay, by) + 1
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        if self.zoom < 1:
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+        p.drawImage(QRectF(0, 0, self.width(), self.height()), self.image)
+        sel = self.selection()
+        if sel:
+            x0, y0, x1, y1 = (v * self.zoom for v in sel)
+            r = QRectF(x0, y0, x1 - x0, y1 - y0)
+            p.fillRect(r, QColor(61, 174, 233, 60))
+            p.setPen(QPen(QColor("#3daee9"), 2))
+            p.drawRect(r)
+        p.end()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.start = self.end = self._px(e.position())
+            self.update()
+
+    def mouseMoveEvent(self, e):
+        px = self._px(e.position())
+        self.hovered.emit(*px)
+        if e.buttons() & Qt.LeftButton and self.start is not None:
+            self.end = px
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self.start is not None:
+            self.end = self._px(e.position())
+            self.update()
+            self.released.emit()
+
+    def wheelEvent(self, e):
+        if e.modifiers() & Qt.ControlModifier:
+            self.zoom_step.emit(1 if e.angleDelta().y() > 0 else -1)
+            e.accept()
+        else:
+            e.ignore()
+
+
+class ScreenPicker(QDialog):
+    """Escolher na tela capturada: um ponto (e a cor dele) ou uma área, que
+    vira o recorte de um passo de imagem ou a região de busca."""
+    ZOOMS = (("Fit", 0.0), ("25%", 0.25), ("50%", 0.5), ("100%", 1.0),
+             ("200%", 2.0), ("400%", 4.0), ("800%", 8.0))
+
+    def __init__(self, parent, frames, mode):
+        super().__init__(parent)
+        self.setWindowTitle(_("Pick on screen"))
+        self.frames, self.mode = frames, mode
+        self.point = self.color = self.rect = self.crop = None
+        self.screen = QComboBox()
+        for i, f in enumerate(frames, 1):
+            self.screen.addItem(_("Screen {n}", n=i) + "  " + _(
+                "{w}×{h} at {x}, {y}", w=f.w, h=f.h, x=f.x, y=f.y))
+        self.zoom = QComboBox()
+        for label, z in self.ZOOMS:
+            self.zoom.addItem(_(label), z)
+        self.scroll = QScrollArea()
+        self.scroll.setAlignment(Qt.AlignCenter)
+        self.info = QLabel(" ")
+        hint = QLabel(_("Click the point.") if mode == "point" else _(
+            "Drag a rectangle around it. Ctrl and the wheel zoom."))
+        hint.setEnabled(False)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                        | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+        top = QHBoxLayout()
+        if len(frames) > 1:
+            top.addWidget(QLabel(_("Screen:")))
+            top.addWidget(self.screen)
+        top.addWidget(QLabel(_("Zoom:")))
+        top.addWidget(self.zoom)
+        top.addStretch()
+        col = QVBoxLayout(self)
+        col.addLayout(top)
+        col.addWidget(self.scroll, 1)
+        col.addWidget(hint)
+        col.addWidget(self.info)
+        col.addWidget(self.buttons)
+        self.resize(1100, 720)
+        self.canvas = None
+        self.screen.currentIndexChanged.connect(self._show_screen)
+        self.zoom.currentIndexChanged.connect(self._apply_zoom)
+        self._show_screen()
+        QTimer.singleShot(0, self._apply_zoom)
+
+    def frame(self):
+        return self.frames[max(0, self.screen.currentIndex())]
+
+    def _show_screen(self, _i=0):
+        self.canvas = _PickCanvas(rgb_qimage(self.frame().rgb))
+        self.canvas.hovered.connect(self._hover)
+        self.canvas.released.connect(self._picked)
+        self.canvas.zoom_step.connect(self._zoom_by)
+        self.scroll.setWidget(self.canvas)
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+        self._apply_zoom()
+
+    def _apply_zoom(self, _i=0):
+        z = self.zoom.currentData() or 0.0
+        if not z:
+            vp = self.scroll.viewport().size()
+            img = self.canvas.image
+            z = min(1.0, max(0.05, min((vp.width() - 4) / img.width(),
+                                       (vp.height() - 4) / img.height())))
+        self.canvas.set_zoom(z)
+
+    def _zoom_by(self, d):
+        self.zoom.setCurrentIndex(max(0, min(self.zoom.count() - 1,
+                                             self.zoom.currentIndex() + d)))
+
+    def _global(self, px, py):
+        gx, gy = self.frame().to_global(px, py)
+        return math.floor(gx), math.floor(gy)
+
+    def _color(self, gx, gy, px, py):
+        """A cor que o passo vai conferir: a do ponto lógico, lida como o
+        macro lê. Com escala, um ponto lógico cobre vários pixels do quadro."""
+        c = pixel_at(self.frames, gx, gy)
+        return c if c is not None else tuple(int(v)
+                                             for v in self.frame().rgb[py, px])
+
+    def _hover(self, px, py):
+        gx, gy = self._global(px + 0.5, py + 0.5)
+        self.info.setText(f"{gx}, {gy}   "
+                          f"{color_hex(self._color(gx, gy, px, py))}")
+
+    def _picked(self):
+        f = self.frame()
+        x0, y0, x1, y1 = self.canvas.selection()
+        if self.mode == "point" or (x1 - x0 < 3 and y1 - y0 < 3):
+            if self.mode != "point":
+                return                    # área pequena demais: segue arrastando
+            self.point = self._global(x0 + 0.5, y0 + 0.5)
+            self.color = self._color(*self.point, x0, y0)
+            self.accept()
+            return
+        self.crop = f.rgb[y0:y1, x0:x1].copy()
+        gx0, gy0 = f.to_global(x0, y0)
+        gx1, gy1 = f.to_global(x1, y1)
+        self.rect = [math.floor(gx0), math.floor(gy0),
+                     math.ceil(gx1) - math.floor(gx0),
+                     math.ceil(gy1) - math.floor(gy0)]
+        self.info.setText(_("Selected {w}×{h}", w=x1 - x0, h=y1 - y0))
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(True)
 
 
 class StepDialog(QDialog):
@@ -4346,6 +6073,7 @@ class StepDialog(QDialog):
         for box, key in ((self.dx, "dx"), (self.dy, "dy")):
             box.setRange(-5000, 5000)
             box.setValue(step.get(key, 0))
+        self._screen_widgets(step)
         form = QFormLayout()
         self.rows = _Rows(form)
         form.addRow(QLabel(_("Action:")), self.op)
@@ -4357,36 +6085,335 @@ class StepDialog(QDialog):
         self.rows.add("dir", "Direction:", self.wheel)
         self.rows.add("dx", "Right (px):", self.dx)
         self.rows.add("dy", "Down (px):", self.dy)
+        for key, text, widget in self.screen_rows:
+            self.rows.add(key, text, widget)
         self.note = QLabel("")
         self.note.setWordWrap(True)
         self.note.setEnabled(False)
+        self.error = QLabel("")
+        self.error.setStyleSheet("color:#d04030;")
+        self.error.setWordWrap(True)
+        self.error.setTextInteractionFlags(Qt.TextSelectableByMouse)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok
                                    | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._ok)
         buttons.rejected.connect(self.reject)
         col = QVBoxLayout(self)
         col.addLayout(form)
         col.addWidget(self.note)
+        col.addWidget(self.error)
         col.addWidget(buttons)
         self.op.currentIndexChanged.connect(self._sync)
+        self.want.currentIndexChanged.connect(self._sync_want)
         self._sync()
+
+    # ------------------------------------------- passos que olham a tela --
+    def _screen_widgets(self, step):
+        op = step["op"]
+        self.px, self.py = QSpinBox(), QSpinBox()
+        for box, key in ((self.px, "x"), (self.py, "y")):
+            box.setRange(-COORD, COORD)
+            box.setValue(step.get(key, 0))
+        self.b_pick = QPushButton(_("Pick on screen…"))
+        self.b_pick.clicked.connect(lambda: self._capture("point"))
+        self.click = _combo(POINT_CLICK_LABELS, step.get("click", "left"))
+        self.human = QCheckBox(_("Curved, like a hand"))
+        self.human.setChecked(bool(step.get("human")))
+        self.human_ms = QDoubleSpinBox()
+        self.human_ms.setRange(20.0, 10000.0)
+        self.human_ms.setDecimals(0)
+        self.human_ms.setSuffix(" ms")
+        self.human_ms.setValue(step.get("ms", 300.0))
+        self.human.toggled.connect(self.human_ms.setEnabled)
+        self.human_ms.setEnabled(self.human.isChecked())
+        self.spread = QSpinBox()
+        self.spread.setRange(0, 500)
+        self.spread.setSuffix(" px")
+        self.spread.setSpecialValueText(_("none"))
+        self.spread.setValue(step.get("spread", 0))
+        self.img_path = step.get("path", "")
+        self.img_view = QLabel()
+        self.img_view.setAlignment(Qt.AlignCenter)
+        self.img_view.setMinimumSize(160, 60)
+        self.img_view.setFrameShape(QFrame.StyledPanel)
+        self.b_shot = QPushButton(_("Capture from screen…"))
+        self.b_shot.clicked.connect(lambda: self._capture("image"))
+        self.b_file = QPushButton(_("Open file…"))
+        self.b_file.clicked.connect(self._open_image)
+        img_w = QWidget()
+        img_col = QVBoxLayout(img_w)
+        img_col.setContentsMargins(0, 0, 0, 0)
+        img_col.addWidget(self.img_view)
+        img_col.addWidget(_hrow(self.b_shot, self.b_file))
+        self.conf = QSpinBox()
+        self.conf.setRange(50, 100)
+        self.conf.setSuffix(" %")
+        self.conf.setValue(round(step.get("conf", 0.85) * 100))
+        self.conf.setToolTip(_("How alike the screen must be to the picture. "
+                               "Lower finds more, and also finds wrong "
+                               "places."))
+        self.region = step.get("region")
+        self.region_lbl = QLabel()
+        self.b_region = QPushButton(_("Pick area…"))
+        self.b_region.clicked.connect(lambda: self._capture("region"))
+        self.b_whole = QPushButton(_("Whole screen"))
+        self.b_whole.clicked.connect(lambda: self._set_region(None))
+        self.color = QLineEdit(step.get("color", "#ffffff"))
+        self.color.setMaxLength(7)
+        self.color.setFixedWidth(90)
+        self.swatch = QLabel()
+        self.swatch.setFixedSize(22, 22)
+        self.color.textChanged.connect(self._sync_swatch)
+        self.tol = QSpinBox()
+        self.tol.setRange(0, 255)
+        self.tol.setValue(step.get("tol", 16))
+        self.tol.setToolTip(_("How far red, green and blue may each be from "
+                              "the color, 0 to 255."))
+        self.want = QComboBox()
+        self._want = step.get("want", "seen")
+        self.wait_s = QDoubleSpinBox()
+        self.wait_s.setRange(0.0, 3600.0)
+        self.wait_s.setDecimals(1)
+        self.wait_s.setSuffix(" s")
+        self.wait_s.setSpecialValueText(_("check once"))
+        self.wait_s.setValue(step.get("wait", 5000.0) / 1000.0)
+        self.act = _combo(SEEN_ACT_LABELS, step.get(
+            "act", "left" if op != "pixel" else "none"))
+        self.act.currentIndexChanged.connect(self._sync_want)
+        self.ok_flow = FlowEdit(step.get("ok", "next"), step.get("ok_to", 1))
+        self.fail_flow = FlowEdit(step.get("fail", "stop"),
+                                  step.get("fail_to", 1))
+        self.delay = QSpinBox()
+        self.delay.setRange(0, 10)
+        self.delay.setSuffix(" s")
+        self.delay.setValue(3)
+        self.delay.setToolTip(_("Time to switch to the game window before the "
+                                "screen is captured."))
+        self.msg = QLineEdit(step.get("text", "") if op == "notify" else "")
+        self.msg.setMaxLength(1000)
+        self.hook = QLineEdit(step.get("url", "") if op == "notify" else "")
+        self.hook.setPlaceholderText(_("optional") + ", "
+                                     "https://discord.com/api/webhooks/…")
+        self.shot = QCheckBox(_("Attach a screenshot"))
+        self.shot.setChecked(bool(step.get("shot")))
+        self.hook.textChanged.connect(self._sync_hook)
+        self.link = QLineEdit(step.get("url", "") if op == "open" else "")
+        self.link.setPlaceholderText("https://…, roblox://…, steam://…")
+        self.cap_note = QLabel("")
+        self.cap_note.setWordWrap(True)
+        self.screen_rows = (
+            ("pos", "Position:", _hrow(QLabel("X"), self.px, QLabel("Y"),
+                                       self.py, self.b_pick)),
+            ("click", "Then:", self.click),
+            ("image", "Image:", img_w),
+            ("conf", "Similarity:", self.conf),
+            ("region", "Search in:", _hrow(self.region_lbl, self.b_region,
+                                           self.b_whole)),
+            ("color", "Color:", _hrow(self.swatch, self.color)),
+            ("tol", "Tolerance:", self.tol),
+            ("want", "Wait until it:", self.want),
+            ("wait", "Wait up to:", self.wait_s),
+            ("act", "When found:", self.act),
+            ("human", "Movement:", _hrow(self.human, self.human_ms)),
+            ("spread", "Random offset:", self.spread),
+            ("ok", "If it happens:", self.ok_flow),
+            ("fail", "If not:", self.fail_flow),
+            ("delay", "Capture after:", _hrow(self.delay, self.cap_note)),
+            ("msg", "Message:", self.msg),
+            ("hook", "Discord webhook:", self.hook),
+            ("shot", "", self.shot),
+            ("link", "Link or file:", self.link))
+        self._show_image()
+        self._set_region(self.region)
+        self._sync_swatch()
+        self._sync_hook()
+
+    def _sync_swatch(self, _t=""):
+        c = parse_color(self.color.text())
+        self.swatch.setStyleSheet(
+            f"background:{color_hex(c)};border:1px solid #888;" if c
+            else "border:1px dashed #888;")
+
+    def _sync_hook(self, _t=""):
+        self.shot.setEnabled(bool(self.hook.text().strip()))
+
+    def _sync_want(self, _i=0):
+        seen = self.want.currentData() != "gone"
+        op = self.op.currentData()
+        self.act.setEnabled(seen)
+        moves = op == "point" or (seen and self.act.currentData() != "none")
+        self.human.setEnabled(moves)
+        self.human_ms.setEnabled(moves and self.human.isChecked())
+
+    def _show_image(self):
+        img = QImage(self.img_path) if self.img_path else QImage()
+        if img.isNull():
+            self.img_view.setPixmap(QPixmap())
+            self.img_view.setText(_("No image yet") if not self.img_path
+                                  else os.path.basename(self.img_path))
+            return
+        box = (240, 120)
+        k = min(box[0] / img.width(), box[1] / img.height())
+        mode = Qt.FastTransformation if k >= 1 else Qt.SmoothTransformation
+        k = min(k, 4.0)
+        self.img_view.setPixmap(QPixmap.fromImage(img.scaled(
+            max(1, round(img.width() * k)), max(1, round(img.height() * k)),
+            Qt.KeepAspectRatio, mode)))
+        self.img_view.setToolTip(self.img_path)
+
+    def _set_region(self, rect):
+        self.region = rect
+        self.region_lbl.setText(_("{w}×{h} at {x}, {y}", w=rect[2], h=rect[3],
+                                  x=rect[0], y=rect[1]) if rect
+                                else _("Whole screen"))
+        self.b_whole.setEnabled(bool(rect))
+
+    def _open_image(self):
+        path, _f = QFileDialog.getOpenFileName(
+            self, _("Image"), images_dir() if os.path.isdir(images_dir())
+            else os.path.expanduser("~"),
+            _("Images") + " (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if not path:
+            return
+        if QImage(path).isNull():
+            self.error.setText(_("That file is not an image."))
+            return
+        self.error.setText("")
+        self.img_path = path
+        self._show_image()
+
+    def _busy(self, on):
+        for w in (self.b_pick, self.b_shot, self.b_region, self.b_file,
+                  self.op):
+            w.setEnabled(not on)
+
+    def _wait(self, seconds, done=lambda: False):
+        app = QApplication.instance()
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and not done():
+            app.processEvents()
+            time.sleep(0.02)
+
+    def _capture(self, mode):
+        """Um quadro de cada tela, depois da contagem (dá tempo de trocar
+        para a janela do jogo), e o seletor. mode: point, image, region."""
+        cap = SCREEN()
+        self.error.setText("")
+        self._busy(True)
+        frames = []
+        try:
+            self.cap_note.setText(_("Waiting for screen sharing…"))
+            cap.start()
+            self._wait(SCREEN_ASK_S, lambda: cap.state != "starting")
+            if cap.state != "on":
+                self.cap_note.setText("")
+                self.error.setText(cap.error
+                                   or _("The screen is not available."))
+                return
+            cap.acquire()
+            try:
+                for left in range(self.delay.value(), 0, -1):
+                    self.cap_note.setText(_(
+                        "Capturing in {n} s, switch to the game window…",
+                        n=left))
+                    self._wait(1.0)
+                frames = cap.frames()
+            finally:
+                cap.release()
+        finally:
+            self._busy(False)
+            self._sync()
+        self.cap_note.setText("")
+        if not frames:
+            self.error.setText(cap.error or _("No picture came from the "
+                                              "screen."))
+            return
+        dlg = ScreenPicker(self, frames, "point" if mode == "point"
+                           else "area")
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._picked(mode, dlg)
+
+    def _picked(self, mode, dlg):
+        if mode == "point" and dlg.point:
+            self.px.setValue(dlg.point[0])
+            self.py.setValue(dlg.point[1])
+            if self.op.currentData() == "pixel" and dlg.color:
+                self.color.setText(color_hex(dlg.color))
+        elif mode == "region" and dlg.rect:
+            self._set_region(dlg.rect)
+        elif mode == "image" and dlg.crop is not None:
+            folder = images_dir()
+            os.makedirs(folder, exist_ok=True)
+            base = time.strftime("image-%Y%m%d-%H%M%S")
+            path, n = os.path.join(folder, base + ".png"), 2
+            while os.path.exists(path):
+                path, n = os.path.join(folder, f"{base}-{n}.png"), n + 1
+            if not rgb_qimage(dlg.crop).save(path, "PNG"):
+                self.error.setText(_("Could not save {path}.", path=path))
+                return
+            self.img_path = path
+            self._show_image()
+
+    def _ok(self):
+        op = self.op.currentData()
+        if self.step() is None:
+            self.error.setText(_({
+                "image": "Pick an image first.",
+                "pixel": "The color must look like #ff8800.",
+                "notify": "Type a message, or attach a screenshot to a "
+                          "webhook.",
+                "open": "Type a link or a file.",
+                "text": "Type the text.",
+                "move": "Right or down must not be zero.",
+            }.get(op, "This step is not complete.")))
+            return
+        self.accept()
 
     NOTES = {"text": "Typed with a US keyboard layout: letters, digits and "
                      "symbols land on the same physical keys.",
-             "move": "Moves by an amount, from where the pointer is. Wayland "
-                     "does not let a program put the pointer at a screen "
-                     "position.",
+             "move": "Moves by an amount, from where the pointer is. To go to "
+                     "an exact position, use Go to a screen position.",
+             "point": "Puts the pointer at an exact position. 0, 0 is the top "
+                      "left corner of the leftmost screen, and all screens "
+                      "count together, as in Display Configuration.",
+             "image": "Looks for the picture on screen, like ImageSearch in "
+                      "AutoHotkey. The first time, the system asks which "
+                      "screens WayClick may see, and remembers the answer.",
+             "pixel": "Reads the color of one point, like PixelGetColor in "
+                      "AutoHotkey.",
+             "notify": "Without a webhook it shows a desktop notification. "
+                       "With a Discord webhook (channel settings, "
+                       "Integrations) it posts in that channel.",
+             "open": "Opens with the default program. Web pages, roblox:// "
+                     "and steam:// links, files.",
              "wait": "Random, up to: each run waits a different time between "
                      "the two values.",
              "down": "Stays pressed until a Release step, or until the macro "
                      "stops, which releases everything it held."}
 
+    SHOWN = {"tap": ("key", "times"), "down": ("key",), "up": ("key",),
+             "wait": ("ms", "max"), "text": ("text",),
+             "wheel": ("dir", "times"), "move": ("dx", "dy"),
+             "point": ("pos", "click", "human", "spread", "delay"),
+             "image": ("image", "conf", "region", "want", "wait", "act",
+                       "human", "ok", "fail", "delay"),
+             "pixel": ("pos", "color", "tol", "want", "wait", "act", "human",
+                       "ok", "fail", "delay"),
+             "notify": ("msg", "hook", "shot"), "open": ("link",)}
+
     def _sync(self, _i=0):
         op = self.op.currentData()
-        shown = {"tap": ("key", "times"), "down": ("key",), "up": ("key",),
-                 "wait": ("ms", "max"), "text": ("text",),
-                 "wheel": ("dir", "times"), "move": ("dx", "dy")}[op]
-        self.rows.show_only(shown)
+        self.rows.show_only(self.SHOWN[op])
+        if op in WANT_LABELS:
+            keep = self.want.currentData() or self._want
+            self.want.blockSignals(True)
+            self.want.clear()
+            for key, label in WANT_LABELS[op]:
+                self.want.addItem(_(label), key)
+            self.want.setCurrentIndex(max(0, self.want.findData(keep)))
+            self.want.blockSignals(False)
+        self._sync_want()
         self.note.setText(_(self.NOTES[op]) if op in self.NOTES else "")
         self.note.setVisible(op in self.NOTES)
         self.adjustSize()
@@ -4400,6 +6427,23 @@ class StepDialog(QDialog):
              "dy": self.dy.value()}
         if op in ("tap", "down", "up") and is_button(s["code"]):
             s.pop("name")
+        if op in ("point", "image", "pixel"):
+            ok, fail = self.ok_flow.value(), self.fail_flow.value()
+            s.update(x=self.px.value(), y=self.py.value(),
+                     click=self.click.currentData(),
+                     human=self.human.isChecked() and self.human.isEnabled(),
+                     ms=self.human_ms.value(), spread=self.spread.value(),
+                     path=self.img_path, conf=self.conf.value() / 100.0,
+                     region=self.region, color=self.color.text(),
+                     tol=self.tol.value(), want=self.want.currentData(),
+                     wait=self.wait_s.value() * 1000.0,
+                     act=self.act.currentData(), ok=ok[0], ok_to=ok[1],
+                     fail=fail[0], fail_to=fail[1])
+        elif op == "notify":
+            s.update(text=self.msg.text(), url=self.hook.text(),
+                     shot=self.shot.isChecked() and self.shot.isEnabled())
+        elif op == "open":
+            s["url"] = self.link.text()
         return normalize_step(s)
 
 
@@ -4564,6 +6608,7 @@ class MacroDialog(QDialog):
                          in ("tap", "down", "up") else None)
         if dlg.exec() == QDialog.Accepted and dlg.step():
             at = row + 1 if 0 <= row < len(self.steps) else len(self.steps)
+            self._retarget(lambda n: n + 1 if n - 1 >= at else n)
             self.steps.insert(at, dlg.step())
             self._fill_steps(at)
 
@@ -4580,6 +6625,7 @@ class MacroDialog(QDialog):
         row = self.step_list.currentRow()
         if 0 <= row < len(self.steps):
             del self.steps[row]
+            self._retarget(lambda n: n - 1 if n - 1 > row else n)
             self._fill_steps(max(0, row - 1))
 
     def _move_step(self, delta):
@@ -4587,7 +6633,16 @@ class MacroDialog(QDialog):
         to = row + delta
         if 0 <= row < len(self.steps) and 0 <= to < len(self.steps):
             self.steps[row], self.steps[to] = self.steps[to], self.steps[row]
+            self._retarget(lambda n: to + 1 if n == row + 1 else
+                           row + 1 if n == to + 1 else n)
             self._fill_steps(to)
+
+    def _retarget(self, fn):
+        """"Ir ao passo N" acompanha inserir, remover e mover passos."""
+        for st in self.steps:
+            for key in ("ok_to", "fail_to"):
+                if key in st:
+                    st[key] = max(1, fn(st[key]))
 
     # -------------------------------------------------------------- modo --
     HINTS = {"toggle": "Press the hotkey to start, press it again to stop. "
@@ -5041,6 +7096,11 @@ class App(QWidget):
         self.engine = MacroEngine(self._macro_outputs, hub=self.watcher.hub)
         self.engine.changed.connect(self._macros_ran)
         self.engine.toggled.connect(self._macro_toggled)
+        self.engine.problem.connect(self._macro_problem)
+        self.engine.message.connect(self._macro_message)
+        self.engine.screen = SCREEN()
+        self.pointer = None
+        self._track_screens()
         self.macro_box.toggled.connect(lambda _on: self._apply_macros())
 
         # fallback só com a janela em foco; desligado quando o global funciona,
@@ -5918,6 +7978,54 @@ class App(QWidget):
             macro.stop()
         self.keymacros = []
 
+    # ------------------------------------------- ponteiro absoluto e telas --
+    def ensure_pointer(self):
+        """O device que põe o cursor numa posição. Criado na thread da UI:
+        nasce em 0,4 s, tempo que a do hub não pode parar."""
+        if self.pointer is None:
+            try:
+                self.pointer = AbsolutePointer()
+            except OSError as e:
+                self.warn.setText(f"absolute pointer failed: {e}")
+                return False
+            self.engine.pointer = self.pointer
+        return True
+
+    def _track_screens(self):
+        """Cada tela é ligada uma vez só, ao aparecer: UniqueConnection com
+        método Python não deduplica em todo PySide6, e religar a cada
+        mudança dobraria as chamadas."""
+        app = QApplication.instance()
+        app.screenAdded.connect(self._screen_added)
+        app.screenRemoved.connect(self._screens_changed)
+        for sc in QApplication.screens():
+            sc.geometryChanged.connect(self._screens_changed)
+        self._screens_changed()
+
+    def _screen_added(self, sc):
+        sc.geometryChanged.connect(self._screens_changed)
+        self._screens_changed()
+
+    def _screens_changed(self, _screen=None):
+        """A área de trabalho inteira (todas as telas, em coordenadas
+        lógicas): é sobre ela que o compositor estica o ponteiro absoluto."""
+        rect = None
+        for sc in QApplication.screens():
+            g = sc.geometry()
+            rect = g if rect is None else rect.united(g)
+        if rect is not None and rect.width() > 0 and rect.height() > 0:
+            self.engine.workspace = (rect.x(), rect.y(), rect.width(),
+                                     rect.height())
+
+    def _macro_problem(self, text):
+        self.warn.setText(text)
+
+    def _macro_message(self, title, text):
+        if getattr(self, "tray", None):
+            self.tray.showMessage(title, text, wayclick_icon())
+        else:
+            notify_desktop(title, text)
+
     # ---------------------------------------------------------- teclado --
     def ensure_keyboard(self):
         if self.keyboard is None:
@@ -6245,6 +8353,9 @@ class App(QWidget):
         active = self.macro_box.isChecked() and not self._macro_editing
         if active and self._macros_need_keyboard():
             self.ensure_keyboard()
+        if active and any(CompiledMacro(m).uses_pointer for m in self.macros
+                          if m["enabled"] and m["steps"]):
+            self.ensure_pointer()
         path = self.selected_mouse()[0]
         if path and self.mouse is not None:
             # botão do mouse como atalho escondido: o relay sai pelo mesmo
@@ -6416,6 +8527,12 @@ class App(QWidget):
         if self.mouse:
             self.mouse.close()
             self.mouse = None
+        if self.pointer:
+            self.engine.pointer = None
+            self.pointer.close()
+            self.pointer = None
+        if self.engine.screen is not None:
+            self.engine.screen.stop()
         try:
             with open(CFG, "w") as fh:
                 json.dump({"interval_ms": self.interval.value(),

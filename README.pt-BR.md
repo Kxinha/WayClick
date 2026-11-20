@@ -26,6 +26,11 @@ compositor e sem nada rodando como root.
   ou botão do mouse, com modificadores), liga e desliga, enquanto segura, uma
   vez ou sempre, uma lista de passos, e o atalho escondido do jogo como o
   AutoHotkey faz. **Importar AHK** transforma um script `.ahk` em macros
+- **Passos de tela** nesses macros, como o `ImageSearch` e o `PixelGetColor`
+  do AutoHotkey. Ir a um ponto exato e clicar, achar uma imagem, conferir a
+  cor de um pixel, esperar até aparecer ou sumir e escolher o que vem depois,
+  postar num webhook do Discord com print da tela, abrir um link. **Escolher
+  na tela** pega o ponto, a cor ou a imagem da sua própria tela
 - **Mandar tecla para uma janela** — escolha uma janela aberta e alimente ela
   com uma tecla; em alvo X11 chega sem mexer no foco, mesmo minimizada
 - **Anti-AFK** — mexe o ponteiro e devolve, com deriva zero
@@ -45,6 +50,7 @@ compositor e sem nada rodando como root.
 | Python | 3.9 ou mais novo |
 | Bindings Qt | PySide6 (`QtMultimedia` é opcional — só para os bipes) |
 | Permissões | seu usuário no grupo `input`, e `/dev/uinput` gravável por ele |
+| Passos de tela (opcional) | numpy, PyGObject e GStreamer com o plugin do PipeWire, mais o portal do desktop (`xdg-desktop-portal-kde` no Plasma) |
 
 ## Instalação
 
@@ -64,6 +70,13 @@ Os pacotes já trazem a regra de udev, então só falta entrar uma vez no grupo
 carrega o próprio Python e Qt e não precisa de dependência nenhuma — só os
 bipes do atalho ficam de fora, porque o PySide6-Essentials não inclui o
 QtMultimedia; ele cai no `paplay` do seu sistema.
+
+Os passos que olham a tela (achar imagem, conferir a cor de um pixel, print
+no webhook) usam numpy, PyGObject e GStreamer do seu sistema, que o Python
+próprio do AppImage não consegue carregar. Lá eles avisam o que falta e seguem
+pelo caminho *Se não*, e as posições são digitadas em vez de escolhidas na
+tela. O rpm e o deb recomendam esses pacotes, e o pacote do Arch lista como
+opcionais.
 
 ### Um comando
 
@@ -231,7 +244,8 @@ Um macro é
   porque jogos leem as teclas uma vez por quadro e perdem toque curto demais.
 - **passos**, em ordem: tocar uma tecla ou clicar (N vezes), segurar, soltar,
   esperar (exato, ou um tempo aleatório entre dois valores), digitar texto,
-  girar a roda, mover o ponteiro uma distância.
+  girar a roda, mover o ponteiro uma distância, e os
+  [passos de tela](#passos-de-tela).
 
 O que um macro segura é solto quando ele para, quando você o desabilita e
 quando o WayClick fecha. Um modificador que você segura para o atalho é solto
@@ -257,9 +271,10 @@ padrões que scripts de jogo usam:
 | `Send` com `{Tecla down}`, `{Tecla up}`, `{Tecla N}`, `^!+#`, texto, `{Click}`, `{WheelDown N}`; `Click`, `Sleep`, `Random`, `MouseMove ..., R`, `Gosub`, funções, atalhos empilhados, `$`, `*`, `~`, nomes `sc`/`vk`, `SetKeyDelay` | os passos correspondentes |
 
 Hotstrings, atalhos `Tecla Up`, combinações `A & B`, condições de janela `#If`
-(o atalho passa a valer em todas as janelas), cliques em coordenadas da tela (o
-Wayland não deixa posicionar o ponteiro) e programação em geral são avisados e
-ignorados.
+(o atalho passa a valer em todas as janelas) e programação em geral são
+avisados e ignorados. `Click X, Y` e `MouseMove X, Y` viram passos
+[Ir a uma posição da tela](#passos-de-tela), com um aviso quando o script
+media a partir da janela ativa, que é o padrão do AutoHotkey.
 
 O script anexado ao primeiro pedido desta função importa como *F1, liga e
 desliga, a cada 1 ms, tocar E*:
@@ -287,6 +302,56 @@ macro se algum jogo perder teclas nesse ritmo.
 No terminal, `wayclick --import script.ahk --dry-run` mostra o mesmo relatório,
 e sem `--dry-run` acrescenta os macros na config (com o WayClick fechado, já
 que um WayClick aberto grava a própria lista ao sair).
+
+### Passos de tela
+
+Mais cinco tipos de passo cobrem o que scripts do AutoHotkey fazem com
+`Click X, Y`, `ImageSearch`, `PixelGetColor` e `Run`.
+
+| Passo | O que faz |
+|---|---|
+| **Ir a uma posição da tela** | Põe o ponteiro num pixel exato e clica (esquerdo, direito, do meio ou duplo) ou só move. *Em curva, como a mão* desliza até lá no tempo que você definir em vez de pular, e *Desvio aleatório* cai até essa quantidade de pixels ao lado a cada vez. |
+| **Achar uma imagem na tela** | Procura uma imagem em todas as telas, ou só dentro de uma área que você marcar, com *Semelhança* de 50 a 100 % (85 por padrão). Achando, pode apontar para ela ou clicar no centro dela. |
+| **Conferir a cor de um pixel** | Lê um ponto e compara com uma cor, vermelho, verde e azul cada um dentro da *Tolerância*. |
+| **Enviar um aviso** | Uma notificação do desktop. Com um webhook do Discord (configurações do canal, Integrações) ele posta naquele canal, e pode anexar um print de cada tela. |
+| **Abrir um link ou arquivo** | Abre com o programa padrão, então páginas da web, links `roblox://` e `steam://` e arquivos funcionam. |
+
+Os passos de imagem e de cor podem esperar. *Esperar até* aparecer ou sumir
+(para uma cor, ter a cor ou perder a cor), por no máximo o tempo que você
+definir, ou *olhar uma vez*. *Se acontecer* e *Se não* escolhem o que vem
+depois, que pode ser seguir, parar o macro, recomeçar do passo 1 ou ir a um
+passo pelo número. Isso basta para o laço de sempre de um macro de jogo, que é
+esperar o botão, clicar, esperar a rodada acabar, coletar e recomeçar. Por
+padrão um passo que não vê o que esperava para o macro, então nada é clicado
+às cegas.
+
+**Escolher na tela…** preenche o passo a partir da sua tela. Depois de uma
+contagem (*Capturar após*, 3 s por padrão) que dá tempo de trocar para o jogo,
+o WayClick tira uma foto de cada tela e mostra. Clique no ponto, e num passo de
+cor a cor vem junto, ou arraste um retângulo em volta da imagem que vai ser
+procurada. As imagens ficam em `~/.local/share/wayclick/images`, e *Abrir
+arquivo…* aceita um PNG, JPEG, BMP ou WebP no lugar.
+
+Na primeira vez que um passo precisa da tela, o sistema pergunta quais telas o
+WayClick pode ver, no mesmo diálogo de compartilhar tela que as chamadas de
+vídeo usam. O WayClick pede ao portal para lembrar a resposta e guarda o token
+que volta em `~/.config/wayclick/screen-token`, que só você pode ler, então
+onde o desktop suporta isso as próximas vezes pulam a pergunta. O
+compartilhamento só fica aberto enquanto um macro precisa dele e fecha depois
+de 30 s sem uso, então o indicador de compartilhamento no painel só aparece
+enquanto algo está olhando.
+
+As posições seguem o arranjo das Configurações de tela, todas as telas juntas,
+com 0, 0 no canto de cima à esquerda do arranjo inteiro. Com escala elas ficam
+em unidades escaladas, então uma tela 4K a 150 % conta como 2560 de largura. O
+AutoHotkey mede o `Click X, Y` a partir da janela ativa por padrão, o que dá no
+mesmo para um jogo em tela cheia na tela mais à esquerda.
+
+Um limite para saber. Enquanto um jogo mantém o cursor travado, numa câmera em
+primeira pessoa ou enquanto você arrasta para virar, o KWin não move o
+ponteiro de jeito nenhum, então um passo de posição não faz nada ali. Use
+posições onde o jogo mostra o cursor livre, como menus, lobbies, lojas e telas
+de construir.
 
 ### Acionamento
 
@@ -463,6 +528,35 @@ O gatilho só é engolido quando o clique está ligado, que é quando o autoclic
 reemite no lugar dele. Segure o botão para acionar só a macro de teclado e ele é
 repassado normalmente — você fica com o seu botão e com a macro.
 
+**Ir a uma posição.** Um mouse relativo só diz quanto andar, e a aceleração do
+ponteiro muda quanto. Então, para os passos de tela, o WayClick cria mais um
+device, um ponteiro absoluto como o mouse que uma máquina virtual dá ao
+convidado, com `ABS_X` e `ABS_Y` de 0 a 65535 e três botões. O udev marca como
+mouse, o libinput entrega ao KWin como movimento absoluto, e o KWin espalha
+essa faixa pela área de trabalho inteira, todas as telas juntas. O WayClick
+transforma a posição no valor que cai no centro daquele pixel, a partir do
+arranjo de telas que o Qt informa, e acompanha o arranjo quando as telas
+mudam. Conferido pelo próprio libinput em três arranjos, cada canto e cada
+borda caem no pixel exato. O kernel descarta um valor igual ao anterior, então
+ir de novo ao mesmo ponto primeiro dá um passo de uma unidade para o lado. O
+device só é criado quando um macro habilitado precisa dele.
+
+**Ver a tela.** No Wayland só o compositor tem a imagem, e a porta de entrada
+para um programa comum é o portal ScreenCast do desktop, o mesmo das chamadas
+de vídeo. O WayClick fala com ele numa conexão D-Bus própria, pede todas as
+telas sem o cursor, e lê os quadros pelo PipeWire e pelo GStreamer
+(`pipewiresrc`, `videoconvert`, `appsink`), dez por segundo. Achar uma imagem
+é correlação cruzada normalizada (o `TM_CCOEFF_NORMED` do OpenCV) escrita em
+numpy com FFT. Os candidatos saem da imagem em cinza, na metade ou num quarto
+do tamanho quando o template aguenta a redução (texto miúdo e ruído não
+aguentam, e são procurados no tamanho real), e cada um depois é pontuado nas
+três cores e pela cor média, então o mesmo botão apagado, ou o mesmo ícone em
+outra cor, não conta. Medido em telas sintéticas de 1920×1080
+(`tests/bench_find_image.py`), 284 de 288 recortes aleatórios de 16×16 a
+300×150 foram achados no lugar exato, com mediana entre uns 30 e 60 ms por
+tela. Os outros quatro caíram numa cópia igual, duas áreas lisas da mesma cor
+e dois recortes de 16 px com um gêmeo de 0,999.
+
 ## Problemas comuns
 
 **"Atalho global DESLIGADO"** — você não está no grupo `input`, ou a sessão
@@ -489,12 +583,32 @@ costuma olhar movimento do ponteiro, não cliques. Ligue o Anti-AFK. Alguns jogo
 vão além e checam se o personagem se moveu; nesse caso use também a macro de
 teclado apertando uma tecla de movimento.
 
+**Um passo de posição não mexe o cursor no jogo.** O jogo travou o ponteiro
+(câmera em primeira pessoa, ou enquanto você vira), e o KWin não move um
+ponteiro travado. Use o passo onde o jogo mostra o cursor.
+
+**Um passo de imagem nunca acha a imagem.** Capture de novo com o jogo na
+resolução e na escala em que ele roda, porque a busca não redimensiona, e
+deixe de fora partes que mudam, como contadores ou fundos animados. Baixar um
+pouco a *Semelhança* ajuda com compressão e efeitos de brilho, e marcar uma
+área de busca deixa mais rápido e tira da frente o que é parecido em outro
+lugar.
+
+**Os passos de tela dizem o que instalar.** Instale os pacotes que a mensagem
+lista e reabra o WayClick. O AppImage não consegue carregar esses pacotes,
+então para passos de tela use um pacote ou o `install.sh`.
+
+**A pergunta de compartilhar a tela volta toda vez.** O desktop não guardou a
+permissão, ou recusou o token salvo. O WayClick salva o token que voltar a
+cada vez, e apagar `~/.config/wayclick/screen-token` faz ele perguntar do
+zero.
+
 ## Testes
 
 Os arquivos em `tests/` são verificações executáveis, não testes unitários —
 eles criam dispositivos de entrada falsos e medem comportamento real.
 
-Estes quatro são isolados e podem rodar enquanto você usa o desktop, até com
+Estes são isolados e podem rodar enquanto você usa o desktop, até com
 um jogo aberto: o WayClick só abre devices com `wctest` no nome, o teclado e o
 mouse falsos são capturados antes do primeiro evento, e todo device virtual
 que o WayClick cria é capturado pelo teste no instante em que aparece, que é
@@ -505,8 +619,20 @@ também como o teste lê o que teria chegado ao compositor (veja
 python3 tests/t_ahk_import.py                       # o importador nos scripts de tests/ahk
 sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk a 1 ms, todos os modos, esconder, relay
 sg input -c "python3 tests/t_hotkeys_ui.py"         # a aba Atalhos de ponta a ponta, config, --import
+sg input -c "python3 tests/t_hotkeys_dialogs.py"    # os editores de macro e de passo
 sg input -c "python3 tests/t_clicker_timing.py"     # período do Clicker e relay do teclado juntos
+sg input -c "python3 tests/t_screen_macros.py"      # passos de tela numa tela falsa, posições, webhook
+sg input -c "python3 tests/t_screen_ui.py"          # editor de passo, Escolher na tela, arranjo das telas
+sg input -c "python3 tests/t_abs_pointer_libinput.py"  # o ponteiro absoluto como o libinput lê
+python3 tests/t_screen_portal.py                    # o portal de verdade, dentro do bubblewrap
+python3 tests/bench_find_image.py                   # busca de imagem, acha ou não e com que rapidez
 ```
+
+O `t_screen_portal.py` roda o `xdg-desktop-portal` de verdade dentro do `bwrap`,
+com D-Bus próprio, PipeWire próprio e um backend ScreenCast falso que serve
+telas sintéticas, então nenhum diálogo aparece e nada da sua tela é
+compartilhado. Ele precisa de `bwrap`, `dbus-run-session`, `pipewire` e
+`wireplumber`, e pula quando falta algum.
 
 Rode com `QT_QPA_PLATFORM=offscreen`. Os outros precisam do compositor; rode a
 partir da raiz do projeto:
@@ -547,7 +673,11 @@ marcadores.
 
 As configurações ficam em `~/.config/wayclick.json`. Nada roda como root, nada é
 instalado no sistema além da regra de udev, e os devices virtuais somem quando o
-processo termina.
+processo termina. As imagens dos passos de imagem ficam em
+`~/.local/share/wayclick/images`, e o token de compartilhamento de tela em
+`~/.config/wayclick/screen-token`. A tela só é compartilhada enquanto um macro
+precisa dela, e nenhum quadro sai da máquina, a não ser que um passo poste um
+print no webhook que você deu a ele.
 
 Use onde automação for permitida. Muito jogo online bane automação de entrada.
 

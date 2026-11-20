@@ -1,12 +1,16 @@
 # Maintainer: gabrielmf1998 <noreply@github.com>
 pkgname=wayclick
-pkgver=1.6.0
+pkgver=1.7.0
 pkgrel=1
 pkgdesc="Autoclicker for Wayland, using /dev/uinput"
 arch=('any')
 url="https://github.com/gabrielmf1998/WayClick"
 license=('MIT')
 depends=('python>=3.9' 'pyside6')
+optdepends=('python-numpy: screen steps, find an image or a pixel color'
+            'python-gobject: screen steps, the screen capture portal'
+            'gst-plugin-pipewire: screen steps, frames from PipeWire'
+            'gst-plugins-base: screen steps, videoconvert and appsink')
 install=wayclick.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')

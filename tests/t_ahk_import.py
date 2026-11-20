@@ -22,8 +22,9 @@ CASES = {
     "v2_func.ahk": (["F1, toggle, every 1 ms: Tap E"], ["SetTimer 1 ms"]),
     "ternary.ahk": (["F1, toggle, every 10 ms: Tap Q",
                      "Ctrl+Shift+F2, toggle, every 1 ms: Tap Q"], []),
-    "braces_else.ahk": (["F1, toggle, every 25 ms: Tap E ×2, Click Left"],
-                        ["click coordinates ignored"]),
+    "braces_else.ahk": (["F1, toggle, every 25 ms: Tap E ×2, "
+                         "Move to 100, 200, Click Left"],
+                        ["measured them from the active window"]),
     "v1_while_toggle.ahk": (["F3, toggle: Hold W, Wait 100 ms, Release W, "
                              "Wait 50 ms"], []),
     "random_sleep.ahk": (["F10, toggle: Tap 1, Wait 80 to 120 ms"], []),
