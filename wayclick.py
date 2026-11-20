@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """WayClick — autoclicker para Wayland via /dev/uinput (kernel), sem X11."""
-import ctypes, fcntl, glob, grp, json, math, os, pwd, random, re, select
+import base64, binascii, ctypes, fcntl, glob, grp, json, math, os, pwd
+import random, re, select
 import shlex, shutil, struct
 import signal, subprocess, sys, tempfile, threading, time, urllib.request
 import wave
@@ -31,7 +32,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -1264,6 +1265,10 @@ class InputHub:
                         out += raw
                     d.frame = bytearray()
                     continue
+            elif etype == EV_REL and code in (REL_WHEEL, REL_HWHEEL):
+                for s in list(self.subs):        # o gravador conta a roda
+                    if getattr(s, "on_rel", None) is not None:
+                        self._ask(s, "on_rel", d, code, value)
             elif etype == EV_KEY:
                 if self._key(d, code, value):
                     # bloqueada: o MSC_SCAN que a anunciava some junto
@@ -2431,13 +2436,20 @@ MACRO_MODE_LABELS = {"toggle": "Toggle: press to start, again to stop",
 MACRO_MODE_SHORT = {"toggle": "toggle", "hold": "while held",
                     "once": "once", "always": "always"}
 STEP_OPS = ("tap", "down", "up", "wait", "text", "wheel", "move",
-            "point", "image", "pixel", "notify", "open")
+            "point", "image", "pixel", "notify", "open", "watch", "count",
+            "window")
 POINT_CLICKS = ("none", "left", "right", "middle", "double")
 SEEN_ACTS = ("none", "move", "left", "right", "middle", "double")
+WATCH_KINDS = ("image", "pixel", "window")
+WINDOW_ACTS = ("check", "focus")
 FLOWS = ("next", "stop", "restart", "jump")
 COORD = 100000                   # |x|, |y| máximos de uma posição na tela
 MAX_MACROS = 50
 MAX_STEPS = 2000
+MAX_RUNS = 1000000               # "parar depois de N" e "a cada N"
+# campos que todo texto de aviso entende; contadores entram com o nome deles
+TEXT_FIELDS = ("run", "time")
+FIELD_RE = re.compile(r"\{(\w{1,24})\}")
 REL_WHEEL, REL_HWHEEL = 8, 6
 REL_WHEEL_HI, REL_HWHEEL_HI = 0x0b, 0x0c
 
@@ -2517,36 +2529,53 @@ def normalize_step(s):
         if spread:
             step["spread"] = spread
         return step
-    if op in ("image", "pixel"):
+    if op in ("image", "pixel", "window"):
+        sight = _sight(op, s)
+        if sight is None:
+            return None
         step = {"op": op,
                 "want": s.get("want") if s.get("want") in ("seen", "gone")
                 else "seen",
                 "wait": _num(s.get("wait", 5000.0), 5000.0, 0.0, 3600000.0)}
-        if op == "image":
-            path = str(s.get("path") or "")[:4096]
-            if not path:
-                return None
-            step["path"] = path
-            step["conf"] = round(_num(s.get("conf", 0.85), 0.85, 0.5, 1.0), 3)
-            region = _rect(s.get("region"))
-            if region:
-                step["region"] = region
+        step.update(sight)
+        if op == "window":
+            step["act"] = s.get("act") if s.get("act") in WINDOW_ACTS \
+                else "check"
         else:
-            color = parse_color(s.get("color"))
-            if color is None:
-                return None
-            step.update(x=_num(s.get("x"), 0, -COORD, COORD, int),
-                        y=_num(s.get("y"), 0, -COORD, COORD, int),
-                        color=color_hex(color),
-                        tol=_num(s.get("tol", 16), 16, 0, 255, int))
-        default = "left" if op == "image" else "none"
-        step["act"] = s.get("act") if s.get("act") in SEEN_ACTS else default
-        _human(step, s)
-        for key, dflt in (("ok", "next"), ("fail", "stop")):
-            step[key] = s.get(key) if s.get(key) in FLOWS else dflt
-            if step[key] == "jump":
-                step[key + "_to"] = _num(s.get(key + "_to", 1), 1, 1,
-                                         MAX_STEPS, int)
+            default = "left" if op == "image" else "none"
+            step["act"] = s.get("act") if s.get("act") in SEEN_ACTS \
+                else default
+            _human(step, s)
+        _flows(step, s, (("ok", "next"), ("fail", "stop")))
+        return step
+    if op == "watch":
+        kind = s.get("kind") if s.get("kind") in WATCH_KINDS else "image"
+        sight = _sight(kind, s)
+        if sight is None:
+            return None
+        step = {"op": "watch", "kind": kind,
+                "want": s.get("want") if s.get("want") in ("seen", "gone")
+                else "seen",
+                "every": _num(s.get("every", 1000.0), 1000.0, 100.0,
+                              3600000.0)}
+        step.update(sight)
+        if kind == "window":
+            step["act"] = "none"
+        else:
+            default = "left" if kind == "image" else "none"
+            step["act"] = s.get("act") if s.get("act") in SEEN_ACTS \
+                else default
+            _human(step, s)
+        _flows(step, s, (("ok", "next"),))
+        return step
+    if op == "count":
+        name = counter_name(s.get("name"))
+        if not name:
+            return None
+        step = {"op": "count", "name": name,
+                "every": _num(s.get("every", 0), 0, 0, MAX_RUNS, int)}
+        if step["every"]:
+            _flows(step, s, (("ok", "stop"),))
         return step
     if op == "notify":
         text = str(s.get("text") or "")[:1000]
@@ -2576,6 +2605,51 @@ def _rect(r):
     return [x, y, w, h] if w > 0 and h > 0 else None
 
 
+def _sight(kind, s):
+    """O que um passo procura: a imagem, a cor num ponto ou a janela."""
+    if kind == "image":
+        path = str(s.get("path") or "")[:4096]
+        if not path:
+            return None
+        out = {"path": path,
+               "conf": round(_num(s.get("conf", 0.85), 0.85, 0.5, 1.0), 3)}
+        region = _rect(s.get("region"))
+        if region:
+            out["region"] = region
+        return out
+    if kind == "pixel":
+        color = parse_color(s.get("color"))
+        if color is None:
+            return None
+        return {"x": _num(s.get("x"), 0, -COORD, COORD, int),
+                "y": _num(s.get("y"), 0, -COORD, COORD, int),
+                "color": color_hex(color),
+                "tol": _num(s.get("tol", 16), 16, 0, 255, int)}
+    match = " ".join(str(s.get("match") or "").split())[:100]
+    return {"match": match} if match else None
+
+
+def _flows(step, s, keys):
+    for key, dflt in keys:
+        step[key] = s.get(key) if s.get(key) in FLOWS else dflt
+        if step[key] == "jump":
+            step[key + "_to"] = _num(s.get(key + "_to", 1), 1, 1,
+                                     MAX_STEPS, int)
+
+
+def counter_name(name):
+    """Nome de contador, que vira {nome} nos textos: letras, dígitos e _."""
+    name = str(name or "").strip().lower()
+    return name if re.fullmatch(r"\w{1,24}", name) else ""
+
+
+def clock_text(seconds):
+    """1:02:03, ou 2:03 abaixo de uma hora."""
+    s = max(0, int(seconds))
+    h, m = divmod(s // 60, 60)
+    return f"{h}:{m:02d}:{s % 60:02d}" if h else f"{m}:{s % 60:02d}"
+
+
 def normalize_macro(m):
     m = m if isinstance(m, dict) else {}
     code = _num(m.get("code", 0), 0, 0, 0x2ff, int)
@@ -2595,6 +2669,7 @@ def normalize_macro(m):
         "period_ms": _num(m.get("period_ms", 100.0), 100.0, 0.0, 3600000.0),
         "press_ms": _num(m.get("press_ms", 0.0), 0.0, 0.0, 10000.0),
         "block": bool(m.get("block", True)),
+        "limit": _num(m.get("limit", 0), 0, 0, MAX_RUNS, int),
         "steps": steps[:MAX_STEPS],
     }
 
@@ -2652,29 +2727,62 @@ def step_label(s):
         if s.get("spread"):
             text += f" ±{s['spread']}"
         return text + (", " + _("curved") if s.get("human") else "")
-    if op in ("image", "pixel"):
+    if op in ("image", "pixel", "window"):
+        seen = s["want"] == "seen"
         if op == "image":
-            name = os.path.splitext(os.path.basename(s["path"]))[0]
-            text = (_("Find “{img}”", img=name) if s["want"] == "seen" else
+            name = image_name(s["path"])
+            text = (_("Find “{img}”", img=name) if seen else
                     _("Wait until “{img}” is gone", img=name))
-        else:
+        elif op == "pixel":
             where = f"{s['x']}, {s['y']}"
             text = (_("Pixel {at} is {color}", at=where, color=s["color"])
-                    if s["want"] == "seen" else
+                    if seen else
                     _("Pixel {at} is not {color}", at=where,
                       color=s["color"]))
+        else:
+            win = s["match"]
+            text = (_("Wait until the “{win}” window closes", win=win)
+                    if not seen else
+                    _("Focus the “{win}” window", win=win)
+                    if s["act"] == "focus" else
+                    _("Check the “{win}” window is open", win=win))
         parts = [text, _("up to {s} s", s=_ms(s["wait"] / 1000.0))
                  if s["wait"] else _("once")]
-        if s["want"] == "seen" and s["act"] != "none":
-            parts.append({"move": _("point at it"), "left": _("click it"),
-                          "right": _("right click it"),
-                          "middle": _("middle click it"),
-                          "double": _("double click it")}[s["act"]])
+        if seen and op != "window" and s["act"] != "none":
+            parts.append(_act_label(s["act"]))
         if s["ok"] != "next":
             parts.append(_("then {what}", what=flow_label(s, "ok")))
         text = ", ".join(parts)
         if s["fail"] != "next":
             text += "; " + _("else {what}", what=flow_label(s, "fail"))
+        return text
+    if op == "watch":
+        seen, kind = s["want"] == "seen", s["kind"]
+        if kind == "image":
+            name = image_name(s["path"])
+            text = (_("Watch for “{img}”", img=name) if seen else
+                    _("Watch for “{img}” to go away", img=name))
+        elif kind == "pixel":
+            where = f"{s['x']}, {s['y']}"
+            text = (_("Watch pixel {at} for {color}", at=where,
+                      color=s["color"]) if seen else
+                    _("Watch pixel {at} losing {color}", at=where,
+                      color=s["color"]))
+        else:
+            text = (_("Watch for the “{win}” window", win=s["match"]) if seen
+                    else _("Watch for the “{win}” window to close",
+                           win=s["match"]))
+        parts = [text, _("every {s} s", s=_ms(s["every"] / 1000.0))]
+        if seen and kind != "window" and s["act"] != "none":
+            parts.append(_act_label(s["act"]))
+        if s["ok"] != "next":
+            parts.append(_("then {what}", what=flow_label(s, "ok")))
+        return ", ".join(parts)
+    if op == "count":
+        text = _("Count {name}", name="{" + s["name"] + "}")
+        if s["every"]:
+            text += ", " + _("every {n} then {what}", n=s["every"],
+                             what=flow_label(s, "ok"))
         return text
     if op == "notify":
         text = _("Notify “{t}”", t=s["text"]) if s["text"] else _("Notify")
@@ -2682,6 +2790,16 @@ def step_label(s):
             text += " + " + _("screenshot")
         return text + (" (webhook)" if s.get("url") else "")
     return _("Open {url}", url=s["url"])
+
+
+def image_name(path):
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _act_label(act):
+    return {"move": _("point at it"), "left": _("click it"),
+            "right": _("right click it"), "middle": _("middle click it"),
+            "double": _("double click it")}[act]
 
 
 def flow_label(s, key):
@@ -2700,6 +2818,9 @@ def macro_summary(m, limit=4):
             parts.append(_("no repeat"))
         elif m["period_ms"]:
             parts.append(_("every {ms} ms", ms=_ms(m["period_ms"])))
+        if m["repeat"] and m.get("limit"):
+            parts.append(_("stop after {n} runs", n=m["limit"])
+                         if m["limit"] > 1 else _("stop after 1 run"))
     steps = [step_label(s) for s in m["steps"][:limit]]
     if len(m["steps"]) > limit:
         steps.append("…")
@@ -2733,13 +2854,33 @@ class CompiledMacro:
                        and is_button(st["code"])}
         # ponteiro absoluto e tela, que a App só cria para quem usa
         self.uses_pointer = any(
-            st["op"] == "point" or (st["op"] in ("image", "pixel")
-                                    and st["act"] != "none")
+            st["op"] == "point" or (_sees(st) and st["act"] != "none")
             for st in self.steps)
         self.uses_screen = any(
-            st["op"] in ("image", "pixel")
-            or (st["op"] == "notify" and st.get("shot"))
+            _sees(st) or (st["op"] == "notify" and st.get("shot"))
             for st in self.steps)
+        self.uses_windows = any(
+            st["op"] == "window"
+            or (st["op"] == "watch" and st["kind"] == "window")
+            for st in self.steps)
+        self.limit = m.get("limit", 0) if loops else 0
+        self.counters = tuple(dict.fromkeys(
+            st["name"] for st in self.steps if st["op"] == "count"))
+
+
+def _sees(st):
+    """O passo olha a tela (imagem ou cor), seja esperando ou vigiando."""
+    return st["op"] in ("image", "pixel") or (
+        st["op"] == "watch" and st["kind"] != "window")
+
+
+class _Jump(Exception):
+    """Um vigia disparou no meio de um passo e o macro vai para outro lugar
+    (to: índice, ou MacroRunner.STOP)."""
+
+    def __init__(self, to):
+        super().__init__(to)
+        self.to = to
 
 
 class MacroRunner(threading.Thread):
@@ -2775,6 +2916,9 @@ class MacroRunner(threading.Thread):
         self._seeing = False
         self._blind = False  # a tela falhou: não pergunta de novo nesta vez
         self._told = set()
+        self.watches = {}    # índice do passo Vigiar -> [passo, a cada, vence]
+        self.counters = dict.fromkeys(macro.counters, 0)
+        self.began = time.perf_counter()
 
     def stop(self):
         self.stopping = True
@@ -2807,7 +2951,7 @@ class MacroRunner(threading.Thread):
             self._sleep(self.m.press)
             self._set(code, False)
             if i + 1 < times:
-                self._sleep(self.m.press)
+                self._rest(self.m.press)
 
     def _wheel(self, direction, times):
         if self.mouse is None:
@@ -2900,7 +3044,7 @@ class MacroRunner(threading.Thread):
 
     def _check(self, st, frames):
         """Onde está agora o que o passo procura (ponto lógico), ou None."""
-        if st["op"] == "image":
+        if st.get("kind", st["op"]) == "image":
             tpl = load_image(st["path"])
             if tpl is None:
                 raise VisionError(_("The image {path} could not be read.",
@@ -2936,7 +3080,140 @@ class MacroRunner(threading.Thread):
             left = deadline - time.perf_counter()
             if left <= 0 or self._halt.is_set():
                 return False, None
-            self._sleep(min(self.POLL_S, left))
+            self._rest(min(self.POLL_S, left))
+
+    # ----------------------------------------------------------- janelas --
+    WINDOW_POLL_S = 1.0          # cada pergunta ao KWin custa uns 30 ms
+
+    def _find_window(self, st, focus=False):
+        """{"found": ...} da janela do passo, ou None sem como perguntar."""
+        kw = getattr(self.env, "windows", None)
+        info = None
+        if kw is not None:
+            try:
+                info = kw.find(st["match"], focus)
+            except Exception:                      # noqa: BLE001
+                info = None
+        if not isinstance(info, dict):
+            self._report(_("windows can only be checked on KDE Plasma, "
+                           "through KWin, so the window step took its else "
+                           "path."))
+            return None
+        return info
+
+    def _window(self, st):
+        """Espera a janela abrir (ou fechar) no tempo do passo; foca."""
+        want = st["want"] == "seen"
+        focus = want and st["act"] == "focus"
+        deadline = time.perf_counter() + st["wait"] / 1000.0
+        while True:
+            info = self._find_window(st, focus)
+            if info is None:
+                return False
+            if bool(info.get("found")) == want:
+                return True
+            left = deadline - time.perf_counter()
+            if left <= 0 or self._halt.is_set():
+                return False
+            self._rest(min(self.WINDOW_POLL_S, left))
+
+    # ------------------------------------------------------------ vigias --
+    # Um passo Vigiar arma uma checagem que corre por baixo dos passos
+    # seguintes, como um SetTimer com ImageSearch no AutoHotkey: a cada tanto,
+    # olha; se viu, age (clica) e segue, ou leva o macro para outro passo.
+    # Só olha quando o macro está esperando (passo Esperar, procura na tela,
+    # intervalo entre toques) e entre um passo e outro, nunca com tecla ou
+    # botão no meio do aperto.
+    def _rest(self, seconds):
+        if seconds > 0:
+            self._rest_until(time.perf_counter() + seconds)
+
+    def _rest_until(self, deadline):
+        """Dorme até o deadline atendendo aos vigias que vencerem no meio.
+        Um vigia que leva a outro passo sai daqui por _Jump."""
+        clock = time.perf_counter
+        while not self._halt.is_set():
+            now = clock()
+            due = min((w[2] for w in self.watches.values()), default=None)
+            if due is not None and due <= now:
+                self._watch(now)
+                continue
+            if now >= deadline:
+                return
+            self._halt.wait((deadline if due is None else min(deadline, due))
+                            - now)
+
+    def _watch(self, now=None):
+        """Os vigias vencidos olham agora, em ordem de passo."""
+        now = time.perf_counter() if now is None else now
+        frames = None
+        for idx in sorted(self.watches):
+            w = self.watches.get(idx)
+            if w is None or w[2] > now or self._halt.is_set():
+                continue
+            st = w[0]
+            w[2] = now + w[1]
+            if st["kind"] == "window":
+                info = self._find_window(st)
+                if info is None:
+                    w[2] = math.inf                # sem KWin: desarma
+                    continue
+                hit = (0, 0) if info.get("found") else None
+            else:
+                if frames is None:
+                    cap = self._screen()
+                    frames = cap.frames() if cap is not None else []
+                    if cap is not None and not frames:
+                        self._blind = True
+                        self._report(cap.error or _("Screen sharing stopped."))
+                if not frames:
+                    w[2] = math.inf
+                    continue
+                try:
+                    hit = self._check(st, frames)
+                except VisionError as e:
+                    self._report(str(e))
+                    w[2] = math.inf
+                    continue
+            if (hit is not None) != (st["want"] == "seen"):
+                continue
+            if st["want"] == "seen" and st["act"] != "none" \
+                    and st["kind"] != "window":
+                if self._go(hit[0], hit[1], st.get("human"),
+                            st.get("ms", 0.0)):
+                    self._pclick(st["act"])
+                frames = None              # a tela mudou com o clique
+            to = self._flow(st, True)
+            if to is not None:
+                raise _Jump(to)
+
+    def _let_go(self):
+        """Solta tudo o que a sequência apertou e não soltou."""
+        for code in reversed(self.held[:]):
+            try:
+                self._set(code, False)
+            except OSError:
+                pass
+        self.held = []
+        for code in reversed(self.pheld[:]):
+            try:
+                self._pset(code, False)
+            except OSError:
+                pass
+        self.pheld = []
+
+    def fill(self, text):
+        """{run}, {time} e os contadores do macro, num texto de aviso."""
+        def sub(mo):
+            key = mo.group(1).lower()
+            if key == "run":
+                return str(self.count + 1)
+            if key == "time":
+                return clock_text(time.perf_counter() - self.began)
+            if key in self.counters:
+                return str(self.counters[key])
+            return mo.group(0)
+        return FIELD_RE.sub(sub, text)
 
     def _flow(self, st, ok):
         key = "ok" if ok else "fail"
@@ -2950,7 +3227,7 @@ class MacroRunner(threading.Thread):
         return None
 
     def _notify(self, st):
-        text = st["text"] or self.m.name
+        text = self.fill(st["text"]) if st["text"] else self.m.name
         if not st.get("url"):
             say = getattr(self.env, "say", None)
             if say:
@@ -2973,7 +3250,7 @@ class MacroRunner(threading.Thread):
         threading.Thread(target=send, daemon=True,
                          name="wayclick-webhook").start()
 
-    def _step(self, st):
+    def _step(self, st, i=0):
         """Faz o passo. Devolve para onde ir (índice) quando não é o
         próximo, ou STOP."""
         op = st["op"]
@@ -2987,7 +3264,7 @@ class MacroRunner(threading.Thread):
             ms = st["ms"]
             if st.get("max"):
                 ms = random.uniform(ms, st["max"])
-            self._sleep(ms / 1000.0)
+            self._rest(ms / 1000.0)
         elif op == "text":
             for ch in st["text"]:
                 if self._halt.is_set():
@@ -3022,6 +3299,18 @@ class MacroRunner(threading.Thread):
             self._notify(st)
         elif op == "open":
             OPENER(st["url"])
+        elif op == "watch":
+            every = st["every"] / 1000.0
+            if st["kind"] == "window":
+                every = max(every, self.WINDOW_POLL_S)
+            self.watches[i] = [st, every, time.perf_counter()]
+        elif op == "count":
+            n = self.counters.get(st["name"], 0) + 1
+            self.counters[st["name"]] = n
+            if st["every"] and n % st["every"] == 0:
+                return self._flow(st, True)
+        elif op == "window":
+            return self._flow(st, self._window(st))
         return None
 
     def run(self):
@@ -3033,7 +3322,16 @@ class MacroRunner(threading.Thread):
                 began = clock()
                 i = 0
                 while i < len(steps) and not self._halt.is_set():
-                    to = self._step(steps[i])
+                    try:
+                        if self.watches:
+                            self._watch()
+                        to = self._step(steps[i], i)
+                    except _Jump as j:
+                        # um vigia interrompeu: o que estava apertado é
+                        # solto, e os vigias valem até ele levar a outro lugar
+                        to = j.to
+                        self.watches.clear()
+                        self._let_go()
                     if to is None:
                         i += 1
                     elif to == self.STOP:
@@ -3042,8 +3340,15 @@ class MacroRunner(threading.Thread):
                         if to <= i:
                             self._sleep(self.MIN_JUMP_S)
                         i = max(0, to)
+                        # vigia que fica depois do destino volta a ser
+                        # armado quando a sequência passar por ele de novo
+                        for idx in [k for k in self.watches if k >= i]:
+                            del self.watches[idx]
+                self.watches.clear()
                 self.count += 1
                 if not self.loop or self._halt.is_set():
+                    break
+                if self.m.limit and self.count >= self.m.limit:
                     break
                 if self.m.period > 0:
                     nxt += self.m.period
@@ -3057,18 +3362,7 @@ class MacroRunner(threading.Thread):
         except OSError:
             pass                         # device fechado no meio
         finally:
-            for code in reversed(self.held[:]):
-                try:
-                    self._set(code, False)
-                except OSError:
-                    pass
-            self.held = []
-            for code in reversed(self.pheld[:]):
-                try:
-                    self._pset(code, False)
-                except OSError:
-                    pass
-            self.pheld = []
+            self._let_go()
             if self._seeing:
                 self._seeing = False
                 self.env.screen.release()
@@ -3094,6 +3388,7 @@ class MacroEngine(QObject):
         self.pointer = None             # AbsolutePointer, que a App cria
         self.screen = None              # ScreenCapture
         self.workspace = None           # (x, y, w, h) lógico de todas as telas
+        self.windows = None             # KWinBridge: find(texto, focar)
         self.hub = hub or HUB()
         self.lock = threading.Lock()
         self.active = False
@@ -3248,6 +3543,458 @@ class MacroEngine(QObject):
         self.active = False
         self.stop_all()
         self.hub.remove(self)
+
+
+# ---------------------------------------------------------- gravador ----
+# Gravar em vez de montar passo a passo: a pessoa joga, o WayClick anota, e o
+# resultado vira passos comuns, que dá para editar. Movimento do mouse sem
+# clique não entra; o clique entra com a posição, que só o KWin sabe.
+TAP_HOLD_S = 0.25        # apertou e soltou antes disso, sem nada no meio: toque
+CLICK_MOVE_PX = 6        # andou menos que isso entre apertar e soltar: clique
+DRAG_ASK_S = 0.15        # segurou mais que isso: pergunta onde soltou
+WHEEL_JOIN_S = 0.25      # giros seguidos da roda viram um passo só
+POINT_OF = {BTN["Left"]: "left", BTN["Right"]: "right",
+            BTN["Middle"]: "middle"}
+
+
+class MacroRecorder(QObject):
+    """Anota teclas, botões (com a posição do clique) e a roda, para virar
+    passos com recorded_steps().
+
+    Inscrito no hub como os macros, mas só olha: nada some, a não ser a
+    tecla de parar. A posição vem do KWin, pedida no instante do aperto
+    por uma thread própria: a do hub repassa as teclas de todo mundo e não
+    pode ficar esperando o compositor.
+    """
+    finished = Signal()             # a tecla de parar foi apertada
+
+    def __init__(self, hub=None, stop_code=0, cursor=None):
+        super().__init__()
+        self.hub = hub or HUB()
+        self.stop_code = stop_code
+        self.cursor = cursor        # () -> (x, y) ou None; None: sem posição
+        self.events = []            # [t, "key" | "wheel", código, valor, pos]
+        self.active = False
+        self.mice = None
+        self._t0 = 0.0
+        self._down_at = {}
+        self._asks = []
+        self._ask_cv = threading.Condition()
+        self._asker = None
+
+    def start(self):
+        self.events = []
+        self._down_at = {}
+        self._t0 = time.perf_counter()
+        self.active = True
+        self.mice = "all"
+        if self.cursor is not None:
+            self._asker = threading.Thread(target=self._ask_loop, daemon=True,
+                                           name="wayclick-recorder")
+            self._asker.start()
+        self.hub.add(self)
+
+    def stop(self):
+        """Para de anotar e espera as posições que faltam chegar."""
+        self.active = False
+        self.mice = None
+        self.hub.remove(self)
+        if self._asker is not None:
+            with self._ask_cv:
+                self._asks.append(None)
+                self._ask_cv.notify()
+            self._asker.join(timeout=5.0)
+            self._asker = None
+        return list(self.events)
+
+    def _ask_loop(self):
+        while True:
+            with self._ask_cv:
+                while not self._asks:
+                    self._ask_cv.wait()
+                ev = self._asks.pop(0)
+            if ev is None:
+                return
+            try:
+                ev[4] = self.cursor()
+            except Exception:                      # noqa: BLE001
+                ev[4] = None
+
+    def _ask(self, ev):
+        with self._ask_cv:
+            self._asks.append(ev)
+            self._ask_cv.notify()
+
+    # ---------------------------------------- inscrito do hub (thread dele)
+    def wants_grab(self, d):
+        return (self.active and bool(self.stop_code) and d.kbd
+                and d.has(self.stop_code))
+
+    def on_key(self, d, code, value):
+        if not self.active or CAPTURE.is_set():
+            return False
+        if code == self.stop_code:
+            if value == 1:
+                self.active = False
+                self.finished.emit()
+            return True
+        if value not in (0, 1):
+            return False                 # repetição automática do teclado
+        t = time.perf_counter() - self._t0
+        ev = [t, "key", code, value, None]
+        self.events.append(ev)
+        if is_button(code) and self.cursor is not None:
+            if value == 1:
+                self._down_at[code] = t
+                self._ask(ev)
+            elif t - self._down_at.pop(code, t) > DRAG_ASK_S:
+                self._ask(ev)            # segurou: pode ter arrastado
+        return False
+
+    def on_rel(self, d, code, value):
+        if self.active and not CAPTURE.is_set() and value:
+            self.events.append([time.perf_counter() - self._t0, "wheel", code,
+                                value, None])
+
+
+def recorded_steps(events, pauses=True):
+    """Eventos do gravador -> passos. Tecla que desce e sobe logo, sem nada
+    no meio, é um toque; botão com posição vira clique naquela posição (ou
+    arrasto, se soltou longe); giros seguidos da roda, um passo; e entre uma
+    ação e outra, a espera que houve, em passos de 10 ms."""
+    steps, last = [], [None]
+    n = len(events)
+    used = set()
+    pressed = {}                 # código -> posição onde apertou (ou None)
+
+    def gap(t):
+        if pauses and last[0] is not None:
+            ms = round((t - last[0]) * 100) * 10.0
+            if ms >= 10:
+                steps.append({"op": "wait", "ms": ms})
+        last[0] = t
+
+    for i, (t, kind, code, value, pos) in enumerate(events):
+        if i in used:
+            continue
+        if kind == "wheel":
+            times, tl, j = 1, t, i + 1
+            while (j < n and events[j][1] == "wheel" and events[j][2] == code
+                   and (events[j][3] > 0) == (value > 0)
+                   and events[j][0] - tl <= WHEEL_JOIN_S):
+                used.add(j)
+                times, tl, j = times + 1, events[j][0], j + 1
+            gap(t)
+            if code == REL_HWHEEL:
+                way = "right" if value > 0 else "left"
+            else:
+                way = "up" if value > 0 else "down"
+            steps.append({"op": "wheel", "dir": way, "times": min(100, times)})
+            continue
+        if value == 1:
+            nxt = events[i + 1] if i + 1 < n else None
+            quick = (nxt is not None and nxt[1] == "key" and nxt[2] == code
+                     and nxt[3] == 0 and nxt[0] - t <= TAP_HOLD_S)
+            gap(t)
+            if is_button(code) and pos is not None:
+                far = quick and nxt[4] is not None and math.hypot(
+                    nxt[4][0] - pos[0], nxt[4][1] - pos[1]) > CLICK_MOVE_PX
+                if quick and not far and code in POINT_OF:
+                    steps.append({"op": "point", "x": pos[0], "y": pos[1],
+                                  "click": POINT_OF[code]})
+                    used.add(i + 1)
+                    continue
+                steps.append({"op": "point", "x": pos[0], "y": pos[1],
+                              "click": "none"})
+                if quick and not far:
+                    steps.append({"op": "tap", "code": code})
+                    used.add(i + 1)
+                    continue
+                steps.append({"op": "down", "code": code})
+                pressed[code] = pos
+                continue
+            if quick:
+                steps.append({"op": "tap", "code": code})
+                used.add(i + 1)
+                continue
+            steps.append({"op": "down", "code": code})
+            pressed[code] = pos
+            continue
+        if code not in pressed:
+            continue                     # soltou o que já estava apertado
+        at = pressed.pop(code)
+        gap(t)
+        if pos is not None and at is not None and math.hypot(
+                pos[0] - at[0], pos[1] - at[1]) > CLICK_MOVE_PX:
+            steps.append({"op": "point", "x": pos[0], "y": pos[1],
+                          "click": "none"})
+        steps.append({"op": "up", "code": code})
+    for code in pressed:                 # ainda apertado quando parou
+        steps.append({"op": "up", "code": code})
+    return [x for x in (normalize_step(st) for st in steps) if x][:MAX_STEPS]
+
+
+# ------------------------------------------------------------- farm -----
+# O que um macro de farm de tower defense faz, com os passos comuns: focar o
+# jogo (e reabrir, se fechou), clicar os botões do lobby em ordem, jogar a
+# estratégia com vigias por baixo (pular onda, reconectar, fim da partida),
+# clicar o botão do fim, avisar, e de novo. O assistente só monta a lista;
+# depois é um macro como qualquer outro, que dá para editar.
+ROBLOX_GAME_RE = re.compile(
+    r"^https?://(?:www\.|web\.)?roblox\.com/games/(?:start\?(?:.*&)?"
+    r"placeId=)?(\d+)", re.I)
+
+
+def farm_link(text):
+    """O link que reabre o jogo. Página de jogo do Roblox
+    (roblox.com/games/ID/...) vira roblox://placeId=ID, o formato que a
+    página de deep links do Roblox documenta para abrir direto no app; o
+    resto fica como veio."""
+    text = (text or "").strip()
+    m = ROBLOX_GAME_RE.match(text)
+    return f"roblox://placeId={m.group(1)}" if m else text
+
+
+def farm_macro(spec):
+    """O macro que o assistente monta. spec: name, code, key, window, link,
+    lobby (imagens, em ordem), lobby_wait (s), strategy (passos), press_ms,
+    skip, reconnect, over (imagem do fim, obrigatória), over_wait (s), hook,
+    report, shot, limit. ValueError se não der um macro inteiro."""
+    win = spec.get("window") or "Sober"
+    link = farm_link(spec.get("link"))
+    if not spec.get("over"):
+        raise ValueError("the end of match image is required")
+    steps, at = [], {}
+
+    def mark(label):
+        at[label] = len(steps) + 1
+
+    def put(st):
+        steps.append(st)
+
+    if link:
+        put({"op": "window", "match": win, "wait": 0, "ok": "jump",
+             "ok_to": "@focus", "fail": "next"})
+        put({"op": "open", "url": link})
+        put({"op": "window", "match": win, "wait": 120000, "fail": "stop"})
+    mark("@focus")
+    put({"op": "window", "match": win, "act": "focus", "wait": 5000,
+         "fail": "restart" if link else "stop"})
+    if link:
+        put({"op": "watch", "kind": "window", "match": win, "want": "gone",
+             "every": 5000, "ok": "restart"})
+    if spec.get("reconnect"):
+        put({"op": "watch", "path": spec["reconnect"], "every": 2000,
+             "act": "left", "ok": "restart"})
+    wait = max(1, int(spec.get("lobby_wait") or 60)) * 1000.0
+    for k, path in enumerate(p for p in spec.get("lobby") or () if p):
+        # o primeiro botão do lobby que não aparece quer dizer que a partida
+        # já começou (Jogar de novo cai direto nela): pula para a estratégia
+        put({"op": "image", "path": path, "wait": wait, "act": "left",
+             "fail": "jump" if k == 0 else "restart", "fail_to": "@match"})
+    mark("@match")
+    if spec.get("skip"):
+        put({"op": "watch", "path": spec["skip"], "every": 2000,
+             "act": "left"})
+    over = spec.get("over") or ""
+    put({"op": "watch", "path": over, "every": 2000, "act": "none",
+         "ok": "jump", "ok_to": "@end"})
+    base = len(steps)
+    for st in spec.get("strategy") or ():
+        st = dict(st)
+        for key in ("ok", "fail"):
+            if st.get(key) == "jump":
+                st[key + "_to"] = st.get(key + "_to", 1) + base
+            elif st.get(key) == "restart":
+                # recomeçar a estratégia, não o farm inteiro
+                st[key], st[key + "_to"] = "jump", base + 1
+        put(st)
+    mark("@end")
+    put({"op": "image", "path": over,
+         "wait": max(1, int(spec.get("over_wait") or 30)) * 60000.0,
+         "act": "left", "fail": "restart"})
+    if spec.get("hook"):
+        put({"op": "notify", "url": spec["hook"],
+             "text": spec.get("report") or "{run}", "shot": spec.get("shot")})
+    for st in steps:
+        for key in ("ok_to", "fail_to"):
+            if isinstance(st.get(key), str):
+                st[key] = at[st[key]]
+    if len(steps) > MAX_STEPS:
+        raise ValueError("too many steps")
+    m = normalize_macro({
+        "name": spec.get("name") or "Farm", "enabled": True,
+        "code": spec.get("code") or KEYS["F6"],
+        "key": spec.get("key") or "F6", "mods": spec.get("mods") or [],
+        "mode": "toggle", "repeat": True, "period_ms": 0.0,
+        "press_ms": spec.get("press_ms", 0.0), "block": True,
+        "limit": spec.get("limit", 0), "steps": steps})
+    if len(m["steps"]) != len(steps):
+        # um passo incompleto sumiria e os saltos apontariam para o vizinho
+        raise ValueError("a step is not complete")
+    return m
+
+
+# ---------------------------------------------------- compartilhar --------
+# Um macro num arquivo, com as imagens dentro (base64): quem recebe abre e
+# usa, sem pasta de imagens para copiar junto. Webhook não vem junto: um
+# arquivo de outra pessoa mandaria prints da sua tela para o canal dela.
+MACRO_FILE_EXT = ".wayclick"
+MACRO_FILE_MAX = 64 << 20          # bytes; o arquivo é lido inteiro
+MAX_FILE_IMAGES = 200
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+SAFE_LINKS = ("https://", "http://", "roblox://", "roblox-player:",
+              "steam://")
+
+
+def _no_hook(st):
+    """Um passo Notificar sem o webhook: vira notificação da área de
+    trabalho. Texto vazio (só o print ia para o canal) ganha um, senão o
+    passo deixaria de existir e os saltos apontariam para o vizinho."""
+    st.pop("url", None)
+    st.pop("shot", None)
+    st["text"] = st.get("text") or "Run {run}"
+    return st
+
+
+def export_macros(macros):
+    """(dados para json.dump, caminhos de imagem que não deu para ler,
+    quantos webhooks ficaram de fora)."""
+    names, images, missing, out, hooks = {}, {}, [], [], 0
+    for m in macros:
+        m = normalize_macro(m)
+        for st in m["steps"]:
+            if st["op"] == "notify" and st.get("url"):
+                hooks += 1
+                _no_hook(st)
+            path = st.get("path")
+            if not path:
+                continue
+            if path not in names:
+                try:
+                    with open(path, "rb") as fh:
+                        data = base64.b64encode(fh.read()).decode()
+                except OSError:
+                    missing.append(path)
+                    names[path] = None
+                    continue
+                stem, ext = os.path.splitext(os.path.basename(path))
+                ext = ext.lower() if ext.lower() in IMAGE_EXTS else ".png"
+                name, n = stem + ext, 2
+                while name in images and images[name] != data:
+                    name, n = f"{stem}-{n}{ext}", n + 1
+                images[name] = data
+                names[path] = name
+            if names[path]:
+                st["path"] = names[path]
+        out.append(m)
+    return ({"wayclick": 1, "app": f"WayClick {VERSION}", "macros": out,
+             "images": images}, missing, hooks)
+
+
+def _safe_image_name(name):
+    stem, ext = os.path.splitext(os.path.basename(str(name)))
+    stem = re.sub(r"[^\w.-]+", "-", stem).strip(".-")[:80] or "image"
+    ext = ext.lower() if ext.lower() in IMAGE_EXTS else ".png"
+    return stem, ext
+
+
+def import_macros(data, folder=None, dry=False):
+    """Lê o que export_macros gravou. As imagens vão para a pasta de imagens
+    (a mesma imagem não é copiada duas vezes; outra com o mesmo nome ganha
+    um número), cada macro ganha id novo e chega desligado, webhooks saem,
+    e um passo que abriria algo que não é web, Roblox ou Steam vira uma
+    espera vazia (os saltos continuam apontando para o passo certo).
+    Devolve (macros, avisos); dry só confere, sem gravar nada. ValueError
+    se não for um arquivo de macros."""
+    if not isinstance(data, dict) or data.get("wayclick") != 1 \
+            or not isinstance(data.get("macros"), list):
+        raise ValueError("not a WayClick macro file")
+    folder = folder or images_dir()
+    saved, notes = {}, []
+    images = data.get("images") if isinstance(data.get("images"), dict) \
+        else {}
+    for name, b64 in list(images.items())[:MAX_FILE_IMAGES]:
+        if not isinstance(name, str) or not isinstance(b64, str):
+            continue
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (ValueError, binascii.Error):
+            continue
+        if QImage.fromData(raw).isNull():
+            continue                     # só imagem de verdade entra
+        if dry:
+            saved[name] = name
+            continue
+        stem, ext = _safe_image_name(name)
+        os.makedirs(folder, exist_ok=True)
+        path, n = os.path.join(folder, stem + ext), 2
+        while os.path.exists(path):
+            try:
+                with open(path, "rb") as fh:
+                    if fh.read() == raw:
+                        break
+            except OSError:
+                pass
+            path, n = os.path.join(folder, f"{stem}-{n}{ext}"), n + 1
+        else:
+            with open(path, "wb") as fh:
+                fh.write(raw)
+        saved[name] = path
+    macros, hooks, links, broken = [], 0, [], 0
+    for m in data["macros"][:MAX_MACROS]:
+        if not isinstance(m, dict):
+            continue
+        m = dict(m, id=new_macro_id(), enabled=False)
+        steps = []
+        raw_steps = m.get("steps") if isinstance(m.get("steps"), list) else []
+        for st in raw_steps[:MAX_STEPS]:
+            st = dict(st) if isinstance(st, dict) else {}
+            if isinstance(st.get("path"), str):
+                st["path"] = saved.get(st["path"], "")
+            if st.get("op") == "notify" and st.get("url"):
+                hooks += 1
+                _no_hook(st)
+            if st.get("op") == "open" and not str(
+                    st.get("url") or "").lower().startswith(SAFE_LINKS):
+                links.append(str(st.get("url"))[:80])
+                st = {"op": "wait", "ms": 0.0}
+            if normalize_step(st) is None:
+                broken += 1
+                st = {"op": "wait", "ms": 0.0}
+            steps.append(st)
+        m["steps"] = steps
+        nm = normalize_macro(m)
+        if nm["steps"]:
+            macros.append(nm)
+    if macros:
+        notes.append(_("The macros come turned off: tick one in the list "
+                       "to turn it on."))
+    if hooks:
+        notes.append(_("Webhooks are not imported ({n}): a file from someone "
+                       "else could send pictures of your screen to their "
+                       "channel. Add your own in the Notify steps.", n=hooks))
+    for url in links:
+        notes.append(_("A step that opens “{url}” became an empty wait: only "
+                       "web, roblox:// and steam:// links are imported.",
+                       url=url))
+    if broken:
+        notes.append(_("{n} steps could not be read (an image missing from "
+                       "the file, for instance) and became empty waits.",
+                       n=broken))
+    return macros, notes
+
+
+def read_macro_file(path):
+    """O JSON de um arquivo .wayclick. OSError, ou ValueError se não for."""
+    with open(path, "rb") as fh:
+        raw = fh.read(MACRO_FILE_MAX + 1)
+    if len(raw) > MACRO_FILE_MAX:
+        raise ValueError("file too big")
+    try:
+        return json.loads(raw)
+    except (UnicodeDecodeError, RecursionError) as e:
+        raise ValueError(str(e)) from None
 
 
 # ------------------------------------------------- importar AutoHotkey ----
@@ -4446,6 +5193,48 @@ for (var i = 0; i < ws.length; i++) {
 callDBus("%(svc)s", "%(path)s", "%(iface)s", "reply", prev);
 """
 
+# Passo Janela e vigia de janela: a melhor janela cujo nome do app (classe,
+# como org.vinegarhq.Sober) contém o texto, ou cujo título é o texto inteiro.
+# Título que só contém não vale: com o jogo fechado, um terminal que rodou
+# "flatpak run org.vinegarhq.Sober" ou uma aba do navegador sobre o Sober
+# passariam por ele, e o macro digitaria a estratégia lá.
+KWIN_FIND_JS = """
+var want = %(match)s;
+var ws = workspace.windowList ? workspace.windowList() : workspace.clientList();
+var best = null, score = 0;
+for (var i = 0; i < ws.length; i++) {
+  var w = ws[i];
+  if (!w.normalWindow) continue;
+  var cls = String(w.resourceClass).toLowerCase();
+  var nm = String(w.resourceName).toLowerCase();
+  var title = String(w.caption).toLowerCase().replace(/\\s+/g, " ").trim();
+  var s = (cls === want || nm === want) ? 3
+        : (cls.indexOf(want) >= 0 || nm.indexOf(want) >= 0) ? 2
+        : title === want ? 1 : 0;
+  if (s > score) { best = w; score = s; }
+}
+var out = {found: best !== null};
+if (best) {
+  out.title = String(best.caption);
+  out.cls = String(best.resourceClass);
+  out.minimized = best.minimized === true;
+  if (%(focus)s) {
+    if (best.minimized) best.minimized = false;
+    workspace.activeWindow = best;
+  }
+  out.active = best.active === true;
+}
+callDBus("%(svc)s", "%(path)s", "%(iface)s", "answer",
+         "%(token)s " + JSON.stringify(out));
+"""
+
+# Onde está o cursor: o gravador pergunta a cada clique.
+KWIN_CURSOR_JS = """
+var p = workspace.cursorPos;
+callDBus("%(svc)s", "%(path)s", "%(iface)s", "answer",
+         "%(token)s " + JSON.stringify({x: p.x, y: p.y}));
+"""
+
 
 class XInject:
     """Injeção de tecla numa janela X11 específica, via XSendEvent.
@@ -4842,6 +5631,8 @@ class KWinBridge(QObject):
         self.ok = False
         self.error = None
         self._reply = None
+        self._calls = {}                # token -> [Event, resposta]
+        self._calls_lock = threading.Lock()
         try:
             from PySide6.QtDBus import QDBusConnection
         except ImportError:
@@ -4863,6 +5654,100 @@ class KWinBridge(QObject):
     @Slot(str)
     def reply(self, payload):
         self._reply = payload
+
+    @Slot(str)
+    def answer(self, payload):
+        """Resposta de um script de call(), marcada com o token dele."""
+        token, _sep, data = payload.partition(" ")
+        with self._calls_lock:
+            box = self._calls.get(token)
+        if box is not None:
+            box[1] = data
+            box[0].set()
+
+    def call(self, js, timeout=2.0, **fields):
+        """Roda um script no KWin e devolve o texto que ele responde, ou
+        None. Serve a qualquer thread, ao contrário de _run: quem espera é um
+        Event, e a resposta chega pelo slot answer, na thread da UI. Cada
+        chamada tem nome e token próprios, então duas ao mesmo tempo (um
+        macro e a lista de janelas) não se confundem."""
+        if not self.ok:
+            return None
+        token = os.urandom(6).hex()
+        box = [threading.Event(), None]
+        with self._calls_lock:
+            self._calls[token] = box
+        name = f"wayclick-{token}"
+        path = f"{self.script[:-3]}-{token}.js"
+
+        def gdbus(*args):
+            try:
+                return subprocess.run(
+                    ("gdbus", "call", "--session", "-d", "org.kde.KWin")
+                    + args, capture_output=True, text=True, timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                return None
+        loaded = False
+        try:
+            with open(path, "w") as fh:
+                fh.write(js % dict(fields, svc=self.service, path=self.path,
+                                   iface=self.IFACE, token=token))
+            r = gdbus("-o", "/Scripting", "-m",
+                      "org.kde.kwin.Scripting.loadScript", path, name)
+            m = re.search(r"-?\d+", r.stdout) if r is not None else None
+            sid = int(m.group()) if m else -1
+            if sid < 0:
+                return None
+            loaded = True
+            gdbus("-o", f"/Scripting/Script{sid}", "-m",
+                  "org.kde.kwin.Script.run")
+            app = QApplication.instance()
+            if app is not None and \
+                    threading.current_thread() is threading.main_thread():
+                # na thread da UI a resposta só chega se os eventos andarem
+                end = time.perf_counter() + timeout
+                while not box[0].is_set() and time.perf_counter() < end:
+                    app.processEvents()
+                    box[0].wait(0.004)
+            else:
+                box[0].wait(timeout)
+            return box[1]
+        except OSError:
+            return None
+        finally:
+            if loaded:
+                gdbus("-o", "/Scripting", "-m",
+                      "org.kde.kwin.Scripting.unloadScript", name)
+            with self._calls_lock:
+                self._calls.pop(token, None)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def find(self, match, focus=False):
+        """A janela cujo nome do app contém o texto, ou cujo título é ele:
+        {"found", "title", "active"...}; com focus, ela vem para a frente.
+        None se o KWin não respondeu."""
+        want = " ".join(str(match).lower().split())
+        if not want:
+            return {"found": False}
+        raw = self.call(KWIN_FIND_JS, match=json.dumps(want),
+                        focus="true" if focus else "false")
+        try:
+            info = json.loads(raw) if raw else None
+        except ValueError:
+            return None
+        return info if isinstance(info, dict) else None
+
+    def cursor(self):
+        """Posição do cursor em coordenadas lógicas, ou None."""
+        raw = self.call(KWIN_CURSOR_JS)
+        try:
+            p = json.loads(raw)
+            return int(math.floor(p["x"])), int(math.floor(p["y"]))
+        except (TypeError, ValueError, KeyError):
+            return None
 
     def _run(self, js, timeout=2.0):
         if not self.ok:
@@ -4913,6 +5798,20 @@ class KWinBridge(QObject):
             os.remove(self.script)
         except (OSError, AttributeError):
             pass
+
+
+_KWIN = None
+
+
+def KWIN():
+    """A ponte do app com o KWin, uma só: o serviço D-Bus dela tem o pid no
+    nome, e uma segunda não conseguiria registrar o mesmo. Criada na thread
+    da UI, na primeira vez que alguém precisa (lista de janelas, passo
+    Janela, gravador)."""
+    global _KWIN
+    if _KWIN is None:
+        _KWIN = KWinBridge()
+    return _KWIN
 
 
 _ICON_CACHE = {}
@@ -5461,10 +6360,15 @@ TRANSLATIONS = {
         "Reads the color of one point, like PixelGetColor in AutoHotkey.":
             "Lê a cor de um ponto, como o PixelGetColor do AutoHotkey.",
         "Without a webhook it shows a desktop notification. With a Discord "
-        "webhook (channel settings, Integrations) it posts in that channel.":
+        "webhook (channel settings, Integrations) it posts in that channel. "
+        "{run} in the text becomes the number of the run, {time} how long "
+        "the macro has been running, and {matches} the value of a counter "
+        "named matches.":
             "Sem webhook, mostra uma notificação do sistema. Com um webhook "
             "do Discord (configurações do canal, Integrações), posta naquele "
-            "canal.",
+            "canal. No texto, {run} vira o número da rodada, {time} há "
+            "quanto tempo o macro está rodando, e {partidas} o valor de um "
+            "contador chamado partidas.",
         "Opens with the default program. Web pages, roblox:// and steam:// "
         "links, files.":
             "Abre com o programa padrão. Páginas da web, links roblox:// e "
@@ -5479,6 +6383,246 @@ TRANSLATIONS = {
         "key {name} is unknown": "tecla {name} desconhecida",
         "the script is nested too deeply, the rest was skipped":
             "o script tem aninhamento demais, o resto foi ignorado",
+        # vigiar, janela, contar, gravar, farm, compartilhar (1.8.0)
+        "Wait until the “{win}” window closes":
+            "Esperar a janela “{win}” fechar",
+        "Focus the “{win}” window": "Trazer a janela “{win}” para a frente",
+        "Check the “{win}” window is open":
+            "Conferir se a janela “{win}” está aberta",
+        "Watch for “{img}”": "Vigiar “{img}”",
+        "Watch for “{img}” to go away": "Vigiar “{img}” sumir",
+        "Watch pixel {at} for {color}": "Vigiar o pixel {at} ficar {color}",
+        "Watch pixel {at} losing {color}":
+            "Vigiar o pixel {at} perder {color}",
+        "Watch for the “{win}” window": "Vigiar a janela “{win}” abrir",
+        "Watch for the “{win}” window to close":
+            "Vigiar a janela “{win}” fechar",
+        "every {s} s": "a cada {s} s", "Count {name}": "Contar {name}",
+        "every {n} then {what}": "a cada {n} vezes, {what}",
+        "stop after {n} runs": "parar após {n} rodadas",
+        "stop after 1 run": "parar após 1 rodada",
+        "windows can only be checked on KDE Plasma, through KWin, so the "
+        "window step took its else path.":
+            "janelas só podem ser conferidas no KDE Plasma, pelo KWin, então "
+            "o passo de janela seguiu pelo senão.",
+        "The macros come turned off: tick one in the list to turn it on.":
+            "Os macros chegam desligados: marque um na lista para ligar.",
+        "Webhooks are not imported ({n}): a file from someone else could "
+        "send pictures of your screen to their channel. Add your own in the "
+        "Notify steps.":
+            "Webhooks não são importados ({n}): um arquivo de outra pessoa "
+            "poderia mandar prints da sua tela para o canal dela. Ponha o seu "
+            "nos passos de aviso.",
+        "A step that opens “{url}” became an empty wait: only web, roblox:// "
+        "and steam:// links are imported.":
+            "Um passo que abriria “{url}” virou uma espera vazia: só links da "
+            "web, roblox:// e steam:// são importados.",
+        "{n} steps could not be read (an image missing from the file, for "
+        "instance) and became empty waits.":
+            "{n} passos não puderam ser lidos (uma imagem que faltou no "
+            "arquivo, por exemplo) e viraram esperas vazias.",
+        "Watch the screen or a window": "Vigiar a tela ou uma janela",
+        "Check or focus a window": "Conferir ou focar uma janela",
+        "Count": "Contar", "is open": "abrir", "is closed": "fechar",
+        "An image": "Uma imagem", "A pixel color": "A cor de um pixel",
+        "A window": "Uma janela", "Only check": "Só conferir",
+        "Bring it to the front": "Trazer para a frente",
+        "How often it looks. Every look at the screen costs a little CPU; a "
+        "window is checked at most once a second.":
+            "De quanto em quanto tempo ele olha. Cada olhada na tela custa um "
+            "pouco de CPU; uma janela é conferida no máximo uma vez por "
+            "segundo.",
+        "matches": "partidas", "never, only count": "nunca, só contar",
+        "Open windows…": "Janelas abertas…",
+        "List the windows that are open now":
+            "Listar as janelas abertas agora",
+        "Watch for:": "Vigiar:", "When it is open:": "Se estiver aberta:",
+        "React when it:": "Reagir quando:", "Check every:": "Olhar a cada:",
+        "Counter:": "Contador:",
+        "{run} and {time} are already taken; pick another name.":
+            "{run} e {time} já estão em uso; escolha outro nome.",
+        "Keeps looking while the next steps run, like a SetTimer with "
+        "ImageSearch in AutoHotkey. It looks while the macro waits (Wait "
+        "steps, screen searches) and between steps, never in the middle of a "
+        "key press. Use it for what can show up at any time, like a skip "
+        "button, a reconnect button or the end of a match. When it takes the "
+        "macro to another step, every watch stops until the macro passes "
+        "over it again.":
+            "Continua olhando enquanto os próximos passos rodam, como um "
+            "SetTimer com ImageSearch no AutoHotkey. Ele olha enquanto o "
+            "macro espera (passos de espera, buscas na tela) e entre um passo "
+            "e outro, nunca no meio de uma tecla apertada. Use para o que "
+            "pode aparecer a qualquer hora, como um botão de pular, de "
+            "reconectar ou o fim da partida. Quando ele leva o macro para "
+            "outro passo, todos os vigias param até o macro passar por eles "
+            "de novo.",
+        "Finds a window by app name, like Sober, or by its whole title, and "
+        "can bring it to the front. Needs KDE Plasma. To reopen a game that "
+        "closed, send the else path to an Open a link step.":
+            "Acha uma janela pelo nome do app, como Sober, ou pelo título "
+            "inteiro, e pode trazê-la para a frente. Precisa do KDE Plasma. "
+            "Para reabrir um jogo que fechou, mande o senão para um passo "
+            "Abrir um link.",
+        "Adds 1 each time the macro passes here. Write the name in braces, "
+        "like {matches}, in a notification to show the number. Every N can "
+        "stop the macro or go to a step, like every 10 matches.":
+            "Soma 1 cada vez que o macro passa aqui. Escreva o nome entre "
+            "chaves, como {partidas}, num aviso para mostrar o número. A cada "
+            "N vezes, pode parar o macro ou ir a um passo, como a cada 10 "
+            "partidas.",
+        "runs": "rodadas",
+        "Stops the macro by itself after this many runs, like 20 matches of "
+        "a farm. A run that starts over does not count.":
+            "Para o macro sozinho depois de tantas rodadas, como 20 partidas "
+            "de um farm. Uma rodada que recomeça não conta.",
+        "Stop after:": "Parar após:", "● Record…": "● Gravar…",
+        "Play, and the keys, clicks and wheel become steps":
+            "Jogue, e as teclas, os cliques e a roda viram passos",
+        "No window list: this needs KDE Plasma.":
+            "Sem lista de janelas: isso precisa do KDE Plasma.",
+        "Record steps": "Gravar passos",
+        "Time to switch to the game window before recording starts.":
+            "Tempo para trocar para a janela do jogo antes de a gravação "
+            "começar.",
+        "Pressing it stops the recording. It is not recorded and the game "
+        "does not see it.":
+            "Ela encerra a gravação. Não é gravada, e o jogo não a vê.",
+        "Keep the pauses between actions": "Manter as pausas entre as ações",
+        "Off, the steps run one right after the other.":
+            "Desligado, os passos rodam um logo depois do outro.",
+        "Start recording": "Começar a gravar",
+        "Mouse movement without a click is not recorded. Clicks keep where "
+        "they happened.":
+            "Movimento do mouse sem clique não é gravado. Os cliques guardam "
+            "onde aconteceram.",
+        "Add these steps": "Adicionar estes passos",
+        "Start after:": "Começar após:", "Stop key:": "Tecla de parar:",
+        "The stop key must be a keyboard key.":
+            "A tecla de parar precisa ser do teclado.",
+        "Cancel": "Cancelar",
+        "Recording in {n} s, switch to the game window…":
+            "Gravando em {n} s, vá para a janela do jogo…",
+        "Recording, {n} actions so far. Press {key} to stop.":
+            "Gravando, {n} ações até agora. Aperte {key} para parar.",
+        "Positions are not available here (they come from KDE Plasma): "
+        "clicks are recorded where the pointer happens to be when the macro "
+        "runs.":
+            "As posições não estão disponíveis aqui (vêm do KDE Plasma): os "
+            "cliques vão acontecer onde o ponteiro estiver quando o macro "
+            "rodar.",
+        "Stop recording": "Parar de gravar", "Record again": "Gravar de novo",
+        "{n} steps.": "{n} passos.", "Nothing was recorded.": "Nada foi gravado.",
+        "Capture…": "Capturar…", "Open…": "Abrir…",
+        "Remove this button": "Tirar este botão",
+        "Remove the image": "Tirar a imagem",
+        "Farm assistant": "Assistente de farm",
+        "Builds an ordinary macro that farms matches by looking at the "
+        "screen, like a person: it brings the game to the front, clicks the "
+        "lobby buttons in order, plays your strategy, keeps watching for the "
+        "skip, reconnect and end of match buttons, and starts again. Capture "
+        "each button from the screen while the game shows it. The macro can "
+        "be edited later like any other.":
+            "Monta um macro comum que farma partidas olhando a tela, como uma "
+            "pessoa: traz o jogo para a frente, clica nos botões do lobby em "
+            "ordem, joga a sua estratégia, fica de olho nos botões de pular, "
+            "de reconectar e de fim da partida, e começa de novo. Capture "
+            "cada botão da tela enquanto o jogo mostra ele. Depois dá para "
+            "editar o macro como qualquer outro.",
+        "Farm": "Farm",
+        "Optional. When the game window closes, the macro opens this link "
+        "and waits for the game again. A Roblox game page becomes "
+        "roblox://placeId=…, the link Roblox documents for opening a game in "
+        "the app.":
+            "Opcional. Quando a janela do jogo fecha, o macro abre este link "
+            "e espera o jogo de novo. Uma página de jogo do Roblox vira "
+            "roblox://placeId=…, o link que o Roblox documenta para abrir um "
+            "jogo no app.",
+        "+ Add a lobby button": "+ Adicionar um botão do lobby",
+        "How long to wait for each lobby button. When the first one does not "
+        "show up, the macro takes it that a match already started and goes "
+        "on to the strategy.":
+            "Quanto esperar por cada botão do lobby. Quando o primeiro não "
+            "aparece, o macro entende que a partida já começou e vai para a "
+            "estratégia.",
+        "None, only farm": "Nenhuma, só farmar",
+        "A macro you made or recorded that places and upgrades the towers. "
+        "Its steps are copied into the farm, so later changes to it do not "
+        "change the farm.":
+            "Um macro que você montou ou gravou, que coloca e melhora as "
+            "torres. Os passos dele são copiados para o farm, então mudar ele "
+            "depois não muda o farm.",
+        "Optional. Clicked whenever it shows up, like a skip wave button.":
+            "Opcional. Clicado sempre que aparece, como um botão de pular "
+            "onda.",
+        "Optional. Clicked whenever it shows up, and the farm starts over "
+        "from the lobby.":
+            "Opcional. Clicado sempre que aparece, e o farm recomeça do "
+            "lobby.",
+        "A button that only shows when the match is over, like Play again or "
+        "Return to lobby. The macro clicks it and starts the next match.":
+            "Um botão que só aparece quando a partida acaba, como Jogar de "
+            "novo ou Voltar ao lobby. O macro clica nele e começa a próxima "
+            "partida.",
+        "If the end of the match takes longer than this, the farm starts "
+        "over.":
+            "Se o fim da partida demorar mais que isso, o farm recomeça.",
+        "Match {run} done, farming for {time}.":
+            "Partida {run} concluída, farmando há {time}.",
+        "{run} becomes the number of the match and {time} how long the farm "
+        "has been running.":
+            "{run} vira o número da partida e {time} há quanto tempo o farm "
+            "está rodando.",
+        "Game window:": "Janela do jogo:", "Reopen with:": "Reabrir com:",
+        "Lobby buttons:": "Botões do lobby:",
+        "Wait for each:": "Esperar cada um:", "Strategy:": "Estratégia:",
+        "Skip button:": "Botão de pular:",
+        "Reconnect button:": "Botão de reconectar:",
+        "End of the match:": "Fim da partida:",
+        "Longest match:": "Partida mais longa:", "Report:": "Relatório:",
+        "Create the macro": "Criar o macro",
+        "Type the name of the game window, like Sober.":
+            "Digite o nome da janela do jogo, como Sober.",
+        "Capture the button that shows at the end of a match: the farm needs "
+        "it to know when a match is over.":
+            "Capture o botão que aparece no fim da partida: o farm precisa "
+            "dele para saber quando a partida acabou.",
+        "The link must start with https://, roblox:// or steam://.":
+            "O link precisa começar com https://, roblox:// ou steam://.",
+        "The webhook must start with https://.":
+            "O webhook precisa começar com https://.",
+        "The strategy is too long to fit in a farm: a macro holds {n} steps.":
+            "A estratégia é longa demais para caber num farm: um macro tem no "
+            "máximo {n} passos.",
+        "Import macros": "Importar macros",
+        "Farm assistant…": "Assistente de farm…", "Export…": "Exportar…",
+        "Import…": "Importar…",
+        "Build a macro that farms matches of a tower defense game, step by "
+        "step":
+            "Montar, passo a passo, um macro que farma partidas de um jogo de "
+            "tower defense",
+        "Save the selected macro, with its images, in a file to share":
+            "Salvar o macro selecionado, com as imagens, num arquivo para "
+            "compartilhar",
+        "Add the macros of a {ext} file": "Adicionar os macros de um arquivo "
+                                          "{ext}",
+        "Export macro": "Exportar macro", "WayClick macros": "Macros do WayClick",
+        "Could not write {file}: {err}":
+            "Não foi possível gravar {file}: {err}",
+        "Saved {file}. Import… adds it on another computer.":
+            "Salvo em {file}. O botão Importar… adiciona ele em outro "
+            "computador.",
+        "The Discord webhook stayed out of the file: whoever has it could "
+        "post in your channel.":
+            "O webhook do Discord ficou fora do arquivo: quem tivesse ele "
+            "poderia postar no seu canal.",
+        "These images could not be read and were left out: {files}":
+            "Estas imagens não puderam ser lidas e ficaram de fora: {files}",
+        "{file} is not a WayClick macro file.":
+            "{file} não é um arquivo de macros do WayClick.",
+        "The app name, like Sober, or the whole title of the game window. "
+        "Open windows… lists both.":
+            "O nome do app, como Sober, ou o título inteiro da janela do "
+            "jogo. Janelas abertas… mostra os dois.",
     },
 }
 LANGS = {"English": "en_US", "Português (BR)": "pt_BR"}
@@ -5837,6 +6981,9 @@ STEP_KINDS = (("tap", "Tap a key or click"), ("down", "Hold down"),
               ("point", "Go to a screen position"),
               ("image", "Find an image on screen"),
               ("pixel", "Check a pixel color"),
+              ("watch", "Watch the screen or a window"),
+              ("window", "Check or focus a window"),
+              ("count", "Count"),
               ("notify", "Send a notification"),
               ("open", "Open a link or file"))
 POINT_CLICK_LABELS = (("none", "Only move"), ("left", "Left click"),
@@ -5850,7 +6997,12 @@ FLOW_LABELS = (("next", "Continue"), ("stop", "Stop the macro"),
                ("restart", "Start over from step 1"), ("jump", "Go to step"))
 WANT_LABELS = {"image": (("seen", "appears"), ("gone", "disappears")),
                "pixel": (("seen", "has the color"),
-                         ("gone", "loses the color"))}
+                         ("gone", "loses the color")),
+               "window": (("seen", "is open"), ("gone", "is closed"))}
+WATCH_KIND_LABELS = (("image", "An image"), ("pixel", "A pixel color"),
+                     ("window", "A window"))
+WINDOW_ACT_LABELS = (("check", "Only check"),
+                     ("focus", "Bring it to the front"))
 WHEEL_DIRS = (("up", "Up"), ("down", "Down"), ("left", "Left"),
               ("right", "Right"))
 
@@ -6100,6 +7252,79 @@ class ScreenPicker(QDialog):
         self.buttons.button(QDialogButtonBox.Ok).setEnabled(True)
 
 
+def _ui_wait(seconds, done=lambda: False):
+    """Espera sem travar a janela."""
+    app = QApplication.instance()
+    end = time.monotonic() + seconds
+    while time.monotonic() < end and not done():
+        app.processEvents()
+        time.sleep(0.02)
+
+
+def grab_frames(delay, note=None):
+    """Um quadro de cada tela depois de `delay` segundos, tempo de trocar
+    para a janela do jogo. Devolve (quadros, erro); note (um QLabel) mostra
+    a contagem."""
+    def say(text):
+        if note is not None:
+            note.setText(text)
+    cap = SCREEN()
+    frames = []
+    say(_("Waiting for screen sharing…"))
+    try:
+        cap.start()
+        _ui_wait(SCREEN_ASK_S, lambda: cap.state != "starting")
+        if cap.state != "on":
+            return [], cap.error or _("The screen is not available.")
+        cap.acquire()
+        try:
+            for left in range(int(delay), 0, -1):
+                say(_("Capturing in {n} s, switch to the game window…",
+                      n=left))
+                _ui_wait(1.0)
+            frames = cap.frames()
+        finally:
+            cap.release()
+    finally:
+        say("")
+    if not frames:
+        return [], cap.error or _("No picture came from the screen.")
+    return frames, ""
+
+
+def save_crop(rgb):
+    """Um recorte da tela vira PNG novo na pasta de imagens. O caminho, ou
+    None se não deu para gravar."""
+    folder = images_dir()
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        return None
+    base = time.strftime("image-%Y%m%d-%H%M%S")
+    path, n = os.path.join(folder, base + ".png"), 2
+    while os.path.exists(path):
+        path, n = os.path.join(folder, f"{base}-{n}.png"), n + 1
+    return path if rgb_qimage(rgb).save(path, "PNG") else None
+
+
+def image_thumb(label, path, box=(240, 120), empty=None):
+    """A miniatura de uma imagem de passo num QLabel."""
+    img = QImage(path) if path else QImage()
+    if img.isNull():
+        label.setPixmap(QPixmap())
+        label.setText(os.path.basename(path) if path
+                      else empty or _("No image yet"))
+        label.setToolTip(path or "")
+        return
+    k = min(box[0] / img.width(), box[1] / img.height())
+    mode = Qt.FastTransformation if k >= 1 else Qt.SmoothTransformation
+    k = min(k, 4.0)
+    label.setPixmap(QPixmap.fromImage(img.scaled(
+        max(1, round(img.width() * k)), max(1, round(img.height() * k)),
+        Qt.KeepAspectRatio, mode)))
+    label.setToolTip(path)
+
+
 class StepDialog(QDialog):
     """Um passo do macro: apertar, segurar, soltar, esperar, digitar..."""
 
@@ -6140,6 +7365,7 @@ class StepDialog(QDialog):
             box.setRange(-5000, 5000)
             box.setValue(step.get(key, 0))
         self._screen_widgets(step)
+        self._farm_widgets(step)
         form = QFormLayout()
         self.rows = _Rows(form)
         form.addRow(QLabel(_("Action:")), self.op)
@@ -6151,7 +7377,8 @@ class StepDialog(QDialog):
         self.rows.add("dir", "Direction:", self.wheel)
         self.rows.add("dx", "Right (px):", self.dx)
         self.rows.add("dy", "Down (px):", self.dy)
-        for key, text, widget in self.screen_rows:
+        for key, text, widget in self.farm_rows[:1] + self.screen_rows \
+                + self.farm_rows[1:]:
             self.rows.add(key, text, widget)
         self.note = QLabel("")
         self.note.setWordWrap(True)
@@ -6171,7 +7398,86 @@ class StepDialog(QDialog):
         col.addWidget(buttons)
         self.op.currentIndexChanged.connect(self._sync)
         self.want.currentIndexChanged.connect(self._sync_want)
+        self.wwant.currentIndexChanged.connect(self._sync_want)
+        self.wkind.currentIndexChanged.connect(self._sync)
+        self.cevery.valueChanged.connect(self._sync_count)
         self._sync()
+
+    # ------------------------------------------ vigiar, contar, janela --
+    def _farm_widgets(self, step):
+        op = step["op"]
+        self.wkind = _combo(WATCH_KIND_LABELS, step.get("kind", "image"))
+        self.wwant = QComboBox()
+        self._wwant = step.get("want", "seen")
+        self.every = QDoubleSpinBox()
+        self.every.setRange(0.1, 3600.0)
+        self.every.setDecimals(1)
+        self.every.setSuffix(" s")
+        self.every.setValue((step.get("every", 2000.0) if op == "watch"
+                             else 2000.0) / 1000.0)
+        self.every.setToolTip(_("How often it looks. Every look at the "
+                                "screen costs a little CPU; a window is "
+                                "checked at most once a second."))
+        self.wok = FlowEdit(step.get("ok", "next") if op == "watch"
+                            else "next", step.get("ok_to", 1))
+        self.counter = QLineEdit(step.get("name", "") if op == "count"
+                                 else "")
+        self.counter.setMaxLength(24)
+        self.counter.setPlaceholderText(_("matches"))
+        self.cevery = QSpinBox()
+        self.cevery.setRange(0, MAX_RUNS)
+        self.cevery.setSpecialValueText(_("never, only count"))
+        self.cevery.setValue(step.get("every", 0) if op == "count" else 0)
+        self.cok = FlowEdit(step.get("ok", "stop") if op == "count"
+                            else "stop", step.get("ok_to", 1))
+        self.match = QComboBox()
+        self.match.setEditable(True)
+        self.match.setInsertPolicy(QComboBox.NoInsert)
+        self.match.setMinimumContentsLength(18)
+        self.match.setEditText(step.get("match", "Sober"))
+        self.match.lineEdit().setMaxLength(100)
+        self.b_wins = QPushButton(_("Open windows…"))
+        self.b_wins.setToolTip(_("List the windows that are open now"))
+        self.b_wins.clicked.connect(self._list_windows)
+        self.winact = _combo(WINDOW_ACT_LABELS, step.get("act", "check")
+                             if op == "window" else "check")
+        self.farm_rows = (
+            ("wkind", "Watch for:", self.wkind),
+            ("match", "Window:", _hrow(self.match, self.b_wins)),
+            ("winact", "When it is open:", self.winact),
+            ("wwant", "React when it:", self.wwant),
+            ("every", "Check every:", self.every),
+            ("wok", "Then:", self.wok),
+            ("counter", "Counter:", self.counter),
+            ("cevery", "Every:", self.cevery),
+            ("cok", "Then:", self.cok))
+
+    def _kind(self):
+        """O que o passo olha: o próprio tipo, ou o do vigia."""
+        op = self.op.currentData()
+        return self.wkind.currentData() if op == "watch" else op
+
+    def _sync_count(self, _v=0):
+        self.cok.setEnabled(self.cevery.value() > 0)
+
+    def _list_windows(self):
+        kw = KWIN()
+        wins = kw.windows() if kw.ok else []
+        if not wins:
+            self.error.setText(kw.error or _("No window list: this needs KDE "
+                                             "Plasma."))
+            return
+        self.error.setText("")
+        keep = self.match.currentText()
+        self.match.clear()
+        names = []
+        for w in wins:
+            for name in (w.get("cls"), w.get("title")):
+                if name and name not in names:
+                    names.append(name)
+        self.match.addItems(names)
+        self.match.setEditText(keep)
+        self.match.showPopup()
 
     # ------------------------------------------- passos que olham a tela --
     def _screen_widgets(self, step):
@@ -6304,28 +7610,16 @@ class StepDialog(QDialog):
         self.shot.setEnabled(bool(self.hook.text().strip()))
 
     def _sync_want(self, _i=0):
-        seen = self.want.currentData() != "gone"
         op = self.op.currentData()
+        want = self.wwant if op == "watch" else self.want
+        seen = want.currentData() != "gone"
         self.act.setEnabled(seen)
         moves = op == "point" or (seen and self.act.currentData() != "none")
         self.human.setEnabled(moves)
         self.human_ms.setEnabled(moves and self.human.isChecked())
 
     def _show_image(self):
-        img = QImage(self.img_path) if self.img_path else QImage()
-        if img.isNull():
-            self.img_view.setPixmap(QPixmap())
-            self.img_view.setText(_("No image yet") if not self.img_path
-                                  else os.path.basename(self.img_path))
-            return
-        box = (240, 120)
-        k = min(box[0] / img.width(), box[1] / img.height())
-        mode = Qt.FastTransformation if k >= 1 else Qt.SmoothTransformation
-        k = min(k, 4.0)
-        self.img_view.setPixmap(QPixmap.fromImage(img.scaled(
-            max(1, round(img.width() * k)), max(1, round(img.height() * k)),
-            Qt.KeepAspectRatio, mode)))
-        self.img_view.setToolTip(self.img_path)
+        image_thumb(self.img_view, self.img_path)
 
     def _set_region(self, rect):
         self.region = rect
@@ -6350,49 +7644,21 @@ class StepDialog(QDialog):
 
     def _busy(self, on):
         for w in (self.b_pick, self.b_shot, self.b_region, self.b_file,
-                  self.op):
+                  self.op, self.wkind):
             w.setEnabled(not on)
-
-    def _wait(self, seconds, done=lambda: False):
-        app = QApplication.instance()
-        end = time.monotonic() + seconds
-        while time.monotonic() < end and not done():
-            app.processEvents()
-            time.sleep(0.02)
 
     def _capture(self, mode):
         """Um quadro de cada tela, depois da contagem (dá tempo de trocar
         para a janela do jogo), e o seletor. mode: point, image, region."""
-        cap = SCREEN()
         self.error.setText("")
         self._busy(True)
-        frames = []
         try:
-            self.cap_note.setText(_("Waiting for screen sharing…"))
-            cap.start()
-            self._wait(SCREEN_ASK_S, lambda: cap.state != "starting")
-            if cap.state != "on":
-                self.cap_note.setText("")
-                self.error.setText(cap.error
-                                   or _("The screen is not available."))
-                return
-            cap.acquire()
-            try:
-                for left in range(self.delay.value(), 0, -1):
-                    self.cap_note.setText(_(
-                        "Capturing in {n} s, switch to the game window…",
-                        n=left))
-                    self._wait(1.0)
-                frames = cap.frames()
-            finally:
-                cap.release()
+            frames, err = grab_frames(self.delay.value(), self.cap_note)
         finally:
             self._busy(False)
             self._sync()
-        self.cap_note.setText("")
         if not frames:
-            self.error.setText(cap.error or _("No picture came from the "
-                                              "screen."))
+            self.error.setText(err)
             return
         dlg = ScreenPicker(self, frames, "point" if mode == "point"
                            else "area")
@@ -6404,35 +7670,39 @@ class StepDialog(QDialog):
         if mode == "point" and dlg.point:
             self.px.setValue(dlg.point[0])
             self.py.setValue(dlg.point[1])
-            if self.op.currentData() == "pixel" and dlg.color:
+            if self._kind() == "pixel" and dlg.color:
                 self.color.setText(color_hex(dlg.color))
         elif mode == "region" and dlg.rect:
             self._set_region(dlg.rect)
         elif mode == "image" and dlg.crop is not None:
-            folder = images_dir()
-            os.makedirs(folder, exist_ok=True)
-            base = time.strftime("image-%Y%m%d-%H%M%S")
-            path, n = os.path.join(folder, base + ".png"), 2
-            while os.path.exists(path):
-                path, n = os.path.join(folder, f"{base}-{n}.png"), n + 1
-            if not rgb_qimage(dlg.crop).save(path, "PNG"):
-                self.error.setText(_("Could not save {path}.", path=path))
+            path = save_crop(dlg.crop)
+            if path is None:
+                self.error.setText(_("Could not save {path}.",
+                                     path=images_dir()))
                 return
             self.img_path = path
             self._show_image()
 
     def _ok(self):
         op = self.op.currentData()
+        if op == "count" and counter_name(self.counter.text()) \
+                in TEXT_FIELDS:
+            self.error.setText(_("{run} and {time} are already taken; pick "
+                                 "another name."))
+            return
         if self.step() is None:
             self.error.setText(_({
                 "image": "Pick an image first.",
                 "pixel": "The color must look like #ff8800.",
+                "window": "Type the name of the window, like Sober.",
+                "count": "Name the counter with letters, digits or _, like "
+                         "matches.",
                 "notify": "Type a message, or attach a screenshot to a "
                           "webhook.",
                 "open": "Type a link or a file.",
                 "text": "Type the text.",
                 "move": "Right or down must not be zero.",
-            }.get(op, "This step is not complete.")))
+            }.get(self._kind(), "This step is not complete.")))
             return
         self.accept()
 
@@ -6450,7 +7720,27 @@ class StepDialog(QDialog):
                       "AutoHotkey.",
              "notify": "Without a webhook it shows a desktop notification. "
                        "With a Discord webhook (channel settings, "
-                       "Integrations) it posts in that channel.",
+                       "Integrations) it posts in that channel. {run} in "
+                       "the text becomes the number of the run, {time} how "
+                       "long the macro has been running, and {matches} the "
+                       "value of a counter named matches.",
+             "watch": "Keeps looking while the next steps run, like a "
+                      "SetTimer with ImageSearch in AutoHotkey. It looks "
+                      "while the macro waits (Wait steps, screen searches) "
+                      "and between steps, never in the middle of a key "
+                      "press. Use it for what can show up at any time, like "
+                      "a skip button, a reconnect button or the end of a "
+                      "match. When it takes the macro to another step, "
+                      "every watch stops until the macro passes over it "
+                      "again.",
+             "window": "Finds a window by app name, like Sober, or by its "
+                       "whole title, and can bring it to the front. Needs "
+                       "KDE Plasma. To reopen a game that closed, send the "
+                       "else path to an Open a link step.",
+             "count": "Adds 1 each time the macro passes here. Write the "
+                      "name in braces, like {matches}, in a notification to "
+                      "show the number. Every N can stop the macro or go to "
+                      "a step, like every 10 matches.",
              "open": "Opens with the default program. Web pages, roblox:// "
                      "and steam:// links, files.",
              "wait": "Random, up to: each run waits a different time between "
@@ -6466,19 +7756,36 @@ class StepDialog(QDialog):
                        "human", "ok", "fail", "delay"),
              "pixel": ("pos", "color", "tol", "want", "wait", "act", "human",
                        "ok", "fail", "delay"),
+             "window": ("match", "want", "wait", "winact", "ok", "fail"),
+             "count": ("counter", "cevery", "cok"),
              "notify": ("msg", "hook", "shot"), "open": ("link",)}
+    WATCH_SHOWN = {"image": ("wkind", "image", "conf", "region", "wwant",
+                             "every", "act", "human", "wok", "delay"),
+                   "pixel": ("wkind", "pos", "color", "tol", "wwant",
+                             "every", "act", "human", "wok", "delay"),
+                   "window": ("wkind", "match", "wwant", "every", "wok")}
+
+    @staticmethod
+    def _want_items(box, items, keep):
+        box.blockSignals(True)
+        box.clear()
+        for key, label in items:
+            box.addItem(_(label), key)
+        box.setCurrentIndex(max(0, box.findData(keep)))
+        box.blockSignals(False)
 
     def _sync(self, _i=0):
         op = self.op.currentData()
-        self.rows.show_only(self.SHOWN[op])
+        kind = self._kind()
+        self.rows.show_only(self.WATCH_SHOWN[kind] if op == "watch"
+                            else self.SHOWN[op])
         if op in WANT_LABELS:
-            keep = self.want.currentData() or self._want
-            self.want.blockSignals(True)
-            self.want.clear()
-            for key, label in WANT_LABELS[op]:
-                self.want.addItem(_(label), key)
-            self.want.setCurrentIndex(max(0, self.want.findData(keep)))
-            self.want.blockSignals(False)
+            self._want_items(self.want, WANT_LABELS[op],
+                             self.want.currentData() or self._want)
+        if op == "watch":
+            self._want_items(self.wwant, WANT_LABELS[kind],
+                             self.wwant.currentData() or self._wwant)
+        self._sync_count()
         self._sync_want()
         self.note.setText(_(self.NOTES[op]) if op in self.NOTES else "")
         self.note.setVisible(op in self.NOTES)
@@ -6505,6 +7812,29 @@ class StepDialog(QDialog):
                      wait=self.wait_s.value() * 1000.0,
                      act=self.act.currentData(), ok=ok[0], ok_to=ok[1],
                      fail=fail[0], fail_to=fail[1])
+        elif op == "watch":
+            ok = self.wok.value()
+            s.update(kind=self.wkind.currentData(), x=self.px.value(),
+                     y=self.py.value(), path=self.img_path,
+                     conf=self.conf.value() / 100.0, region=self.region,
+                     color=self.color.text(), tol=self.tol.value(),
+                     match=self.match.currentText(),
+                     want=self.wwant.currentData(),
+                     every=self.every.value() * 1000.0,
+                     act=self.act.currentData(),
+                     human=self.human.isChecked() and self.human.isEnabled(),
+                     ms=self.human_ms.value(), ok=ok[0], ok_to=ok[1])
+        elif op == "window":
+            ok, fail = self.ok_flow.value(), self.fail_flow.value()
+            s.update(match=self.match.currentText(),
+                     want=self.want.currentData(),
+                     wait=self.wait_s.value() * 1000.0,
+                     act=self.winact.currentData(), ok=ok[0], ok_to=ok[1],
+                     fail=fail[0], fail_to=fail[1])
+        elif op == "count":
+            ok = self.cok.value()
+            s.update(name=self.counter.text(), every=self.cevery.value(),
+                     ok=ok[0], ok_to=ok[1])
         elif op == "notify":
             s.update(text=self.msg.text(), url=self.hook.text(),
                      shot=self.shot.isChecked() and self.shot.isEnabled())
@@ -6574,6 +7904,14 @@ class MacroDialog(QDialog):
             "How long each tap stays down. Auto is 40 ms, or half the repeat "
             "time when that is shorter: games read keys once per frame and "
             "miss a tap that is too short."))
+        self.limit = QSpinBox()
+        self.limit.setRange(0, MAX_RUNS)
+        self.limit.setSpecialValueText(_("never"))
+        self.limit.setSuffix(" " + _("runs"))
+        self.limit.setValue(m["limit"])
+        self.limit.setToolTip(_("Stops the macro by itself after this many "
+                                "runs, like 20 matches of a farm. A run that "
+                                "starts over does not count."))
 
         form = QFormLayout()
         form.addRow(QLabel(_("Name:")), self.name)
@@ -6595,6 +7933,8 @@ class MacroDialog(QDialog):
         self.rep_lbl = QLabel(_("Repeat:"))
         form.addRow(self.rep_lbl, rep_w)
         self.rep_w = rep_w
+        self.limit_lbl = QLabel(_("Stop after:"))
+        form.addRow(self.limit_lbl, self.limit)
         form.addRow(QLabel(_("Key press time:")), self.press)
 
         self.steps = list(m["steps"])
@@ -6604,6 +7944,10 @@ class MacroDialog(QDialog):
         self.step_list.currentRowChanged.connect(self._sync_buttons)
         btns = QHBoxLayout()
         self.b_add = QPushButton(_("+ Add"))
+        self.b_rec = QPushButton(_("● Record…"))
+        self.b_rec.setToolTip(_("Play, and the keys, clicks and wheel become "
+                                "steps"))
+        self.b_rec.clicked.connect(self._record)
         self.b_edit = QPushButton(_("Edit"))
         self.b_del = QPushButton(_("Remove"))
         self.b_up = QPushButton("↑")
@@ -6617,7 +7961,7 @@ class MacroDialog(QDialog):
         self.b_del.clicked.connect(self._del_step)
         self.b_up.clicked.connect(lambda: self._move_step(-1))
         self.b_down.clicked.connect(lambda: self._move_step(1))
-        for b in (self.b_add, self.b_edit, self.b_del):
+        for b in (self.b_add, self.b_rec, self.b_edit, self.b_del):
             btns.addWidget(b)
         btns.addStretch()
         btns.addWidget(self.b_up)
@@ -6666,6 +8010,25 @@ class MacroDialog(QDialog):
         self.b_up.setEnabled(has and row > 0)
         self.b_down.setEnabled(has and row < len(self.steps) - 1)
         self.b_add.setEnabled(len(self.steps) < MAX_STEPS)
+        self.b_rec.setEnabled(len(self.steps) < MAX_STEPS)
+
+    def insert_steps(self, new):
+        """Passos novos depois do selecionado (ou no fim), com os saltos
+        acompanhando."""
+        new = list(new)[:MAX_STEPS - len(self.steps)]
+        if not new:
+            return
+        row = self.step_list.currentRow()
+        at = row + 1 if 0 <= row < len(self.steps) else len(self.steps)
+        n = len(new)
+        self._retarget(lambda k: k + n if k - 1 >= at else k)
+        self.steps[at:at] = new
+        self._fill_steps(at)
+
+    def _record(self):
+        dlg = RecordDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            self.insert_steps(dlg.steps)
 
     def _add_step(self):
         row = self.step_list.currentRow()
@@ -6732,6 +8095,8 @@ class MacroDialog(QDialog):
         self.rep_w.setEnabled(looping)
         self.every.setEnabled(looping and self.repeat.isChecked())
         self.period.setEnabled(looping and self.repeat.isChecked())
+        self.limit_lbl.setEnabled(looping and self.repeat.isChecked())
+        self.limit.setEnabled(looping and self.repeat.isChecked())
         self.hint.setText(_(self.HINTS[mode]))
 
     def _ok(self):
@@ -6758,6 +8123,7 @@ class MacroDialog(QDialog):
             "mode": mode, "repeat": self.repeat.isChecked(),
             "period_ms": self.period.value(),
             "press_ms": self.press.value(),
+            "limit": self.limit.value() if self.limit.isEnabled() else 0,
             "block": self.block.isChecked(), "steps": self.steps})
 
 
@@ -6816,6 +8182,560 @@ class ImportDialog(QDialog):
                                      QDialogButtonBox.AcceptRole)
         buttons.addButton(QDialogButtonBox.Cancel)
         self.add.setEnabled(bool(imp.macros) and room > 0)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        col.addWidget(buttons)
+
+
+def window_names(combo, error):
+    """Põe na lista do combo as janelas abertas agora (app e título), sem
+    perder o que já estava escrito. error: QLabel para quando não dá."""
+    kw = KWIN()
+    wins = kw.windows() if kw.ok else []
+    if not wins:
+        error.setText(kw.error or _("No window list: this needs KDE Plasma."))
+        return False
+    error.setText("")
+    keep = combo.currentText()
+    combo.clear()
+    names = []
+    for w in wins:
+        for name in (w.get("cls"), w.get("title")):
+            if name and name not in names:
+                names.append(name)
+    combo.addItems(names)
+    combo.setEditText(keep)
+    combo.showPopup()
+    return True
+
+
+class RecordDialog(QDialog):
+    """Gravar passos: conta até começar (tempo de ir para o jogo), anota
+    teclas, cliques e a roda até a tecla de parar, e mostra no que virou
+    antes de acrescentar."""
+    TICK_MS = 250
+
+    def __init__(self, parent=None, hub=None, cursor=None):
+        super().__init__(parent)
+        self.setWindowTitle(_("Record steps"))
+        self.resize(460, 480)
+        self.hub = hub
+        self.cursor = cursor            # None: pergunta ao KWin na hora
+        self.events, self.steps = [], []
+        self.rec = None
+        self._left = 0
+        self.delay = QSpinBox()
+        self.delay.setRange(0, 10)
+        self.delay.setSuffix(" s")
+        self.delay.setValue(3)
+        self.delay.setToolTip(_("Time to switch to the game window before "
+                                "recording starts."))
+        self.stop_key = KeyCatcher(KEYS["F10"], "F10")
+        self.stop_key.setToolTip(_("Pressing it stops the recording. It is "
+                                   "not recorded and the game does not see "
+                                   "it."))
+        self.pauses = QCheckBox(_("Keep the pauses between actions"))
+        self.pauses.setChecked(True)
+        self.pauses.setToolTip(_("Off, the steps run one right after the "
+                                 "other."))
+        self.pauses.toggled.connect(self._show)
+        self.b_go = QPushButton(_("Start recording"))
+        self.b_go.clicked.connect(self._go)
+        self.state = QLabel(_("Mouse movement without a click is not "
+                              "recorded. Clicks keep where they happened."))
+        self.state.setWordWrap(True)
+        self.preview = QListWidget()
+        self.error = QLabel("")
+        self.error.setStyleSheet("color:#d04030;")
+        self.error.setWordWrap(True)
+        buttons = QDialogButtonBox()
+        self.add = buttons.addButton(_("Add these steps"),
+                                     QDialogButtonBox.AcceptRole)
+        buttons.addButton(QDialogButtonBox.Cancel)
+        self.add.setEnabled(False)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form = QFormLayout()
+        form.addRow(QLabel(_("Start after:")), self.delay)
+        form.addRow(QLabel(_("Stop key:")), self.stop_key)
+        form.addRow("", self.pauses)
+        col = QVBoxLayout(self)
+        col.addLayout(form)
+        col.addWidget(self.b_go)
+        col.addWidget(self.state)
+        col.addWidget(self.preview, 1)
+        col.addWidget(self.error)
+        col.addWidget(buttons)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+
+    def _busy(self, on):
+        for w in (self.delay, self.stop_key, self.add):
+            w.setEnabled(not on)
+
+    def _go(self):
+        if self.rec is not None:
+            self._finish(by_button=True)
+            return
+        if self._left:
+            self._left = 0                       # desistiu na contagem
+            self.timer.stop()
+            self._busy(False)
+            self.add.setEnabled(bool(self.steps))
+            self.b_go.setText(_("Start recording"))
+            self.state.setText("")
+            return
+        code = self.stop_key.code
+        if not code or is_button(code):
+            self.error.setText(_("The stop key must be a keyboard key."))
+            return
+        self.error.setText("")
+        self._busy(True)
+        self.b_go.setText(_("Cancel"))
+        self._left = self.delay.value()
+        if self._left:
+            self._say_left()
+            self.timer.start(1000)
+        else:
+            self._begin()
+
+    def _say_left(self):
+        self.state.setText(_("Recording in {n} s, switch to the game "
+                             "window…", n=self._left))
+
+    def _tick(self):
+        if self.rec is not None:
+            self.state.setText(_("Recording, {n} actions so far. Press {key} "
+                                 "to stop.", n=len(self.rec.events),
+                                 key=self.stop_key.name))
+            return
+        self._left -= 1
+        if self._left > 0:
+            self._say_left()
+            return
+        self.timer.stop()
+        self._begin()
+
+    def _where(self):
+        """Quem diz onde o cursor está: o KWin, se ele responder."""
+        if self.cursor is not None:
+            return self.cursor, ""
+        kw = KWIN()
+        if kw.ok and kw.cursor() is not None:
+            return kw.cursor, ""
+        return None, _("Positions are not available here (they come from "
+                       "KDE Plasma): clicks are recorded where the pointer "
+                       "happens to be when the macro runs.")
+
+    def _begin(self):
+        self._left = 0
+        cursor, note = self._where()
+        self.rec = MacroRecorder(self.hub, self.stop_key.code, cursor)
+        self.rec.finished.connect(self._finish)
+        self.rec.start()
+        self.b_go.setText(_("Stop recording"))
+        self.error.setText(note)
+        self._tick()
+        self.timer.start(self.TICK_MS)
+
+    def _finish(self, by_button=False):
+        if self.rec is None:
+            return
+        self.timer.stop()
+        events = self.rec.stop()
+        self.rec = None
+        if by_button:
+            # o clique no botão Parar foi anotado também: sai, com o que veio
+            # depois dele
+            cut = next((i for i in range(len(events) - 1, -1, -1)
+                        if events[i][1] == "key" and events[i][2]
+                        == BTN["Left"] and events[i][3] == 1), None)
+            if cut is not None:
+                events = events[:cut]
+        self.events = events
+        self._busy(False)
+        self.b_go.setText(_("Record again"))
+        self._show()
+        self.raise_()
+        self.activateWindow()
+
+    def _show(self, _on=False):
+        self.steps = recorded_steps(self.events, self.pauses.isChecked())
+        self.preview.clear()
+        for i, st in enumerate(self.steps, 1):
+            self.preview.addItem(f"{i}. {step_label(st)}")
+        if self.rec is None and not self._left:
+            self.state.setText(_("{n} steps.", n=len(self.steps))
+                               if self.events else _("Nothing was recorded."))
+            self.add.setEnabled(bool(self.steps))
+
+    def done(self, r):
+        self.timer.stop()
+        if self.rec is not None:                 # fechou gravando
+            self.rec.stop()
+            self.rec = None
+        super().done(r)
+
+
+class ImageField(QWidget):
+    """Uma imagem de botão do jogo: miniatura, capturar da tela, abrir
+    arquivo e tirar."""
+    changed = Signal()
+
+    def __init__(self, path="", grab=None, error=None, optional=True,
+                 remove=None):
+        super().__init__()
+        self.path = path or ""
+        self._grab = grab               # () -> quadros (ou [] com o erro dito)
+        self._error = error
+        self._remove = remove           # ✕ tira a linha inteira, não a imagem
+        self.view = QLabel()
+        self.view.setAlignment(Qt.AlignCenter)
+        self.view.setMinimumSize(120, 40)
+        self.view.setFrameShape(QFrame.StyledPanel)
+        self.b_cap = QPushButton(_("Capture…"))
+        self.b_cap.setToolTip(_("Capture from screen…"))
+        self.b_cap.clicked.connect(self._capture)
+        self.b_open = QPushButton(_("Open…"))
+        self.b_open.setToolTip(_("Open file…"))
+        self.b_open.clicked.connect(self._open)
+        self.b_clear = QPushButton("✕")
+        self.b_clear.setFixedWidth(30)
+        self.b_clear.setToolTip(_("Remove this button") if remove else
+                                _("Remove the image"))
+        self.b_clear.clicked.connect(remove or (lambda: self.set_path("")))
+        self.b_clear.setVisible(optional or remove is not None)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.view, 1)
+        for b in (self.b_cap, self.b_open, self.b_clear):
+            row.addWidget(b)
+        self._show()
+
+    def set_path(self, path):
+        self.path = path or ""
+        self._show()
+        self.changed.emit()
+
+    def _show(self):
+        image_thumb(self.view, self.path, box=(160, 48), empty=_("none"))
+        self.b_clear.setEnabled(bool(self.path) or self._remove is not None)
+
+    def _say(self, text):
+        if self._error is not None:
+            self._error.setText(text)
+
+    def _open(self):
+        path, _f = QFileDialog.getOpenFileName(
+            self, _("Image"), images_dir() if os.path.isdir(images_dir())
+            else os.path.expanduser("~"),
+            _("Images") + " (*.png *.jpg *.jpeg *.bmp *.webp)")
+        if not path:
+            return
+        if QImage(path).isNull():
+            self._say(_("That file is not an image."))
+            return
+        self._say("")
+        self.set_path(path)
+
+    def _capture(self):
+        self._say("")
+        frames = self._grab() if self._grab else []
+        if not frames:
+            return
+        dlg = ScreenPicker(self.window(), frames, "area")
+        if dlg.exec() != QDialog.Accepted or dlg.crop is None:
+            return
+        path = save_crop(dlg.crop)
+        if path is None:
+            self._say(_("Could not save {path}.", path=images_dir()))
+            return
+        self.set_path(path)
+
+
+class FarmDialog(QDialog):
+    """O assistente de farm: pergunta o jogo, os botões do lobby, a
+    estratégia e o fim da partida, e monta um macro comum com farm_macro."""
+    MAX_LOBBY = 8
+
+    def __init__(self, parent=None, macros=(), spec=None):
+        super().__init__(parent)
+        self.setWindowTitle(_("Farm assistant"))
+        self.resize(620, 760)
+        spec = dict(spec or {})
+        self.strategies = [m for m in macros if m.get("steps")]
+        self.error = QLabel("")
+        self.error.setStyleSheet("color:#d04030;")
+        self.error.setWordWrap(True)
+        self.error.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.cap_note = QLabel("")
+        self.delay = QSpinBox()
+        self.delay.setRange(0, 10)
+        self.delay.setSuffix(" s")
+        self.delay.setValue(3)
+        self.delay.setToolTip(_("Time to switch to the game window before the "
+                                "screen is captured."))
+        intro = QLabel(_(
+            "Builds an ordinary macro that farms matches by looking at the "
+            "screen, like a person: it brings the game to the front, clicks "
+            "the lobby buttons in order, plays your strategy, keeps watching "
+            "for the skip, reconnect and end of match buttons, and starts "
+            "again. Capture each button from the screen while the game "
+            "shows it. The macro can be edited later like any other."))
+        intro.setWordWrap(True)
+        intro.setEnabled(False)
+
+        self.name = QLineEdit(spec.get("name") or _("Farm"))
+        self.name.setMaxLength(60)
+        self.hotkey = KeyCatcher(spec.get("code") or KEYS["F6"],
+                                 spec.get("key") or "F6", allow_mouse=False)
+        self.window_name = QComboBox()
+        self.window_name.setEditable(True)
+        self.window_name.setInsertPolicy(QComboBox.NoInsert)
+        self.window_name.setMinimumContentsLength(18)
+        self.window_name.setEditText(spec.get("window") or "Sober")
+        self.window_name.lineEdit().setMaxLength(100)
+        self.window_name.setToolTip(_(
+            "The app name, like Sober, or the whole title of the game "
+            "window. Open windows… lists both."))
+        b_wins = QPushButton(_("Open windows…"))
+        b_wins.setToolTip(_("List the windows that are open now"))
+        b_wins.clicked.connect(lambda: window_names(self.window_name,
+                                                    self.error))
+        self.link = QLineEdit(spec.get("link") or "")
+        self.link.setPlaceholderText("https://www.roblox.com/games/…")
+        self.link.setToolTip(_(
+            "Optional. When the game window closes, the macro opens this "
+            "link and waits for the game again. A Roblox game page becomes "
+            "roblox://placeId=…, the link Roblox documents for opening a "
+            "game in the app."))
+
+        self.lobby_box = QVBoxLayout()
+        self.lobby_box.setContentsMargins(0, 0, 0, 0)
+        self.lobby = []
+        self.b_lobby = QPushButton(_("+ Add a lobby button"))
+        self.b_lobby.clicked.connect(lambda: self._add_lobby(""))
+        lobby_w = QWidget()
+        lobby_col = QVBoxLayout(lobby_w)
+        lobby_col.setContentsMargins(0, 0, 0, 0)
+        lobby_col.addLayout(self.lobby_box)
+        lobby_col.addWidget(self.b_lobby, 0, Qt.AlignLeft)
+        for path in spec.get("lobby") or ():
+            self._add_lobby(path)
+        self.lobby_wait = QSpinBox()
+        self.lobby_wait.setRange(1, 3600)
+        self.lobby_wait.setSuffix(" s")
+        self.lobby_wait.setValue(int(spec.get("lobby_wait") or 60))
+        self.lobby_wait.setToolTip(_(
+            "How long to wait for each lobby button. When the first one does "
+            "not show up, the macro takes it that a match already started "
+            "and goes on to the strategy."))
+
+        self.strategy = QComboBox()
+        self.strategy.addItem(_("None, only farm"), None)
+        for m in self.strategies:
+            self.strategy.addItem(f"{m['name'] or hotkey_label(m)}  "
+                                  f"({len(m['steps'])})", m["id"])
+        self.strategy.setCurrentIndex(max(0, self.strategy.findData(
+            spec.get("strategy_id"))))
+        self.strategy.setToolTip(_(
+            "A macro you made or recorded that places and upgrades the "
+            "towers. Its steps are copied into the farm, so later changes "
+            "to it do not change the farm."))
+        self.skip = self._image(spec.get("skip"))
+        self.skip.setToolTip(_("Optional. Clicked whenever it shows up, like "
+                               "a skip wave button."))
+        self.reconnect = self._image(spec.get("reconnect"))
+        self.reconnect.setToolTip(_("Optional. Clicked whenever it shows up, "
+                                    "and the farm starts over from the "
+                                    "lobby."))
+        self.over = self._image(spec.get("over"), optional=False)
+        self.over.setToolTip(_("A button that only shows when the match is "
+                               "over, like Play again or Return to lobby. "
+                               "The macro clicks it and starts the next "
+                               "match."))
+        self.over_wait = QSpinBox()
+        self.over_wait.setRange(1, 600)
+        self.over_wait.setSuffix(" min")
+        self.over_wait.setValue(int(spec.get("over_wait") or 30))
+        self.over_wait.setToolTip(_("If the end of the match takes longer "
+                                    "than this, the farm starts over."))
+        self.hook = QLineEdit(spec.get("hook") or "")
+        self.hook.setPlaceholderText(_("optional") + ", "
+                                     "https://discord.com/api/webhooks/…")
+        self.report = QLineEdit(spec.get("report")
+                                or _("Match {run} done, farming for {time}."))
+        self.report.setMaxLength(1000)
+        self.report.setToolTip(_("{run} becomes the number of the match and "
+                                 "{time} how long the farm has been "
+                                 "running."))
+        self.shot = QCheckBox(_("Attach a screenshot"))
+        self.shot.setChecked(bool(spec.get("shot", True)))
+        self.hook.textChanged.connect(self._sync)
+        self.limit = QSpinBox()
+        self.limit.setRange(0, MAX_RUNS)
+        self.limit.setSpecialValueText(_("never"))
+        self.limit.setSuffix(" " + _("matches"))
+        self.limit.setValue(int(spec.get("limit") or 0))
+
+        form = QFormLayout()
+        form.addRow(QLabel(_("Name:")), self.name)
+        form.addRow(QLabel(_("Hotkey:")), self.hotkey)
+        form.addRow(QLabel(_("Game window:")), _hrow(self.window_name,
+                                                     b_wins))
+        form.addRow(QLabel(_("Reopen with:")), self.link)
+        form.addRow(QLabel(_("Lobby buttons:")), lobby_w)
+        form.addRow(QLabel(_("Wait for each:")), self.lobby_wait)
+        form.addRow(QLabel(_("Strategy:")), self.strategy)
+        form.addRow(QLabel(_("Skip button:")), self.skip)
+        form.addRow(QLabel(_("Reconnect button:")), self.reconnect)
+        form.addRow(QLabel(_("End of the match:")), self.over)
+        form.addRow(QLabel(_("Longest match:")), self.over_wait)
+        form.addRow(QLabel(_("Discord webhook:")), self.hook)
+        form.addRow(QLabel(_("Report:")), self.report)
+        form.addRow("", self.shot)
+        form.addRow(QLabel(_("Stop after:")), self.limit)
+        form.addRow(QLabel(_("Capture after:")), _hrow(self.delay,
+                                                       self.cap_note))
+        inner = QWidget()
+        inner_col = QVBoxLayout(inner)
+        inner_col.addWidget(intro)
+        inner_col.addLayout(form)
+        inner_col.addStretch()
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setWidget(inner)
+        self.buttons = QDialogButtonBox()
+        self.make = self.buttons.addButton(_("Create the macro"),
+                                           QDialogButtonBox.AcceptRole)
+        self.buttons.addButton(QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self._ok)
+        self.buttons.rejected.connect(self.reject)
+        col = QVBoxLayout(self)
+        col.addWidget(self.scroll, 1)
+        col.addWidget(self.error)
+        col.addWidget(self.buttons)
+        if not self.lobby:
+            self._add_lobby("")
+        self._sync()
+
+    def _grab(self):
+        self.scroll.setEnabled(False)
+        self.buttons.setEnabled(False)
+        try:
+            frames, err = grab_frames(self.delay.value(), self.cap_note)
+        finally:
+            self.scroll.setEnabled(True)
+            self.buttons.setEnabled(True)
+        if not frames:
+            self.error.setText(err)
+        return frames
+
+    def _image(self, path, optional=True):
+        return ImageField(path or "", self._grab, self.error, optional)
+
+    def _add_lobby(self, path):
+        if len(self.lobby) >= self.MAX_LOBBY:
+            return
+        box = []
+        field = ImageField(path or "", self._grab, self.error,
+                           remove=lambda: self._del_lobby(box[0]))
+        box.append(field)
+        self.lobby.append(field)
+        self.lobby_box.addWidget(field)
+        self.b_lobby.setEnabled(len(self.lobby) < self.MAX_LOBBY)
+
+    def _del_lobby(self, field):
+        if field in self.lobby:
+            self.lobby.remove(field)
+            self.lobby_box.removeWidget(field)
+            field.deleteLater()
+        self.b_lobby.setEnabled(len(self.lobby) < self.MAX_LOBBY)
+
+    def _sync(self, _t=""):
+        self.shot.setEnabled(bool(self.hook.text().strip()))
+
+    def spec(self):
+        sid = self.strategy.currentData()
+        strat = next((m for m in self.strategies if m["id"] == sid), None)
+        hook = self.hook.text().strip()
+        return {"name": self.name.text().strip(), "code": self.hotkey.code,
+                "key": self.hotkey.name,
+                "window": " ".join(self.window_name.currentText().split()),
+                "link": self.link.text().strip(),
+                "lobby": [f.path for f in self.lobby if f.path],
+                "lobby_wait": self.lobby_wait.value(),
+                "strategy_id": sid,
+                "strategy": strat["steps"] if strat else [],
+                "press_ms": strat["press_ms"] if strat else 0.0,
+                "skip": self.skip.path, "reconnect": self.reconnect.path,
+                "over": self.over.path, "over_wait": self.over_wait.value(),
+                "hook": hook, "report": self.report.text(),
+                "shot": self.shot.isChecked() and bool(hook),
+                "limit": self.limit.value()}
+
+    def _ok(self):
+        s = self.spec()
+        if not s["window"]:
+            self.error.setText(_("Type the name of the game window, like "
+                                 "Sober."))
+            return
+        if not s["over"]:
+            self.error.setText(_("Capture the button that shows at the end "
+                                 "of a match: the farm needs it to know "
+                                 "when a match is over."))
+            return
+        link = farm_link(s["link"])
+        if link and not link.lower().startswith(SAFE_LINKS):
+            self.error.setText(_("The link must start with https://, "
+                                 "roblox:// or steam://."))
+            return
+        if s["hook"] and not s["hook"].lower().startswith("https://"):
+            self.error.setText(_("The webhook must start with https://."))
+            return
+        try:
+            self.macro()
+        except ValueError:
+            self.error.setText(_("The strategy is too long to fit in a farm: "
+                                 "a macro holds {n} steps.", n=MAX_STEPS))
+            return
+        self.accept()
+
+    def macro(self):
+        return farm_macro(self.spec())
+
+
+class MacroFileDialog(QDialog):
+    """O que um arquivo .wayclick traz, antes de acrescentar."""
+
+    def __init__(self, parent, macros, notes, source, room):
+        super().__init__(parent)
+        self.setWindowTitle(_("Import macros"))
+        self.resize(560, 380)
+        name = os.path.basename(source)
+        n = len(macros)
+        lines = [_("1 macro found in {file}:", file=name) if n == 1 else
+                 _("{n} macros found in {file}:", n=n, file=name)]
+        for m in macros:
+            head = f"{m['name']}  " if m["name"] else ""
+            lines.append(f"  • {head}[{macro_summary(m, 6)}]")
+        if notes:
+            lines += ["", _("Notes:")] + ["  " + x for x in notes]
+        text = QPlainTextEdit("\n".join(lines))
+        text.setReadOnly(True)
+        col = QVBoxLayout(self)
+        col.addWidget(text, 1)
+        if n > room:
+            lbl = QLabel(_("Only {n} fit: the list holds {max} macros.",
+                           n=room, max=MAX_MACROS))
+            lbl.setStyleSheet("color:#c86000;")
+            col.addWidget(lbl)
+        buttons = QDialogButtonBox()
+        self.add = buttons.addButton(_("Add these macros"),
+                                     QDialogButtonBox.AcceptRole)
+        buttons.addButton(QDialogButtonBox.Cancel)
+        self.add.setEnabled(bool(macros) and room > 0)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         col.addWidget(buttons)
@@ -7032,15 +8952,27 @@ class App(QWidget):
         self.m_import = QPushButton(_("Import AHK…"))
         self.m_import.setToolTip(_("Turn the hotkeys of an AutoHotkey script "
                                    "(.ahk) into macros"))
+        self.m_farm = QPushButton(_("Farm assistant…"))
+        self.m_export = QPushButton(_("Export…"))
+        self.m_load = QPushButton(_("Import…"))
         self.m_new.clicked.connect(self._new_macro)
         self.m_edit.clicked.connect(self._edit_macro)
         self.m_del.clicked.connect(self._remove_macro)
         self.m_import.clicked.connect(self._import_ahk)
+        self.m_farm.clicked.connect(self._farm)
+        self.m_export.clicked.connect(self._export_macro)
+        self.m_load.clicked.connect(self._import_macros)
+        self._macro_tips()
         mrow = QHBoxLayout()
         for b in (self.m_new, self.m_edit, self.m_del):
             mrow.addWidget(b)
         mrow.addStretch()
         mrow.addWidget(self.m_import)
+        mrow2 = QHBoxLayout()
+        mrow2.addWidget(self.m_farm)
+        mrow2.addStretch()
+        mrow2.addWidget(self.m_export)
+        mrow2.addWidget(self.m_load)
         self.macro_state = QLabel("")
         self.macro_state.setWordWrap(True)
         self.macro_clash = QLabel("")
@@ -7051,6 +8983,7 @@ class App(QWidget):
         macro_form.setContentsMargins(0, 0, 0, 0)
         macro_form.addWidget(self.macro_list, 1)
         macro_form.addLayout(mrow)
+        macro_form.addLayout(mrow2)
         macro_form.addWidget(self.macro_clash)
         macro_form.addWidget(self.macro_state)
 
@@ -7466,10 +9399,13 @@ class App(QWidget):
             "The hotkey still arms and disarms, but the game or app in front "
             "never receives it."))
         for b, src in ((self.m_new, "New"), (self.m_edit, "Edit"),
-                       (self.m_del, "Remove"), (self.m_import, "Import AHK…")):
+                       (self.m_del, "Remove"), (self.m_import, "Import AHK…"),
+                       (self.m_farm, "Farm assistant…"),
+                       (self.m_export, "Export…"), (self.m_load, "Import…")):
             b.setText(_(src))
         self.m_import.setToolTip(_("Turn the hotkeys of an AutoHotkey script "
                                    "(.ahk) into macros"))
+        self._macro_tips()
         self._fill_macros()
         self.target_box.setText(_("Enable sending the key"))
         self.afk.setText(_("Anti-AFK: nudge the cursor every"))
@@ -8198,7 +10134,7 @@ class App(QWidget):
     def refresh_windows(self):
         """Lista as janelas abertas, com ícone, mantendo a seleção se possível."""
         if self.bridge is None:
-            self.bridge = KWinBridge()
+            self.bridge = KWIN()
         keep = (self.win_sel.currentData() or {}).get("id")
         self.win_sel.blockSignals(True)
         self.win_sel.clear()
@@ -8454,6 +10390,11 @@ class App(QWidget):
         if active and any(CompiledMacro(m).uses_pointer for m in self.macros
                           if m["enabled"] and m["steps"]):
             self.ensure_pointer()
+        if active and self.engine.windows is None and any(
+                CompiledMacro(m).uses_windows for m in self.macros
+                if m["enabled"] and m["steps"]):
+            kw = KWIN()                 # na thread da UI, onde ela vive
+            self.engine.windows = kw if kw.ok else None
         path = self.selected_mouse()[0]
         if path and self.mouse is not None:
             # botão do mouse como atalho escondido: o relay sai pelo mesmo
@@ -8490,6 +10431,17 @@ class App(QWidget):
         self.m_del.setEnabled(has)
         self.m_new.setEnabled(len(self.macros) < MAX_MACROS)
         self.m_import.setEnabled(len(self.macros) < MAX_MACROS)
+        self.m_farm.setEnabled(len(self.macros) < MAX_MACROS)
+        self.m_load.setEnabled(len(self.macros) < MAX_MACROS)
+        self.m_export.setEnabled(has)
+
+    def _macro_tips(self):
+        self.m_farm.setToolTip(_("Build a macro that farms matches of a "
+                                 "tower defense game, step by step"))
+        self.m_export.setToolTip(_("Save the selected macro, with its images, "
+                                   "in a file to share"))
+        self.m_load.setToolTip(_("Add the macros of a {ext} file",
+                                 ext=MACRO_FILE_EXT))
 
     def _macro_item_changed(self, item):
         row = self.macro_list.row(item)
@@ -8580,6 +10532,115 @@ class App(QWidget):
         self._apply_macros()
         return len(new)
 
+    def _farm(self):
+        """O assistente de farm. Pausa os macros como o editor: capturar um
+        botão do jogo com um macro rodando por cima não dá."""
+        if len(self.macros) >= MAX_MACROS:
+            return
+        self._macro_editing = True
+        self._apply_macros()
+        m = None
+        try:
+            dlg = FarmDialog(self, self.macros)
+            if dlg.exec() == QDialog.Accepted:
+                m = dlg.macro()
+        finally:
+            self._macro_editing = False
+        if m:
+            self.macros.append(m)
+            self._fill_macros()
+            self.macro_list.setCurrentRow(len(self.macros) - 1)
+            self.macro_box.setChecked(True)
+        self._apply_macros()
+
+    def _export_macro(self):
+        row = self.macro_list.currentRow()
+        if not 0 <= row < len(self.macros):
+            return
+        m = self.macros[row]
+        base = re.sub(r"[^\w.-]+", "-", m["name"] or hotkey_label(m)) \
+            .strip(".-") or "macro"
+        path, _f = QFileDialog.getSaveFileName(
+            self, _("Export macro"),
+            os.path.join(os.path.expanduser("~"), base + MACRO_FILE_EXT),
+            _("WayClick macros") + f" (*{MACRO_FILE_EXT})")
+        if path:
+            if not path.endswith(MACRO_FILE_EXT):
+                path += MACRO_FILE_EXT
+            self.export_macro_path([m], path)
+
+    def export_macro_path(self, macros, path, ask=True):
+        """Grava os macros num arquivo .wayclick, com as imagens dentro."""
+        data, missing, hooks = export_macros(macros)
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(data, fh, ensure_ascii=False)
+            os.replace(tmp, path)
+        except OSError as e:
+            QMessageBox.warning(self, _("Export macro"),
+                                _("Could not write {file}: {err}",
+                                  file=os.path.basename(path),
+                                  err=e.strerror or e))
+            return False
+        lines = [_("Saved {file}. Import… adds it on another computer.",
+                   file=os.path.basename(path))]
+        if hooks:
+            lines.append(_("The Discord webhook stayed out of the file: "
+                           "whoever has it could post in your channel."))
+        if missing:
+            lines.append(_("These images could not be read and were left "
+                           "out: {files}", files=", ".join(
+                               os.path.basename(x) for x in missing)))
+        if ask:
+            QMessageBox.information(self, _("Export macro"),
+                                    "\n\n".join(lines))
+        return True
+
+    def _import_macros(self):
+        path, _f = QFileDialog.getOpenFileName(
+            self, _("Import macros"), os.path.expanduser("~"),
+            _("WayClick macros") + f" (*{MACRO_FILE_EXT} *.json);;"
+            + _("All files") + " (*)")
+        if path:
+            self.import_macro_path(path)
+
+    def import_macro_path(self, path, ask=True):
+        """Mostra o que o arquivo traz e acrescenta os macros."""
+        try:
+            data = read_macro_file(path)
+            macros, notes = import_macros(data, dry=True)
+        except OSError as e:
+            QMessageBox.warning(self, _("Import macros"),
+                                _("Could not read {file}: {err}",
+                                  file=os.path.basename(path),
+                                  err=e.strerror or e))
+            return 0
+        except ValueError:
+            QMessageBox.warning(self, _("Import macros"),
+                                _("{file} is not a WayClick macro file.",
+                                  file=os.path.basename(path)))
+            return 0
+        room = MAX_MACROS - len(self.macros)
+        if ask:
+            dlg = MacroFileDialog(self, macros, notes, path, room)
+            if dlg.exec() != QDialog.Accepted:
+                return 0
+        try:
+            macros, _notes = import_macros(data)
+        except OSError as e:
+            QMessageBox.warning(self, _("Import macros"),
+                                _("Could not save {path}.",
+                                  path=e.filename or images_dir()))
+            return 0
+        new = macros[:max(0, room)]
+        self.macros += new
+        self._fill_macros()
+        if new:
+            self.macro_list.setCurrentRow(len(self.macros) - len(new))
+        self._apply_macros()
+        return len(new)
+
     def _macros_ran(self):
         """Algum macro começou ou terminou (sinal vindo de outra thread)."""
         if not hasattr(self, "macro_state"):
@@ -8613,8 +10674,8 @@ class App(QWidget):
             self.antiafk.stop()
             self.antiafk = None
         self.target_timer.stop()
-        if self.bridge:
-            self.bridge.cleanup()
+        if self.bridge or _KWIN:
+            (self.bridge or _KWIN).cleanup()
         self.engine.close()
         self.watcher.stop()
         if self.trig_watcher:

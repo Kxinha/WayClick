@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.7.1
+Version:        1.8.0
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -76,6 +76,21 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Fri Nov 20 2026 gabrielmf1998 <noreply@github.com> - 1.8.0-1
+- Watch steps keep looking for an image, a pixel color or a window while
+  the next steps run, and can click it or take the macro to another step
+- Window steps find a window by app name or by its whole title through
+  KWin, wait for it to open or close and bring it to the front
+- Count steps, Stop after N runs, and {run}, {time} and counters in
+  notifications
+- Record in the macro editor turns keys, clicks, drags and the wheel into
+  steps
+- Farm assistant builds a whole match farm, from opening the game and the
+  lobby buttons to a strategy, skip and reconnect buttons, the end of the
+  match and a Discord report
+- Export and Import share macros with their pictures as .wayclick files,
+  without webhooks or unsafe links
+
 * Fri Nov 20 2026 gabrielmf1998 <noreply@github.com> - 1.7.1-1
 - Imported AutoHotkey timers and waits shorter than 15.6 ms run every
   15.6 ms, like AutoHotkey on Windows, so a game that reads fewer keys per

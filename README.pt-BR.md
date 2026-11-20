@@ -31,6 +31,12 @@ compositor e sem nada rodando como root.
   cor de um pixel, esperar até aparecer ou sumir e escolher o que vem depois,
   postar num webhook do Discord com print da tela, abrir um link. **Escolher
   na tela** pega o ponto, a cor ou a imagem da sua própria tela
+- **Passos de farm**: *Vigiar* fica olhando a tela ou uma janela enquanto os
+  outros passos rodam, *Janela* acha o jogo e traz para a frente, *Contar* e
+  *Parar após N rodadas* terminam um farm sozinhos. **Gravar** transforma o
+  que você joga em passos, o **Assistente de farm** monta o laço de lobby,
+  partida, fim e de novo de um jogo de tower defense, e **Exportar /
+  Importar** compartilha um macro com as imagens num arquivo `.wayclick` só
 - **Mandar tecla para uma janela** — escolha uma janela aberta e alimente ela
   com uma tecla; em alvo X11 chega sem mexer no foco, mesmo minimizada
 - **Anti-AFK** — mexe o ponteiro e devolve, com deriva zero
@@ -362,6 +368,69 @@ ponteiro de jeito nenhum, então um passo de posição não faz nada ali. Use
 posições onde o jogo mostra o cursor livre, como menus, lobbies, lojas e telas
 de construir.
 
+### Farm: vigiar, janela, contar, gravar, compartilhar
+
+Mais quatro peças deixam um macro farmar partidas sozinho, como os macros
+de tower defense para Windows fazem, mas só olhando a tela e apertando
+teclas como uma pessoa. O WayClick nunca lê nem mexe na memória de um jogo.
+
+| Passo ou ajuste | O que faz |
+|---|---|
+| **Vigiar a tela ou uma janela** | Continua olhando enquanto os próximos passos rodam, como um `SetTimer` com `ImageSearch` no AutoHotkey, atrás de uma imagem, da cor de um pixel ou de uma janela, a cada N segundos. Quando vê o que espera, pode clicar e seguir, ou levar o macro para outro lugar (recomeçar, parar, ir a um passo). Ele olha enquanto o macro espera (passos de espera, buscas na tela) e entre um passo e outro, nunca no meio de uma tecla apertada. Quando um vigia leva o macro para outro passo, todos os vigias param até o macro passar por eles de novo. |
+| **Conferir ou focar uma janela** | Acha uma janela pelo nome do app (`Sober` bate com `org.vinegarhq.Sober`) ou pelo título inteiro, pode esperar ela abrir ou fechar, e pode trazer para a frente, minimizada ou não. Um título que só contém o texto não conta, então com o jogo fechado um terminal ou uma aba do navegador sobre ele não é confundido com o jogo. Precisa do KDE Plasma, porque só o KWin conhece as janelas. |
+| **Contar** | Soma 1 cada vez que o macro passa, e a cada N vezes pode parar o macro ou ir a um passo. |
+| **Parar após N rodadas** | No próprio macro. Um macro que repete para sozinho depois de tantas rodadas, e uma rodada que recomeça não conta. |
+
+Os avisos preenchem `{run}` (o número da rodada), `{time}` (há quanto tempo o
+macro está rodando, como `1:02:05`) e `{vitorias}` para um contador chamado
+vitorias.
+
+**● Gravar…** no editor de macro transforma o que você joga em passos. Depois
+de uma contagem ele anota teclas, botões do mouse e a roda até você apertar a
+tecla de parar (F10 por padrão, que o jogo não vê), e mostra os passos antes
+de pôr depois do selecionado. Um aperto rápido vira um toque, um clique
+guarda onde aconteceu (a posição vem do KWin), um aperto que andou vira um
+arrasto, giros seguidos da roda viram um passo, e as pausas entre as ações
+viram esperas em passos de 10 ms, ou ficam de fora. Movimento do mouse sem
+clique não é gravado.
+
+**Assistente de farm…** na aba Atalhos monta um farm inteiro de uma vez. Você
+captura os botões do lobby, escolhe uma estratégia (um macro que você montou
+ou gravou, que coloca e melhora as torres) e captura o botão que aparece no
+fim da partida, mais um botão de pular onda e um de reconectar, se o jogo
+tiver. Ele monta um macro comum que
+
+1. confere se a janela do jogo está aberta e, se não estiver, abre o link
+   que você deu e espera por ela,
+2. traz o jogo para a frente e fica vigiando a janela fechar e o botão de
+   reconectar, e qualquer um dos dois recomeça o farm,
+3. clica nos botões do lobby em ordem (quando o primeiro não aparece, uma
+   partida já está rolando, então vai direto para a estratégia),
+4. joga a estratégia, clicando no botão de pular sempre que ele aparece, e o
+   fim da partida corta a estratégia,
+5. clica no botão do fim, posta o relatório no seu webhook do Discord, com
+   print se você quiser, e começa de novo, até o número de partidas que você
+   definir.
+
+Um link de página de jogo do Roblox vira `roblox://placeId=ID`, o formato da
+página sobre deep links do Roblox Creator Hub, e o Sober se registra para
+links `roblox://`. Abrir um jogo assim ainda não foi testado com o Sober; se
+não fizer nada, cole um link que funcione para você ou deixe o campo vazio. O
+que o assistente monta dá para editar depois como qualquer outro macro, e o
+WayClick não vem com estratégias prontas. Confira as regras do jogo antes,
+porque muito jogo online bane farm automático.
+
+**Exportar…** salva o macro selecionado num arquivo `.wayclick` com as
+imagens dentro, então uma estratégia pode ser compartilhada como um arquivo
+só, e **Importar…** adiciona os macros de um arquivo desses. O webhook do
+Discord nunca vai para o arquivo, e webhooks num arquivo são descartados na
+importação de qualquer jeito, porque um arquivo de outra pessoa poderia
+mandar prints da sua tela para o canal dela. As imagens só são salvas quando
+são imagens de verdade, e nunca fora da pasta de imagens. Um passo que
+abriria qualquer coisa que não seja um link da web, `roblox://` ou
+`steam://` vira uma espera vazia, para os outros passos manterem os números,
+e os macros importados chegam desligados.
+
 ### Acionamento
 
 **Modo**
@@ -570,6 +639,14 @@ outra cor, não conta. Medido em telas sintéticas de 1920×1080
 tela. Os outros quatro caíram numa cópia igual, duas áreas lisas da mesma cor
 e dois recortes de 16 px com um gêmeo de 0,999.
 
+**Janelas e o cursor.** No Wayland só o compositor conhece as janelas, então
+os passos de janela e o gravador perguntam ao KWin. O WayClick carrega um
+script pequeno no KWin pelo D-Bus (`org.kde.kwin.Scripting`), e o script lê
+`workspace.windowList()` ou `workspace.cursorPos` e chama de volta um serviço
+D-Bus do WayClick com a resposta. Medido contra um KWin aninhado
+(`tests/t_farm_kwin.py`), uma pergunta leva de 5 a 10 ms, e um passo de
+janela pergunta no máximo uma vez por segundo.
+
 ## Problemas comuns
 
 **"Atalho global DESLIGADO"** — você não está no grupo `input`, ou a sessão
@@ -637,6 +714,9 @@ sg input -c "python3 tests/t_clicker_timing.py"     # período do Clicker e rela
 sg input -c "python3 tests/t_screen_macros.py"      # passos de tela numa tela falsa, posições, webhook
 sg input -c "python3 tests/t_screen_ui.py"          # editor de passo, Escolher na tela, arranjo das telas
 sg input -c "python3 tests/t_abs_pointer_libinput.py"  # o ponteiro absoluto como o libinput lê
+sg input -c "python3 tests/t_farm_macros.py"        # vigias, janelas, contadores, o gravador, um farm inteiro num jogo falso
+sg input -c "python3 tests/t_farm_ui.py"            # editores, gravador, assistente de farm, arquivos .wayclick
+python3 tests/t_farm_kwin.py                        # passos de janela e o cursor contra um KWin de verdade, aninhado
 python3 tests/t_screen_portal.py                    # o portal de verdade, dentro do bubblewrap
 python3 tests/bench_find_image.py                   # busca de imagem, acha ou não e com que rapidez
 python3 tests/t_sober_kwin.py                       # tudo isso contra o Roblox (Sober), num KWin aninhado
@@ -710,7 +790,8 @@ processo termina. As imagens dos passos de imagem ficam em
 `~/.local/share/wayclick/images`, e o token de compartilhamento de tela em
 `~/.config/wayclick/screen-token`. A tela só é compartilhada enquanto um macro
 precisa dela, e nenhum quadro sai da máquina, a não ser que um passo poste um
-print no webhook que você deu a ele.
+print no webhook que você deu a ele. As imagens de arquivos `.wayclick`
+importados vão para a mesma pasta de imagens.
 
 Use onde automação for permitida. Muito jogo online bane automação de entrada.
 

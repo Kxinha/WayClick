@@ -30,6 +30,12 @@ running as root.
   color, wait until it shows up or goes away and choose what comes next, post
   to a Discord webhook with a screenshot, open a link. **Pick on screen** takes
   the spot, the color or the picture from your own screen
+- **Farm steps**: *Watch* keeps looking at the screen or a window while the
+  other steps run, *Window* finds the game and brings it to the front, *Count*
+  and *Stop after N runs* end a farm by themselves. **Record** turns what you
+  play into steps, the **Farm assistant** builds a lobby, match, end and again
+  loop for a tower defense game, and **Export / Import** shares a macro with
+  its pictures in one `.wayclick` file
 - **Send key to a window** — pick an open window and feed it a key; for X11
   targets it arrives with no focus change, even minimized
 - **Anti-AFK** — nudges the pointer and puts it back, with zero drift
@@ -356,6 +362,68 @@ person camera or while you drag to turn, KWin does not move the pointer at
 all, so a position step does nothing there. Use positions where the game shows
 a free cursor, such as menus, lobbies, shops and build screens.
 
+### Farming: watch, window, count, record, share
+
+Four more pieces let a macro farm matches by itself, as the tower defense
+macros for Windows do, but only by looking at the screen and pressing keys
+like a person. WayClick never reads or touches the memory of a game.
+
+| Step or setting | What it does |
+|---|---|
+| **Watch the screen or a window** | Keeps looking while the next steps run, like a `SetTimer` with `ImageSearch` in AutoHotkey, for an image, a pixel color or a window, every N seconds. When it sees what it waits for it can click it and continue, or take the macro elsewhere (start over, stop, go to a step). It looks while the macro waits (Wait steps, screen searches) and between steps, never in the middle of a key press. When a watch takes the macro to another step, every watch stops until the macro passes over it again. |
+| **Check or focus a window** | Finds a window by app name (`Sober` matches `org.vinegarhq.Sober`) or by its whole title, can wait for it to open or close, and can bring it to the front, minimized or not. A title that only contains the text does not count, so with the game closed a terminal or a browser tab about it is not taken for the game. Needs KDE Plasma, since only KWin knows the windows. |
+| **Count** | Adds 1 each time the macro passes, and every N times can stop the macro or go to a step. |
+| **Stop after N runs** | In the macro itself. A repeating macro stops by itself after that many runs, and a run that starts over does not count. |
+
+Notifications fill in `{run}` (the number of the run), `{time}` (how long the
+macro has been running, like `1:02:05`) and `{wins}` for a counter named
+wins.
+
+**● Record…** in the macro editor turns what you play into steps. After a
+countdown it notes keys, mouse buttons and the wheel until you press the stop
+key (F10 by default, which the game does not see), then shows the steps
+before adding them after the selected one. A quick press becomes a tap, a
+click keeps where it happened (the position comes from KWin), a press that
+moved becomes a drag, turns of the wheel in a row become one step, and the
+pauses between actions become waits in steps of 10 ms, or are left out.
+Mouse movement without a click is not recorded.
+
+**Farm assistant…** on the Hotkeys tab builds a whole farm in one go. You
+capture the lobby buttons, pick a strategy (a macro you made or recorded that
+places and upgrades the towers) and capture the button that shows at the end
+of a match, plus a skip wave button and a reconnect button if the game has
+them. It makes an ordinary macro that
+
+1. checks that the game window is open, and if not, opens the link you gave
+   and waits for it,
+2. brings the game to the front and keeps watching for the window closing
+   and for the reconnect button, either of which starts the farm over,
+3. clicks the lobby buttons in order (when the first one is missing, a match
+   is already on, so it goes straight to the strategy),
+4. plays the strategy, clicking the skip button whenever it shows up, with
+   the end of the match cutting the strategy short,
+5. clicks the end of match button, posts the report to your Discord webhook,
+   with a screenshot if you want, and starts again, until the number of
+   matches you set.
+
+A Roblox game page link becomes `roblox://placeId=ID`, the format on the
+Roblox Creator Hub page about deep linking, and Sober registers itself for
+`roblox://` links. Opening a game that way has not been tried with Sober
+yet; if it does nothing, paste a link that works for you or leave the field
+empty. What the assistant makes can be edited later like any other macro, and
+no ready strategies come with WayClick. Check the rules of the game first,
+since many online games ban automated farming.
+
+**Export…** saves the selected macro in a `.wayclick` file with its pictures
+inside, so a strategy can be shared as one file, and **Import…** adds the
+macros of such a file. The Discord webhook never goes into the file, and
+webhooks in a file are dropped on import anyway, because a file from someone
+else could send pictures of your screen to their channel. Pictures are only
+saved when they really are images, and never outside the pictures folder. A
+step that would open anything other than a web, `roblox://` or `steam://`
+link becomes an empty wait, so the other steps keep their numbers, and the
+imported macros arrive turned off.
+
 ### Trigger
 
 **Mode**
@@ -562,6 +630,14 @@ screens (`tests/bench_find_image.py`), 284 of 288 random cuts from 16×16 to
 60 ms per screen. The other four landed on an equal copy, two flat areas of
 the same color and two 16 px cuts with a 0.999 twin.
 
+**Windows and the cursor.** On Wayland only the compositor knows the
+windows, so window steps and the recorder ask KWin. WayClick loads a small
+KWin script over D-Bus (`org.kde.kwin.Scripting`), and the script reads
+`workspace.windowList()` or `workspace.cursorPos` and calls a D-Bus service of
+WayClick back with the answer. Measured against a nested KWin
+(`tests/t_farm_kwin.py`), a question takes 5 to 10 ms, and a window step asks
+at most once a second.
+
 ## Troubleshooting
 
 **"Global hotkey OFF"** — you are not in the `input` group, or the session
@@ -626,6 +702,9 @@ sg input -c "python3 tests/t_clicker_timing.py"     # Clicker period and keyboar
 sg input -c "python3 tests/t_screen_macros.py"      # screen steps on a fake screen, positions, webhook
 sg input -c "python3 tests/t_screen_ui.py"          # step editor, Pick on screen, screen layout
 sg input -c "python3 tests/t_abs_pointer_libinput.py"  # the absolute pointer as libinput reads it
+sg input -c "python3 tests/t_farm_macros.py"        # watches, windows, counters, the recorder, a whole farm on a fake game
+sg input -c "python3 tests/t_farm_ui.py"            # editors, recorder, farm assistant, .wayclick files
+python3 tests/t_farm_kwin.py                        # window steps and the cursor against a real KWin, nested
 python3 tests/t_screen_portal.py                    # the real portal, inside bubblewrap
 python3 tests/bench_find_image.py                   # image search, found or not and how fast
 python3 tests/t_sober_kwin.py                       # all of it against Roblox (Sober), in a nested KWin
@@ -698,7 +777,8 @@ when the process exits. Pictures for image steps are kept in
 `~/.local/share/wayclick/images`, and the screen sharing token in
 `~/.config/wayclick/screen-token`. The screen is only shared while a macro
 needs it, and frames never leave the machine unless a step posts a screenshot
-to the webhook you gave it.
+to the webhook you gave it. Pictures from imported `.wayclick` files go to the
+same pictures folder.
 
 Use it where automation is allowed. Plenty of online games ban input automation.
 
