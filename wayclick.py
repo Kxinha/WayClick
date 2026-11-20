@@ -31,7 +31,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -1404,6 +1404,11 @@ class HotkeyWatcher(QObject):
         self.hub = hub or HUB()
         self.error = None
         self._on = False
+        # (código) -> bool: um macro ligado responde a esta tecla agora. Aí o
+        # aperto é dele, e armar o clique junto (o F8 padrão de um .ahk
+        # importado) clicaria sozinho no jogo
+        self.shadow = None
+        self._shadowed = False
         if not self.files:
             self.error = ("sem acesso a /dev/input" if self.hub.denied
                           else "nenhum teclado encontrado")
@@ -1437,10 +1442,16 @@ class HotkeyWatcher(QObject):
         if CAPTURE.is_set() and value == 1:
             return False
         if value == 1:
+            self._shadowed = bool(self.shadow and self.shadow(code))
+            if self._shadowed:
+                return False
             self.pressed.emit()
         elif value == 0:
+            if self._shadowed:
+                self._shadowed = False
+                return False
             self.released.emit()
-        return self.block
+        return self.block and not self._shadowed
 
     def stop(self):
         self._on = False
@@ -3123,6 +3134,17 @@ class MacroEngine(QObject):
     def needs_keyboard(self):
         return self.active and any(c.uses_keys for c in self.macros)
 
+    def claims(self, code):
+        """Um macro ligado dispara com esta tecla, com os modificadores que
+        estão seguros agora (a mesma conta de on_key). Roda na thread do hub."""
+        if not self.active:
+            return False
+        ms = self.by_code.get(code)
+        if not ms:
+            return False
+        mods = self.hub.mods_active()
+        return any(m.mods <= mods for m in ms)
+
     # chamados das threads dos macros; os sinais chegam na da UI
     def report(self, text):
         self.problem.emit(text)
@@ -3239,6 +3261,15 @@ class MacroEngine(QObject):
 #   X:: Send ..., Click, Sleep                         -> uma vez por aperto
 #   a::b                                              -> remapeia (enquanto segura)
 #   SetTimer no início do script                      -> "sempre"
+#
+# Tempo como no Windows: lá o AutoHotkey arredonda SetTimer e Sleep para cima,
+# para um múltiplo de 10 ou 15,6 ms ("Timer precision" nas páginas SetTimer e
+# Sleep da documentação v1 e v2). Abaixo de um tique, então, o script rodava
+# de verdade a cada 15,6 ms, e é assim que ele vem. SetTimer 1 tomado ao pé
+# da letra manda mil teclas por segundo, e o jogo que lê menos que isso não as
+# perde, enfileira: no Roblox (Sober), 0,5 s de "SpamE F1" a 1 ms virou 18 s
+# de E chegando depois de desligar (tests/t_sober_kwin.py).
+AHK_TICK_MS = 15.6
 AHK_KEYS = {
     "space": 57, "enter": 28, "return": 28, "tab": 15, "esc": 1, "escape": 1,
     "backspace": 14, "bs": 14, "delete": 111, "del": 111, "insert": 110,
@@ -3419,6 +3450,7 @@ class AhkImport:
         self.press_ms = 0.0
         self.send_mode = "input"
         self._ifwin_noted = False
+        self._tick_noted = False
         # Click X, Y e MouseMove X, Y contam da janela ativa no AutoHotkey,
         # a não ser com CoordMode Mouse, Screen
         self.screen_coords = bool(re.search(
@@ -3899,12 +3931,13 @@ class AhkImport:
             self.note(ln, "SetTimer period {p} is not a number, used 250 ms",
                       p=text)
             return 250
-        if 0 < p < 16:
+        if 0 < p < AHK_TICK_MS:
             self.note(ln, "SetTimer {ms} ms: on Windows AutoHotkey rounds "
                           "timers up to 10 or 15.6 ms, so the script really "
-                          "ran about every 15 ms. WayClick runs exactly {ms} "
-                          "ms; raise it in the macro if the game drops keys.",
-                      ms=p)
+                          "ran every 15.6 ms, and so does the macro. Keys "
+                          "sent faster than the game reads them pile up and "
+                          "keep arriving after the macro stops.", ms=p)
+            return AHK_TICK_MS
         return p
 
     def _from_timers(self, ln, spec, base, timers, flips):
@@ -4075,16 +4108,35 @@ class AhkImport:
         m = re.fullmatch(r"Random\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)", a, re.I)
         if m:
             lo, hi = sorted((int(m.group(1)), int(m.group(2))))
-            return [{"op": "wait", "ms": max(0, lo), "max": max(0, hi)}]
+            return [self._wait(lo, hi, ln)]
         try:
-            return [{"op": "wait", "ms": max(0.0, float(a))}]
+            return [self._wait(float(a), None, ln)]
         except ValueError:
             pass
         if a.lower() in rand:
             lo, hi = rand[a.lower()]
-            return [{"op": "wait", "ms": max(0, lo), "max": max(0, hi)}]
+            return [self._wait(lo, hi, ln)]
         self.note(ln, "Sleep {a} is not a number, skipped", a=arg)
         return []
+
+    def _tick(self, ms, ln):
+        """Sleep curto como no Windows: abaixo de um tique, um tique. Sleep 0
+        e -1 só cedem a vez no AutoHotkey, e aqui não esperam nada."""
+        if 0 < ms < AHK_TICK_MS:
+            if not self._tick_noted:
+                self._tick_noted = True
+                self.note(ln, "Sleep {ms}: on Windows AutoHotkey waits at "
+                              "least 10 or 15.6 ms, so the script really "
+                              "waited 15.6 ms, and so do the macros (every "
+                              "wait shorter than that)", ms=_ms(ms))
+            return AHK_TICK_MS
+        return max(0.0, float(ms))
+
+    def _wait(self, lo, hi, ln):
+        lo = self._tick(lo, ln)
+        if hi is None:
+            return {"op": "wait", "ms": lo}
+        return {"op": "wait", "ms": lo, "max": max(lo, self._tick(hi, ln))}
 
     def _move(self, args, ln):
         rel = any(a.strip().lower() in ("r", "rel", "relative") for a in args)
@@ -5236,12 +5288,26 @@ TRANSLATIONS = {
         "SetTimer period {p} is not a number, used 250 ms":
             "o período {p} do SetTimer não é um número, usei 250 ms",
         "SetTimer {ms} ms: on Windows AutoHotkey rounds timers up to 10 or "
-        "15.6 ms, so the script really ran about every 15 ms. WayClick runs "
-        "exactly {ms} ms; raise it in the macro if the game drops keys.":
+        "15.6 ms, so the script really ran every 15.6 ms, and so does the "
+        "macro. Keys sent faster than the game reads them pile up and keep "
+        "arriving after the macro stops.":
             "SetTimer {ms} ms: no Windows o AutoHotkey arredonda os timers "
-            "para 10 ou 15,6 ms, então o script rodava de verdade a cada uns "
-            "15 ms. O WayClick roda exatamente {ms} ms; aumente no macro se o "
-            "jogo perder teclas.",
+            "para 10 ou 15,6 ms, então o script rodava de verdade a cada "
+            "15,6 ms, e o macro também. Teclas mandadas mais rápido do que o "
+            "jogo lê se acumulam e continuam chegando depois que o macro "
+            "para.",
+        "Sleep {ms}: on Windows AutoHotkey waits at least 10 or 15.6 ms, so "
+        "the script really waited 15.6 ms, and so do the macros (every wait "
+        "shorter than that)":
+            "Sleep {ms}: no Windows o AutoHotkey espera pelo menos 10 ou "
+            "15,6 ms, então o script esperava de verdade 15,6 ms, e os macros "
+            "também (toda espera mais curta que isso)",
+        "{key} is also the arm/disarm hotkey. While hotkey macros are on, "
+        "{key} runs the macro and does not arm the clicker; pick another "
+        "arm/disarm hotkey to use both.":
+            "{key} também é o atalho de armar/desarmar. Com os macros de "
+            "atalho ligados, {key} roda o macro e não arma o clique; escolha "
+            "outro atalho de armar/desarmar para usar os dois.",
         "{hk} only stops a timer; in WayClick the hotkey that starts a macro "
         "also stops it":
             "{hk} só para um timer; no WayClick o atalho que começa um macro "
@@ -6695,8 +6761,21 @@ class MacroDialog(QDialog):
             "block": self.block.isChecked(), "steps": self.steps})
 
 
-def import_report(imp, source):
-    """Texto do que um .ahk vira: um macro por linha e as observações."""
+def arm_clash_text(macros, code, name):
+    """O aviso de quando um macro ligado, sem modificador, usa a tecla de
+    armar o clique (F8 de fábrica, comum em script de jogo)."""
+    if not code or not any(m.get("enabled", True) and m.get("code") == code
+                           and not m.get("mods") and m.get("mode") != "always"
+                           for m in macros):
+        return ""
+    return _("{key} is also the arm/disarm hotkey. While hotkey macros are "
+             "on, {key} runs the macro and does not arm the clicker; pick "
+             "another arm/disarm hotkey to use both.", key=name)
+
+
+def import_report(imp, source, arm=None):
+    """Texto do que um .ahk vira: um macro por linha e as observações. `arm`
+    é (código, nome) da tecla de armar o clique, para avisar se bater."""
     n = len(imp.macros)
     name = os.path.basename(source)
     if n == 1:
@@ -6706,21 +6785,24 @@ def import_report(imp, source):
     for m in imp.macros:
         head = f"{m['name']}  " if m["name"] else ""
         lines.append(f"  • {head}[{macro_summary(m, 6)}]")
-    if imp.notes:
+    clash = arm_clash_text(imp.macros, *arm) if arm else ""
+    if imp.notes or clash:
         lines += ["", _("Notes:")]
         lines += ["  " + note_text(x) for x in sorted(imp.notes,
                                                       key=lambda x: x[0])]
+        if clash:
+            lines.append("  " + clash)
     return "\n".join(lines)
 
 
 class ImportDialog(QDialog):
     """Mostra o que o script vira antes de acrescentar."""
 
-    def __init__(self, parent, imp, source, room):
+    def __init__(self, parent, imp, source, room, arm=None):
         super().__init__(parent)
         self.setWindowTitle(_("Import AutoHotkey"))
         self.resize(560, 380)
-        text = QPlainTextEdit(import_report(imp, source))
+        text = QPlainTextEdit(import_report(imp, source, arm))
         text.setReadOnly(True)
         col = QVBoxLayout(self)
         col.addWidget(text, 1)
@@ -6961,10 +7043,15 @@ class App(QWidget):
         mrow.addWidget(self.m_import)
         self.macro_state = QLabel("")
         self.macro_state.setWordWrap(True)
+        self.macro_clash = QLabel("")
+        self.macro_clash.setWordWrap(True)
+        self.macro_clash.setStyleSheet("color:#c86000;font-size:11px;")
+        self.macro_clash.hide()
         macro_form = QVBoxLayout()
         macro_form.setContentsMargins(0, 0, 0, 0)
         macro_form.addWidget(self.macro_list, 1)
         macro_form.addLayout(mrow)
+        macro_form.addWidget(self.macro_clash)
         macro_form.addWidget(self.macro_state)
 
         # --- injeção direcionada a uma janela (beta) ---
@@ -7094,6 +7181,7 @@ class App(QWidget):
 
         # macros com atalho: vivem independentes do Start
         self.engine = MacroEngine(self._macro_outputs, hub=self.watcher.hub)
+        self.watcher.shadow = self.engine.claims
         self.engine.changed.connect(self._macros_ran)
         self.engine.toggled.connect(self._macro_toggled)
         self.engine.problem.connect(self._macro_problem)
@@ -8332,6 +8420,16 @@ class App(QWidget):
         self._hinted = False
         self.warn.setText("")
         self._hint()
+        self._show_clash()
+
+    def _show_clash(self):
+        """Avisa quando um macro usa a tecla de armar o clique: com os macros
+        ligados ela é do macro, e o clique não arma por ela."""
+        if not hasattr(self, "macro_clash"):
+            return
+        text = arm_clash_text(self.macros, self.hk.code, self.hk.name)
+        self.macro_clash.setText(text)
+        self.macro_clash.setVisible(bool(text))
 
     # ---------------------------------------------------- macros (atalhos) --
     def _macro_outputs(self):
@@ -8379,6 +8477,7 @@ class App(QWidget):
             item.setData(Qt.UserRole, m["id"])
             self.macro_list.addItem(item)
         self.macro_list.blockSignals(False)
+        self._show_clash()
         if self.macros:
             self.macro_list.setCurrentRow(max(0, min(row,
                                                      len(self.macros) - 1)))
@@ -8468,7 +8567,8 @@ class App(QWidget):
             return 0
         room = MAX_MACROS - len(self.macros)
         if ask:
-            dlg = ImportDialog(self, imp, path, room)
+            dlg = ImportDialog(self, imp, path, room,
+                               arm=(self.hk.code, self.hk.name))
             if dlg.exec() != QDialog.Accepted:
                 return 0
         new = imp.macros[:max(0, room)]
@@ -8637,7 +8737,9 @@ def cli_import(argv):
         print(_("Could not read {file}: {err}", file=path,
                 err=e.strerror or e), file=sys.stderr)
         return 1
-    print(import_report(imp, path))
+    arm = cfg.get("hotkey_code") or KEYNAMES.get(cfg.get("hotkey", "F8"),
+                                                 KEYNAMES["F8"])
+    print(import_report(imp, path, (arm, cfg.get("hotkey") or "F8")))
     if dry or not imp.macros:
         return 0 if imp.macros else 1
     pid = _other_instance()

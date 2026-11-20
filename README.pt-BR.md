@@ -277,7 +277,7 @@ avisados e ignorados. `Click X, Y` e `MouseMove X, Y` viram passos
 media a partir da janela ativa, que é o padrão do AutoHotkey.
 
 O script anexado ao primeiro pedido desta função importa como *F1, liga e
-desliga, a cada 1 ms, tocar E*:
+desliga, a cada 15,6 ms, tocar E*:
 
 ```ahk
 F1::
@@ -293,11 +293,20 @@ Send, e
 return
 ```
 
-Uma diferença honesta: no Windows o AutoHotkey arredonda o `SetTimer` para 10
-ou 15,6 ms, então esse script apertava E umas 64 vezes por segundo. O WayClick
-roda o 1 ms que foi pedido, 1.000 vezes por segundo (medido: mediana de 1,000
-ms entre toques). O relatório da importação avisa isso; aumente o tempo no
-macro se algum jogo perder teclas nesse ritmo.
+Por que 15,6 e não 1: no Windows o AutoHotkey arredonda os períodos do
+`SetTimer` e as esperas do `Sleep` para cima, para um múltiplo de 10 ou 15,6 ms
+(as notas *Timer precision* nas páginas
+[SetTimer](https://www.autohotkey.com/docs/v2/lib/SetTimer.htm) e
+[Sleep](https://www.autohotkey.com/docs/v2/lib/Sleep.htm) da documentação),
+então esse script apertava E umas 64 vezes por segundo. A importação mantém o
+que o script fazia lá: timer ou espera abaixo de 15,6 ms vira 15,6 ms (`Sleep 0`
+continua 0), e o relatório avisa. Mais rápido não ajudaria num jogo, que lê as
+teclas mais ou menos uma vez por quadro e enfileira o resto: no Roblox (Sober a
+60 fps, veja `tests/t_sober_kwin.py`) meio segundo de E a 1 ms continuou
+chegando por 18 segundos depois de desligar o macro. A 15,6 ms todo E ainda
+chega, só que a fila é bem menor, e a 33 ms não sobra nada. O editor de macro
+ainda aceita 1 ms (medido: mediana de 1,000 ms entre toques) para um programa
+que leia nesse ritmo.
 
 No terminal, `wayclick --import script.ahk --dry-run` mostra o mesmo relatório,
 e sem `--dry-run` acrescenta os macros na config (com o WayClick fechado, já
@@ -391,7 +400,11 @@ tecla serve; o campo avisa quando você escolhe uma que também digita, porque
 ela armaria e desarmaria toda vez que fosse apertada em qualquer lugar. `Esc`
 sempre para, com a janela em foco. **Esconder dos outros programas** continua
 armando e desarmando, mas a tecla não chega ao jogo, como o AutoHotkey esconde
-os atalhos dele; vem desligado, para nada mudar para quem já usa.
+os atalhos dele; vem desligado, para nada mudar para quem já usa. Quando um
+macro sem modificadores usa a mesma tecla (um script importado com o próprio
+`F8::`, por exemplo), a tecla é do macro enquanto os macros estão ligados, e o
+clique não arma por ela; a aba Atalhos e o relatório da importação avisam. Um
+macro em `Ctrl+F8` deixa o `F8` sozinho para o atalho de armar.
 
 Ele não é o gatilho. Armar faz o gatilho valer, e o gatilho é quem roda as
 coisas — que é o que permite "armar no F8 e rodar segurando o clique esquerdo"
@@ -617,7 +630,7 @@ também como o teste lê o que teria chegado ao compositor (veja
 
 ```bash
 python3 tests/t_ahk_import.py                       # o importador nos scripts de tests/ahk
-sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk a 1 ms, todos os modos, esconder, relay
+sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk a 15,6 e a 1 ms, todos os modos, esconder, relay
 sg input -c "python3 tests/t_hotkeys_ui.py"         # a aba Atalhos de ponta a ponta, config, --import
 sg input -c "python3 tests/t_hotkeys_dialogs.py"    # os editores de macro e de passo
 sg input -c "python3 tests/t_clicker_timing.py"     # período do Clicker e relay do teclado juntos
@@ -626,6 +639,7 @@ sg input -c "python3 tests/t_screen_ui.py"          # editor de passo, Escolher 
 sg input -c "python3 tests/t_abs_pointer_libinput.py"  # o ponteiro absoluto como o libinput lê
 python3 tests/t_screen_portal.py                    # o portal de verdade, dentro do bubblewrap
 python3 tests/bench_find_image.py                   # busca de imagem, acha ou não e com que rapidez
+python3 tests/t_sober_kwin.py                       # tudo isso contra o Roblox (Sober), num KWin aninhado
 ```
 
 O `t_screen_portal.py` roda o `xdg-desktop-portal` de verdade dentro do `bwrap`,
@@ -633,6 +647,25 @@ com D-Bus próprio, PipeWire próprio e um backend ScreenCast falso que serve
 telas sintéticas, então nenhum diálogo aparece e nada da sua tela é
 compartilhado. Ele precisa de `bwrap`, `dbus-run-session`, `pipewire` e
 `wireplumber`, e pula quando falta algum.
+
+O `t_sober_kwin.py` roda o WayClick contra a janela de um jogo de verdade. O
+`tests/kwin_nested.py` sobe um `kwin_wayland --virtual` aninhado, com duas
+telas, dentro do `bwrap`, com D-Bus próprio, PipeWire próprio com saída muda, o
+`xdg-desktop-portal-kde` de verdade (o teste responde o diálogo de
+compartilhar clicando nele) e uma ponte de entrada que entrega cada device
+virtual do WayClick só ao KWin aninhado. Um Sober novo abre ali, com HOME
+próprio em `/var/tmp` (do seu vêm só os APKs do Roblox e a versão, nada de
+conta), rede própria pelo `pasta` (pacote `passt`) e a menor prioridade de CPU
+e disco, então o seu Sober pode ficar aberto. O teclado falso só digita
+enquanto o WayClick de dentro da caixa diz que o segura e a captura dá
+ocupada. O teste importa scripts de `tests/ahk` e confere no formulário de
+login do Roblox, lendo o texto de volta pela área de transferência da caixa;
+roda os passos de tela na tela inicial do Roblox (imagem achada e clicada, cor
+de pixel, notificações, prints no webhook, abrir link); e passa pelo token de
+restauração e pelas escolhas do diálogo. Precisa do Sober com o Roblox já
+baixado uma vez, `pasta`, `bwrap`, `kwin_wayland`, `wl-clipboard` e
+`kscreen-doctor`, e pula quando falta algum (`WCTEST_PASTA=/caminho/do/pasta`
+usa um que não esteja instalado).
 
 Rode com `QT_QPA_PLATFORM=offscreen`. Os outros precisam do compositor; rode a
 partir da raiz do projeto:

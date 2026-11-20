@@ -16,12 +16,13 @@ import wayclick as a                                        # noqa: E402
 a.LANG = "en_US"
 HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ahk")
 CASES = {
-    "SpamE F1.ahk": (["F1, toggle, every 1 ms: Tap E"],
+    "SpamE F1.ahk": (["F1, toggle, every 15.6 ms: Tap E"],
                      ["rounds timers up to 10 or 15.6 ms"]),
     "v2_toggle.ahk": (["F2, toggle, every 50 ms: Tap Space"], []),
-    "v2_func.ahk": (["F1, toggle, every 1 ms: Tap E"], ["SetTimer 1 ms"]),
-    "ternary.ahk": (["F1, toggle, every 10 ms: Tap Q",
-                     "Ctrl+Shift+F2, toggle, every 1 ms: Tap Q"], []),
+    "v2_func.ahk": (["F1, toggle, every 15.6 ms: Tap E"], ["SetTimer 1 ms"]),
+    "ternary.ahk": (["F1, toggle, every 15.6 ms: Tap Q",
+                     "Ctrl+Shift+F2, toggle, every 15.6 ms: Tap Q"],
+                    ["SetTimer 10 ms"]),
     "braces_else.ahk": (["F1, toggle, every 25 ms: Tap E ×2, "
                          "Move to 100, 200, Click Left"],
                         ["measured them from the active window"]),
@@ -31,7 +32,8 @@ CASES = {
     "hold_loop.ahk": (["Left click, while held: Click Left, Wait 30 ms"],
                       ["clicks its own button"]),
     "loop_break.ahk": (["Side click, while held: Tap E, Wait 20 ms"], []),
-    "v1_gks.ahk": (["F6, while held: Tap R, Wait 5 ms"], []),
+    "v1_gks.ahk": (["F6, while held: Tap R, Wait 15.6 ms"],
+                   ["Sleep 5: on Windows AutoHotkey waits at least"]),
     "v2_hold.ahk": (["Extra click, while held: Click Left, Wait 40 to 60 ms",
                      "F1, once: Wait 500 ms, Tap F"], []),
     "keywait.ahk": (["F4, while held, no repeat: Hold Right button",
@@ -41,8 +43,8 @@ CASES = {
                    "Alt+A, once: Hold Left Ctrl, Tap C, Release Left Ctrl, "
                    "Wait 50 ms, …"], []),
     "stacked.ahk": (["F7, once: Tap X", "F8, once: Tap X",
-                     "Numpad +, once: Hold Left button, Wait 10 ms, "
-                     "Release Left button"], []),
+                     "Numpad +, once: Hold Left button, Wait 15.6 ms, "
+                     "Release Left button"], ["Sleep 10"]),
     "settimer_auto.ahk": (["no hotkey, always, every 60000 ms: Tap Space"],
                           ["starts with the script",
                            "ExitApp is not supported"]),
@@ -91,6 +93,31 @@ checks = [
     ("a big Loop count is cut to the step limit", len(a.AhkImport(
         "F1::\nLoop 100000\n{\nSend a\n}\nreturn\n").macros[0]["steps"])
      <= a.MAX_STEPS),
+    # tempo como no Windows: abaixo de um tique, um tique; acima, o pedido
+    ("SetTimer 16 stays 16 ms", a.AhkImport(
+        "F1::SetTimer, S, 16\nS:\nSend e\nreturn\n").macros[0]
+     ["period_ms"] == 16.0),
+    ("Sleep 0 waits nothing, Sleep 20 waits 20", [
+        st.get("ms") for st in a.AhkImport(
+            "F1::\nSend a\nSleep 0\nSend b\nSleep 20\nreturn\n")
+        .macros[0]["steps"] if st["op"] == "wait"] == [0.0, 20.0]),
+    ("Random 1 to 10 waits one tick", [
+        (st["ms"], st.get("max")) for st in a.AhkImport(
+            "F1::\nRandom, r, 1, 10\nSleep, %r%\nSend a\nreturn\n")
+        .macros[0]["steps"] if st["op"] == "wait"]
+     == [(a.AHK_TICK_MS, None)]),
+    ("the short Sleep note shows once per script", sum(
+        "waits at least" in a.note_text(n) for n in a.AhkImport(
+            "F1::\nSleep 1\nSend a\nSleep 2\nreturn\n").notes) == 1),
+    # um macro na tecla de armar o clique (F8 de fábrica) ganha aviso
+    ("an F8 macro warns about the F8 arm hotkey", "F8 is also the arm"
+     in a.import_report(a.import_ahk_file(os.path.join(HERE, "stacked.ahk")),
+                        "stacked.ahk", (a.KEYS["F8"], "F8"))),
+    ("Ctrl+F8, a disabled F8 or another key do not warn", not any(
+        a.arm_clash_text(ms, a.KEYS["F8"], "F8") for ms in (
+            [{"code": a.KEYS["F8"], "mods": ["ctrl"], "mode": "once"}],
+            [{"code": a.KEYS["F8"], "enabled": False, "mode": "once"}],
+            [{"code": a.KEYS["F7"], "mode": "once"}]))),
 ]
 for label, ok in checks:
     bad += not ok

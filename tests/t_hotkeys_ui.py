@@ -55,8 +55,8 @@ kbd.tap(K["F1"])
 pump(0.15)
 out.poll()
 taps = len(out.keys(K["E"], 1))
-check("F1 on the keyboard starts and stops it", 300 <= taps <= 500,
-      f"{taps} taps")
+check("F1 on the keyboard starts and stops it, every 15.6 ms like on "
+      "Windows", 20 <= taps <= 33, f"{taps} taps")
 check("status line and tab show it running",
       "⚡ SpamE" in status and "Running: SpamE" in state, f"{status!r}")
 check("and stop showing it after", "⚡" not in w.status.text()
@@ -119,6 +119,31 @@ check("hidden arm hotkey still arms and disarms", armed and not w.running,
 w.key_box.setChecked(False)
 check("and never reaches the app", not ck.keys(w.hk.code))
 
+# a tecla de armar igual à do macro: a aba avisa, e o aperto é do macro
+check("no clash warning while the keys differ", w.macro_clash.isHidden()
+      and not w.macro_clash.text())
+arm = (w.hk.code, w.hk.name)
+w.hk.set_key(K["F1"], "F1")
+pump(0.05)
+check("the Hotkeys tab warns when the arm hotkey is a macro's key",
+      not w.macro_clash.isHidden()
+      and "F1 is also the arm/disarm hotkey" in w.macro_clash.text(),
+      w.macro_clash.text()[:60])
+out.clear()
+kbd.tap(K["F1"])
+pump(0.3)
+armed = w.running
+kbd.tap(K["F1"])
+pump(0.15)
+out.poll()
+check("then F1 runs the macro and the clicker stays off",
+      not armed and not w.running and out.keys(K["E"], 1),
+      f"armed={armed} taps={len(out.keys(K['E'], 1))}")
+w.hk.set_key(*arm)
+pump(0.05)
+check("and the warning goes away with another arm hotkey",
+      w.macro_clash.isHidden())
+
 # tradução
 w._set_language("pt_BR")
 check("translated to Portuguese", "Atalhos" in w.tabs.tabText(2)
@@ -135,7 +160,8 @@ check("config keeps macros, the switch and the hidden hotkey",
 w2 = a.App()
 w2.sound.setChecked(False)
 check("a new start restores them", len(w2.macros) == 1
-      and w2.macros[0]["period_ms"] == 1.0 and w2.hk_block.isChecked()
+      and w2.macros[0]["period_ms"] == a.AHK_TICK_MS
+      and w2.hk_block.isChecked()
       and w2.engine.active)
 w2.cleanup()
 

@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.7.0
+Version:        1.7.1
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -76,6 +76,18 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Fri Nov 20 2026 gabrielmf1998 <noreply@github.com> - 1.7.1-1
+- Imported AutoHotkey timers and waits shorter than 15.6 ms run every
+  15.6 ms, like AutoHotkey on Windows, so a game that reads fewer keys per
+  second no longer keeps getting keys after the macro stops; the import
+  report says so
+- A hotkey macro on the arm/disarm key (F8 by default, common in game
+  scripts) takes that key while macros are on, and the clicker no longer
+  arms with it; the Hotkeys tab and the import report warn about it
+- New end to end test against Roblox (Sober) in a nested KWin with the real
+  KDE share dialog: imported scripts, image and pixel steps, webhook
+  screenshots, the restore token and every dialog choice
+
 * Fri Nov 20 2026 gabrielmf1998 <noreply@github.com> - 1.7.0-1
 - Screen steps in hotkey macros: go to an exact screen position and click,
   find an image on screen, check a pixel color, send a notification or a

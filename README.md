@@ -274,7 +274,7 @@ and skipped. `Click X, Y` and `MouseMove X, Y` become
 measured them from the active window, which is AutoHotkey's default.
 
 The script attached to the first request for this feature imports as *F1,
-toggle, every 1 ms, tap E*:
+toggle, every 15.6 ms, tap E*:
 
 ```ahk
 F1::
@@ -290,11 +290,19 @@ Send, e
 return
 ```
 
-One honest difference: on Windows, AutoHotkey rounds `SetTimer` up to 10 or
-15.6 ms, so that script really pressed E about 64 times a second. WayClick runs
-the 1 ms you asked for, 1,000 times a second (measured: median 1.000 ms between
-taps). The import report says so; raise the time in the macro if a game drops
-keys at that rate.
+Why 15.6 and not 1: on Windows, AutoHotkey rounds `SetTimer` periods and
+`Sleep` delays up to a multiple of 10 or 15.6 ms (the *Timer precision* notes
+in the [SetTimer](https://www.autohotkey.com/docs/v2/lib/SetTimer.htm) and
+[Sleep](https://www.autohotkey.com/docs/v2/lib/Sleep.htm) docs), so that
+script really pressed E about 64 times a second. The import keeps what the
+script did there: a timer or a wait under 15.6 ms becomes 15.6 ms (`Sleep 0`
+stays 0), and the report says so. Faster would not help in a game, which reads
+keys about once per frame and queues the rest: in Roblox (Sober at 60 fps, see
+`tests/t_sober_kwin.py`) half a second of E at 1 ms kept arriving for 18
+seconds after the macro was turned off. At 15.6 ms every E still arrives, the
+queue is just shorter, and at 33 ms nothing is left over. The macro editor
+still takes 1 ms (measured: median 1.000 ms between taps) for a program that
+reads that fast.
 
 From a terminal, `wayclick --import script.ahk --dry-run` prints the same
 report, and without `--dry-run` adds the macros to the config (with WayClick
@@ -386,7 +394,11 @@ when you pick one that also types, since it would arm and disarm every time you
 pressed it anywhere. `Esc` always stops when the window is focused.
 **Hide it from other apps** keeps arming and disarming but stops the key from
 reaching the game, the way AutoHotkey hides its hotkeys; off by default, so
-nothing changes for whoever already uses it.
+nothing changes for whoever already uses it. When a macro without modifiers
+uses the same key (an imported script with its own `F8::`, say), the macro
+gets the key while macros are enabled and the clicker is not armed by it; the
+Hotkeys tab and the import report warn about this. A `Ctrl+F8` macro leaves
+plain `F8` to the arm hotkey.
 
 It is not the trigger. Arming makes the trigger live, and the trigger is what
 runs things — which is what lets "arm with F8, run while holding left click"
@@ -607,7 +619,7 @@ root needed.
 
 ```bash
 python3 tests/t_ahk_import.py                       # the importer on the scripts in tests/ahk
-sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk at 1 ms, every mode, hiding, relay
+sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk at 15.6 and 1 ms, every mode, hiding, relay
 sg input -c "python3 tests/t_hotkeys_ui.py"         # the Hotkeys tab end to end, config, --import
 sg input -c "python3 tests/t_hotkeys_dialogs.py"    # the macro and step editors
 sg input -c "python3 tests/t_clicker_timing.py"     # Clicker period and keyboard relay together
@@ -616,6 +628,7 @@ sg input -c "python3 tests/t_screen_ui.py"          # step editor, Pick on scree
 sg input -c "python3 tests/t_abs_pointer_libinput.py"  # the absolute pointer as libinput reads it
 python3 tests/t_screen_portal.py                    # the real portal, inside bubblewrap
 python3 tests/bench_find_image.py                   # image search, found or not and how fast
+python3 tests/t_sober_kwin.py                       # all of it against Roblox (Sober), in a nested KWin
 ```
 
 `t_screen_portal.py` runs the real `xdg-desktop-portal` inside `bwrap` with
@@ -623,6 +636,25 @@ its own D-Bus, its own PipeWire and a fake ScreenCast backend that serves
 synthetic screens, so no dialog appears and nothing of your screen is shared.
 It needs `bwrap`, `dbus-run-session`, `pipewire` and `wireplumber`, and skips
 when one is missing.
+
+`t_sober_kwin.py` runs WayClick against a real game window. `tests/kwin_nested.py`
+starts a nested `kwin_wayland --virtual` with two screens inside `bwrap`, with
+its own D-Bus, its own PipeWire with a muted output, the real
+`xdg-desktop-portal-kde` (the test answers the share dialog by clicking it) and
+an input bridge that hands every WayClick virtual device to the nested KWin
+only. A fresh Sober opens in it with its own home in `/var/tmp` (only the
+Roblox APKs and the version string are copied from yours, no account data),
+its own network through `pasta` (package `passt`) and the lowest CPU and disk
+priority, so your own Sober can stay open. The fake keyboard only types while
+the WayClick inside the sandbox reports holding its grab and the grab is
+confirmed busy. The test imports `tests/ahk` scripts and checks them in the
+Roblox login form, reading the text back through the sandbox clipboard; runs
+the screen steps against the Roblox start screen (image found and clicked,
+pixel color, notifications, webhook screenshots, open link); and goes through
+the restore token and the dialog choices. It needs Sober with Roblox
+downloaded once, `pasta`, `bwrap`, `kwin_wayland`, `wl-clipboard` and
+`kscreen-doctor`, and skips when one is missing (`WCTEST_PASTA=/path/to/pasta`
+uses one that is not installed).
 
 Run them with `QT_QPA_PLATFORM=offscreen`. The rest need the compositor; run
 them from the project root:

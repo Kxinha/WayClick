@@ -1,9 +1,11 @@
 """Macros com atalho, no kernel, sem tocar no desktop (ver harness.py).
 
-Roda o SpamE F1.ahk do jeito que o AutoHotkey rodaria: F1 liga, F1 desliga,
-E a cada 1 ms, e o F1 nunca chega ao programa. Depois os outros modos:
-enquanto segura (botão lateral), uma vez por aperto com Ctrl, atalho que
-deixa a tecla passar (~), sempre ligado, remapeamento e o relay do hub.
+Roda o SpamE F1.ahk do jeito que o AutoHotkey rodaria no Windows: F1 liga, F1
+desliga, E a cada 15,6 ms (o tique do Windows), e o F1 nunca chega ao
+programa; editado para 1 ms, o mesmo macro roda a 1 kHz. Depois os outros
+modos: enquanto segura (botão lateral), uma vez por aperto com Ctrl, atalho
+que deixa a tecla passar (~), sempre ligado, remapeamento, o relay do hub e a
+tecla de armar o clique quando um macro usa a mesma.
 
     QT_QPA_PLATFORM=offscreen nice -n 19 python3 tests/t_hotkey_macros.py
 """
@@ -63,11 +65,32 @@ imp = a.import_ahk_file(os.path.join(HERE, "ahk", "SpamE F1.ahk"))
 check("SpamE F1.ahk becomes one macro", len(imp.macros) == 1,
       a.macro_summary(imp.macros[0]) if imp.macros else "none")
 m = imp.macros[0]
-check("F1, toggle, every 1 ms, tap E, F1 hidden",
+check("F1, toggle, every 15.6 ms like AutoHotkey on Windows, tap E, F1 hidden",
       (m["code"], m["mode"], m["repeat"], m["period_ms"], m["block"],
        [(s["op"], s["code"]) for s in m["steps"]])
-      == (F1, "toggle", True, 1.0, True, [("tap", E)]))
+      == (F1, "toggle", True, a.AHK_TICK_MS, True, [("tap", E)]))
 engine.configure(imp.macros, True)
+pump(0.1)
+ok_.clear()
+kbd.tap(F1)
+t_on = time.time()
+pump(0.6)
+kbd.tap(F1)
+t_off = time.time()
+pump(0.1)
+ok_.poll()
+downs = ok_.keys(E, 1)
+gaps = [(b[3] - a_[3]) * 1000 for a_, b in zip(downs, downs[1:])]
+check("imported, it taps E 64 times a second, like the script on Windows",
+      55 <= len(downs) / (t_off - t_on) <= 70 and gaps
+      and 15.3 <= statistics.median(gaps) <= 15.9,
+      f"{len(downs)} taps, median gap "
+      f"{statistics.median(gaps) if gaps else 0:.2f} ms")
+pump(0.1)
+
+# editado para 1 ms no macro, roda a 1 ms mesmo
+fast = a.normalize_macro(dict(m, period_ms=1.0))
+engine.configure([fast], True)
 pump(0.1)
 ck.clear(); ok_.clear()
 kbd.tap(F1)
@@ -235,6 +258,47 @@ kbd.tap(F6)
 pump(0.1)
 ck.poll()
 check("and passes again when not hidden", len(ck.keys(F6)) == 2)
+
+# ------------------------- macro na tecla de armar: o aperto é do macro --
+# um .ahk com F8 (a tecla de armar de fábrica) armava o clique junto com o
+# macro, e o clique saía sozinho no jogo
+w.shadow = engine.claims
+same = a.normalize_macro({"code": F6, "mode": "once",
+                          "steps": [{"op": "tap", "code": X}]})
+engine.configure([same], True)
+pump(0.1)
+seen.clear(); ok_.clear(); ck.clear()
+kbd.tap(F6)
+pump(0.1)
+ok_.poll(); ck.poll()
+check("a macro on the arm hotkey runs, and the clicker does not arm",
+      seen == [] and len(ok_.keys(X, 1)) == 1 and not ck.keys(F6),
+      f"arm {seen}, macro taps {len(ok_.keys(X, 1))}")
+engine.configure([same], False)
+pump(0.1)
+seen.clear()
+kbd.tap(F6)
+pump(0.1)
+check("with hotkey macros off, the key arms the clicker again",
+      seen == ["p", "r"], str(seen))
+held = a.normalize_macro({"code": F6, "mods": ["ctrl"], "mode": "once",
+                          "steps": [{"op": "tap", "code": X}]})
+engine.configure([held], True)
+pump(0.1)
+seen.clear(); ok_.clear()
+kbd.tap(F6)
+pump(0.1)
+kbd.key(CTRL, True)
+pump(0.02)
+kbd.tap(F6)
+pump(0.1)
+kbd.key(CTRL, False)
+pump(0.05)
+ok_.poll()
+check("a Ctrl+F6 macro takes Ctrl+F6 and leaves plain F6 to the clicker",
+      seen == ["p", "r"] and len(ok_.keys(X, 1)) == 1,
+      f"arm {seen}, macro taps {len(ok_.keys(X, 1))}")
+engine.configure([], False)
 w.stop()
 
 # --------------------------------- MouseHold pelo hub (modo segurar) --
