@@ -2,7 +2,7 @@
 """WayClick — autoclicker para Wayland via /dev/uinput (kernel), sem X11."""
 import base64, binascii, ctypes, fcntl, glob, grp, json, math, os, pwd
 import random, re, select
-import shlex, shutil, struct
+import shlex, shutil, socket, struct
 import signal, subprocess, sys, tempfile, threading, time, urllib.request
 import wave
 
@@ -32,7 +32,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -2656,7 +2656,7 @@ def normalize_macro(m):
     mode = m.get("mode") if m.get("mode") in MACRO_MODES else "toggle"
     steps = [x for x in (normalize_step(s) for s in (m.get("steps") or [])
                          if isinstance(m.get("steps"), list)) if x]
-    return {
+    out = {
         "id": str(m.get("id") or new_macro_id())[:16],
         "name": str(m.get("name") or "")[:60],
         "enabled": bool(m.get("enabled", True)),
@@ -2672,6 +2672,11 @@ def normalize_macro(m):
         "limit": _num(m.get("limit", 0), 0, 0, MAX_RUNS, int),
         "steps": steps[:MAX_STEPS],
     }
+    # joga dentro da Doca; a chave só existe quando ligada, então os macros
+    # de antes ficam iguais byte a byte
+    if m.get("dock") is True:
+        out["dock"] = True
+    return out
 
 
 def hotkey_label(m):
@@ -2821,6 +2826,8 @@ def macro_summary(m, limit=4):
         if m["repeat"] and m.get("limit"):
             parts.append(_("stop after {n} runs", n=m["limit"])
                          if m["limit"] > 1 else _("stop after 1 run"))
+    if m.get("dock"):
+        parts.append(_("in the Dock"))
     steps = [step_label(s) for s in m["steps"][:limit]]
     if len(m["steps"]) > limit:
         steps.append("…")
@@ -2866,6 +2873,7 @@ class CompiledMacro:
         self.limit = m.get("limit", 0) if loops else 0
         self.counters = tuple(dict.fromkeys(
             st["name"] for st in self.steps if st["op"] == "count"))
+        self.dock = bool(m.get("dock"))
 
 
 def _sees(st):
@@ -2964,6 +2972,9 @@ class MacroRunner(threading.Thread):
                 self._sleep(0.01)
             os.write(self.mouse.fd, _ev(EV_REL, lo, sign)
                      + _ev(EV_REL, hi, 120 * sign) + SYN)
+
+    def _open(self, url):
+        OPENER(url)
 
     # ------------------------------------------- ponteiro absoluto e tela --
     def _report(self, text):
@@ -3298,7 +3309,7 @@ class MacroRunner(threading.Thread):
         elif op == "notify":
             self._notify(st)
         elif op == "open":
-            OPENER(st["url"])
+            self._open(st["url"])
         elif op == "watch":
             every = st["every"] / 1000.0
             if st["kind"] == "window":
@@ -3389,6 +3400,7 @@ class MacroEngine(QObject):
         self.screen = None              # ScreenCapture
         self.workspace = None           # (x, y, w, h) lógico de todas as telas
         self.windows = None             # KWinBridge: find(texto, focar)
+        self.dock = None                # Dock: macros que jogam dentro dela
         self.hub = hub or HUB()
         self.lock = threading.Lock()
         self.active = False
@@ -3500,24 +3512,45 @@ class MacroEngine(QObject):
             if r:
                 r.stop()
                 self.toggled.emit(False)
-            else:
-                self._start(m)
+            elif self._start(m):
                 self.toggled.emit(True)
         elif not r:
             self._start(m)
 
     def _start(self, m, only_if_idle=False):
-        kb, mouse = self.outputs()
+        dock = self.dock if m.dock else None
+        if m.dock and (dock is None or not dock.alive()):
+            # o "sempre" tenta de novo sozinho quando a Doca abre; o atalho
+            # avisa, já que alguém apertou e nada aconteceu
+            if not only_if_idle:
+                self.report(f"{m.name}: " + _(
+                    "the Dock is not open, so the macro did not start."))
+            return None
+        kb, mouse = (None, None) if dock else self.outputs()
         loop = m.repeat and m.mode != "once"
         keep = not m.repeat and m.mode in ("toggle", "hold", "always")
         with self.lock:
             if only_if_idle and self._alive(m.id):
                 return None
-            r = MacroRunner(m, kb, mouse, loop, keep, self._done, env=self)
+            if dock:
+                r = DockRunner(m, dock, loop, keep, self._done,
+                               env=DockEnv(self, dock))
+            else:
+                r = MacroRunner(m, kb, mouse, loop, keep, self._done,
+                                env=self)
             self.runners[m.id] = r
         r.start()
         self.changed.emit()
         return r
+
+    def stop_dock(self):
+        """A Doca fechou: os macros dela param (o que dormia não ia notar
+        sozinho até o próximo passo)."""
+        with self.lock:
+            runners = [r for r in self.runners.values()
+                       if isinstance(r, DockRunner)]
+        for r in runners:
+            r.stop()
 
     def _done(self, r):
         with self.lock:
@@ -3828,7 +3861,8 @@ def farm_macro(spec):
         "key": spec.get("key") or "F6", "mods": spec.get("mods") or [],
         "mode": "toggle", "repeat": True, "period_ms": 0.0,
         "press_ms": spec.get("press_ms", 0.0), "block": True,
-        "limit": spec.get("limit", 0), "steps": steps})
+        "limit": spec.get("limit", 0), "steps": steps,
+        "dock": spec.get("dock") is True})
     if len(m["steps"]) != len(steps):
         # um passo incompleto sumiria e os saltos apontariam para o vizinho
         raise ValueError("a step is not complete")
@@ -5623,16 +5657,23 @@ class KWinBridge(QObject):
     O script JS roda dentro do compositor e devolve o resultado chamando um
     serviço D-Bus nosso — scripts do KWin podem fazer callDBus, mas não podem
     escrever em arquivo nem receber chamadas.
+
+    address: o D-Bus de outro KWin, o da Doca, em vez do da sessão. O script
+    dele chama callDBus no barramento dele, então o serviço nosso é
+    registrado lá também.
     """
     IFACE = "org.wayclick.Bridge"
 
-    def __init__(self):
+    def __init__(self, address=None):
         super().__init__()
         self.ok = False
         self.error = None
         self._reply = None
         self._calls = {}                # token -> [Event, resposta]
         self._calls_lock = threading.Lock()
+        self.address = address
+        self._bus_args = ("--address", address) if address else ("--session",)
+        self._conn_name = None
         try:
             from PySide6.QtDBus import QDBusConnection
         except ImportError:
@@ -5640,7 +5681,15 @@ class KWinBridge(QObject):
             return
         self.service = f"org.wayclick.Bridge{os.getpid()}"
         self.path = "/bridge"
-        bus = QDBusConnection.sessionBus()
+        if address:
+            self._conn_name = "wayclick-" + os.urandom(4).hex()
+            bus = QDBusConnection.connectToBus(address, self._conn_name)
+            if not bus.isConnected():
+                self.error = "could not reach the D-Bus at " + address
+                return
+        else:
+            bus = QDBusConnection.sessionBus()
+        self.bus = bus
         if not (bus.registerService(self.service)
                 and bus.registerObject(self.path, self.IFACE, self,
                                        QDBusConnection.ExportAllSlots)):
@@ -5648,8 +5697,30 @@ class KWinBridge(QObject):
             return
         self.script = os.path.join(
             os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(),
-            f"wayclick-kwin-{os.getpid()}.js")
+            f"wayclick-kwin-{'dock-' if address else ''}{os.getpid()}.js")
         self.ok = True
+
+    def has_kwin(self):
+        """O KWin deste barramento já está nele (a Doca leva um instante)."""
+        try:
+            r = self.bus.interface().isServiceRegistered("org.kde.KWin")
+            return bool(r.value() if hasattr(r, "value") else r)
+        except Exception:                          # noqa: BLE001
+            return False
+
+    def close(self):
+        """Sai do barramento da Doca (o da sessão fica com o app)."""
+        self.ok = False
+        if self._conn_name:
+            from PySide6.QtDBus import QDBusConnection
+            try:
+                self.bus.unregisterObject(self.path)
+                self.bus.unregisterService(self.service)
+            except Exception:                      # noqa: BLE001
+                pass
+            QDBusConnection.disconnectFromBus(self._conn_name)
+            self._conn_name = None
+        self.cleanup()
 
     @Slot(str)
     def reply(self, payload):
@@ -5683,8 +5754,9 @@ class KWinBridge(QObject):
         def gdbus(*args):
             try:
                 return subprocess.run(
-                    ("gdbus", "call", "--session", "-d", "org.kde.KWin")
-                    + args, capture_output=True, text=True, timeout=5)
+                    ("gdbus", "call") + self._bus_args
+                    + ("-d", "org.kde.KWin") + args,
+                    capture_output=True, text=True, timeout=5)
             except (OSError, subprocess.SubprocessError):
                 return None
         loaded = False
@@ -5759,17 +5831,18 @@ class KWinBridge(QObject):
                                "iface": self.IFACE, "target": self._target})
         except OSError:
             return None
+        bus = self._bus_args
         run = lambda *a: subprocess.run(a, capture_output=True, text=True)
-        run("gdbus", "call", "--session", "-d", "org.kde.KWin", "-o",
+        run("gdbus", "call", *bus, "-d", "org.kde.KWin", "-o",
             "/Scripting", "-m", "org.kde.kwin.Scripting.unloadScript", "wayclick")
-        r = run("gdbus", "call", "--session", "-d", "org.kde.KWin", "-o",
+        r = run("gdbus", "call", *bus, "-d", "org.kde.KWin", "-o",
                 "/Scripting", "-m", "org.kde.kwin.Scripting.loadScript",
                 self.script, "wayclick")
         sid = "".join(c for c in r.stdout if c.isdigit())
         if not sid:
             self.error = "KWin refused the script (is this KWin?)"
             return None
-        run("gdbus", "call", "--session", "-d", "org.kde.KWin", "-o",
+        run("gdbus", "call", *bus, "-d", "org.kde.KWin", "-o",
             f"/Scripting/Script{sid}", "-m", "org.kde.kwin.Script.run")
         deadline = time.perf_counter() + timeout
         app = QApplication.instance()
@@ -5812,6 +5885,1160 @@ def KWIN():
     if _KWIN is None:
         _KWIN = KWinBridge()
     return _KWIN
+
+
+# ------------------------------------------------------------- a Doca --
+# O jogo numa tela só do WayClick, como o Tower Defense Macro do Windows faz
+# ao encaixar a janela do Roblox dentro da dele. No Wayland um programa não
+# entra na janela de outro, então a Doca é um compositor inteiro: um
+# kwin_wayland em janela (o backend Wayland do KWin), com D-Bus e
+# configuração próprios, e o jogo aberto dentro dele. Os macros da Doca
+# entram pelo fake_input do KWin dela e olham a tela pelo ScreenShot2 dela:
+# o cursor e o teclado de verdade ficam livres, não há pergunta de
+# compartilhar a tela, e a janela da Doca pode ficar atrás das outras ou
+# minimizada. Medido no KWin 6.8.3: o jogo dentro seguiu a 60 quadros por
+# segundo coberto e minimizado, recebeu teclas e cliques com o foco do
+# desktop em outra janela, e cada captura de 1280x720 levou uns 7 ms.
+DOCK_SOCKET = "wayland-wayclick-dock"
+DOCK_GAME = "flatpak run org.vinegarhq.Sober"
+DOCK_SIZES = ((1280, 720), (1366, 768), (1600, 900), (1920, 1080),
+              (1024, 576), (800, 600))
+DOCK_START_S = 20.0          # quanto esperar o KWin da Doca subir
+DOCK_FIX_MS = 700            # redimensionada, a janela volta ao tamanho
+DOCK_FIX_TRIES = 3           # depois disso desiste (tela menor que a Doca)
+# kwinrc da Doca: janela maximizada sem borda (o jogo enche a tela dela),
+# janela nova já maximizada, e nada de canto quente nem Visão geral, que um
+# macro com o cursor no canto abriria em vez de clicar
+DOCK_KWINRC = """[Windows]
+BorderlessMaximizedWindows=true
+Placement=Maximizing
+
+[Plugins]
+overviewEnabled=false
+windowviewEnabled=false
+
+[Effect-overview]
+BorderActivate=9
+
+[ElectricBorders]
+Bottom=None
+BottomLeft=None
+BottomRight=None
+Left=None
+Right=None
+Top=None
+TopLeft=None
+TopRight=None
+"""
+DOCK_KDEGLOBALS = "[KDE]\nAnimationDurationFactor=0\n"
+# o layout do teclado, a repetição e o tema do cursor são os de quem usa:
+# só estes arquivos vêm copiados da configuração do desktop
+DOCK_COPY = ("kxkbrc", "kcminputrc")
+# D-Bus da Doca: a política do session.conf (manda, recebe e registra
+# qualquer nome), sem pasta de serviços, então nada da sessão sobe nele
+DOCK_BUS_CONF = """<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <keep_umask/>
+  <listen>unix:path=%s</listen>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"""
+# a janela da Doca no desktop de quem usa, achada pelo pid do KWin dela:
+# volta ao tamanho escolhido e, com show, vem para a frente
+DOCK_HOST_JS = """
+var ws = workspace.windowList ? workspace.windowList() : workspace.clientList();
+var out = {found: false};
+for (var i = 0; i < ws.length; i++) {
+  var w = ws[i];
+  if (w.pid !== %(pid)s) continue;
+  out.found = true;
+  if (%(fix)s) {
+    if (w.fullScreen) w.fullScreen = false;
+    if (w.setMaximize) w.setMaximize(false, false);
+    var f = w.frameGeometry, c = w.clientGeometry;
+    w.frameGeometry = {x: f.x, y: f.y, width: %(w)s + f.width - c.width,
+                       height: %(h)s + f.height - c.height};
+  }
+  if (%(show)s) {
+    if (w.minimized) w.minimized = false;
+    workspace.activeWindow = w;
+  }
+  out.w = w.clientGeometry.width;
+  out.h = w.clientGeometry.height;
+  out.minimized = w.minimized === true;
+  break;
+}
+callDBus("%(svc)s", "%(path)s", "%(iface)s", "answer",
+         "%(token)s " + JSON.stringify(out));
+"""
+
+
+SOBER_TWICE = ("Sober is already open outside the Dock, and it opens one "
+               "copy at a time. Close it, then press Start the game.")
+
+
+class DockError(Exception):
+    """A Doca não abriu; a mensagem diz por quê."""
+
+
+def _is_wayclick(pid):
+    """O processo existe e é um WayClick (a linha de comando diz)."""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
+            return b"wayclick" in fh.read().lower()
+    except (OSError, ValueError):
+        return False
+
+
+def _ppid(pid):
+    """O pai de um processo, pelo /proc (None se ele já saiu)."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+class WaylandLink:
+    """Cliente Wayland mínimo, só socket e struct (sem libwayland): registro,
+    as telas em coordenadas lógicas (xdg_output) e pedidos crus. Uma thread
+    lê os eventos; enviar serve a qualquer thread. A Doca usa um para o
+    fake_input do KWin dela e para saber quando a tela dela mudou de
+    tamanho."""
+
+    def __init__(self, path, on_output=None, on_close=None):
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.s.settimeout(5.0)
+        self.s.connect(path)
+        self.lock = threading.Lock()
+        self._next = 2
+        self.globals = {}            # nome -> (interface, versão)
+        self.handlers = {1: self._display_ev}
+        self.errors = []
+        self.outputs = {}            # id do wl_output -> {"x","y","w","h"}
+        self.on_output, self.on_close = on_output, on_close
+        self.closed = False
+        self._xom = None
+        self.reg = self.new_id()
+        self.handlers[self.reg] = self._registry_ev
+        self.send(1, 1, self.u(self.reg))
+        self._reader = threading.Thread(target=self._read_loop, daemon=True,
+                                        name="wayclick-dock-wayland")
+        self._reader.start()
+        if not self.sync():
+            self.close()
+            raise OSError("the compositor did not answer")
+        self._xom, _v = self.bind("zxdg_output_manager_v1", 3)
+        for gname, (iface, _v) in list(self.globals.items()):
+            if iface == "wl_output":
+                self._add_output(gname)
+        self.sync()
+
+    # ---- formato do fio
+    @staticmethod
+    def u(v):
+        return struct.pack("<I", v & 0xffffffff)
+
+    @staticmethod
+    def fixed(v):
+        return struct.pack("<i", int(round(v * 256)))
+
+    @staticmethod
+    def string(t):
+        b = t.encode() + b"\0"
+        return struct.pack("<I", len(b)) + b + b"\0" * ((4 - len(b) % 4) % 4)
+
+    @staticmethod
+    def _str_at(p, off):
+        n = struct.unpack_from("<I", p, off)[0]
+        return p[off + 4:off + 4 + n - 1].decode("utf-8", "replace")
+
+    def new_id(self):
+        with self.lock:
+            n = self._next
+            self._next += 1
+        return n
+
+    def send(self, obj, opcode, payload=b""):
+        if self.closed:
+            raise BrokenPipeError("the Dock is closed")
+        msg = struct.pack("<II", obj, ((8 + len(payload)) << 16) | opcode) \
+            + payload
+        with self.lock:
+            try:
+                self.s.sendall(msg)
+            except OSError:
+                self.closed = True
+                raise
+
+    def sync(self, timeout=5.0):
+        """Espera o compositor ter lido tudo o que foi mandado antes."""
+        done = threading.Event()
+        cb = self.new_id()
+        self.handlers[cb] = lambda op, p: done.set()
+        try:
+            self.send(1, 0, self.u(cb))
+        except OSError:
+            return False
+        ok = done.wait(timeout)
+        self.handlers.pop(cb, None)
+        return ok
+
+    def bind(self, iface, version=None, name=None):
+        for gname, (i, v) in list(self.globals.items()):
+            if i == iface and (name is None or gname == name):
+                ver = min(v, version or v)
+                oid = self.new_id()
+                self.send(self.reg, 0, self.u(gname) + self.string(iface)
+                          + self.u(ver) + self.u(oid))
+                return oid, ver
+        return None, 0
+
+    def close(self):
+        self.closed = True
+        try:
+            self.s.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+    # ---- eventos (thread de leitura)
+    def _display_ev(self, op, p):
+        if op == 0:
+            oid, code = struct.unpack_from("<II", p)
+            self.errors.append((oid, code, self._str_at(p, 8)))
+
+    def _registry_ev(self, op, p):
+        if op == 0:
+            name = struct.unpack_from("<I", p)[0]
+            iface = self._str_at(p, 4)
+            n = struct.unpack_from("<I", p, 4)[0]
+            ver = struct.unpack_from("<I", p, 8 + n + (4 - n % 4) % 4)[0]
+            self.globals[name] = (iface, ver)
+            if iface == "wl_output" and self._xom:
+                self._add_output(name)
+        elif op == 1:
+            name = struct.unpack_from("<I", p)[0]
+            self.globals.pop(name, None)
+            for oid, o in list(self.outputs.items()):
+                if o.get("global") == name:
+                    del self.outputs[oid]
+
+    def _add_output(self, gname):
+        out, _v = self.bind("wl_output", 4, name=gname)
+        if not out:
+            return
+        rec = {"global": gname, "x": 0, "y": 0, "w": 0, "h": 0}
+        self.outputs[out] = rec
+        self.handlers[out] = lambda op, p: None
+        if not self._xom:
+            return
+        xo = self.new_id()
+        self.send(self._xom, 1, self.u(xo) + self.u(out))
+
+        def ev(op, p):
+            if op == 0:
+                rec["x"], rec["y"] = struct.unpack_from("<ii", p)
+            elif op == 1:
+                size = struct.unpack_from("<ii", p)
+                if size != (rec["w"], rec["h"]):
+                    rec["w"], rec["h"] = size
+                    if self.on_output:
+                        self.on_output(*size)
+        self.handlers[xo] = ev
+
+    def size(self):
+        """Largura e altura lógicas da tela (a Doca tem uma só)."""
+        outs = [o for o in self.outputs.values() if o["w"] and o["h"]]
+        if not outs:
+            return None
+        return (max(o["x"] + o["w"] for o in outs)
+                - min(o["x"] for o in outs),
+                max(o["y"] + o["h"] for o in outs)
+                - min(o["y"] for o in outs))
+
+    def _read_loop(self):
+        buf = b""
+        try:
+            while not self.closed:
+                try:
+                    data = self.s.recv(1 << 16)
+                except socket.timeout:
+                    continue
+                if not data:
+                    break
+                buf += data
+                while len(buf) >= 8:
+                    obj, word = struct.unpack_from("<II", buf)
+                    size = word >> 16
+                    if size < 8 or len(buf) < size:
+                        break
+                    p, buf = buf[8:size], buf[size:]
+                    h = self.handlers.get(obj)
+                    if h:
+                        try:
+                            h(word & 0xffff, p)
+                        except (struct.error, OSError):
+                            pass
+        except OSError:
+            pass
+        self.closed = True
+        if self.on_close:
+            self.on_close()
+
+
+class DockInput:
+    """Teclas, botões, roda e movimento para dentro da Doca, pelo
+    org_kde_kwin_fake_input do KWin dela. Os códigos são os do evdev, como
+    os do resto do app. O cursor e o teclado de verdade não mexem."""
+    AUTH, REL, BUTTON, AXIS, ABS, KEY = 0, 1, 2, 3, 9, 10
+
+    def __init__(self, link):
+        self.link = link
+        self.id, self.version = link.bind("org_kde_kwin_fake_input", 6)
+        if not self.id:
+            raise OSError("the Dock compositor has no fake input")
+        link.send(self.id, self.AUTH, link.string("WayClick")
+                  + link.string("macros that play in the Dock"))
+
+    def key(self, code, down):
+        self.link.send(self.id, self.KEY, self.link.u(code)
+                       + self.link.u(1 if down else 0))
+
+    def button(self, code, down):
+        self.link.send(self.id, self.BUTTON, self.link.u(code)
+                       + self.link.u(1 if down else 0))
+
+    def axis(self, axis, value):
+        """axis 0 é a roda vertical, 1 a horizontal; positivo desce ou vai
+        para a direita."""
+        self.link.send(self.id, self.AXIS, self.link.u(axis)
+                       + self.link.fixed(value))
+
+    def move(self, dx, dy):
+        """Movimento relativo, sem aceleração: dx pixels são dx pixels. É o
+        que move a câmera de um jogo com o ponteiro travado."""
+        self.link.send(self.id, self.REL, self.link.fixed(dx)
+                       + self.link.fixed(dy))
+
+    def absolute(self, x, y):
+        self.link.send(self.id, self.ABS, self.link.fixed(x)
+                       + self.link.fixed(y))
+
+
+class DockPointer:
+    """O ponteiro absoluto dos passos de tela, dentro da Doca: o mesmo
+    papel do AbsolutePointer, com as coordenadas da tela dela."""
+
+    def __init__(self, inp):
+        self.inp = inp
+        self.pos = None
+
+    def warp(self, x, y, ws=None):
+        # no meio do pixel, como o AbsolutePointer mira
+        self.inp.absolute(x + 0.5, y + 0.5)
+        self.pos = (x, y)
+
+    def button(self, code, down):
+        self.inp.button(code, down)
+
+
+class DockScreen:
+    """A tela da Doca para os passos de imagem e cor: um ScreenShot2 do KWin
+    dela a cada pedido, sem portal e sem pergunta. A mesma cara da
+    ScreenCapture (ensure, acquire, release, frames), então o MacroRunner
+    não sabe a diferença."""
+    CACHE_S = 0.03           # vigias que olham juntos dividem uma captura
+
+    def __init__(self, dock):
+        self.dock = dock
+        self.lock = threading.Lock()
+        self.state, self.error = "off", ""
+        self.users = 0
+        self._bus = None
+        self._cache = (0.0, [])
+
+    def _connect(self):
+        if not self.dock.alive():
+            raise VisionError(_("The Dock is not open."))
+        _numpy()
+        try:
+            import gi
+            gi.require_version("Gio", "2.0")
+            from gi.repository import Gio, GLib
+        except (ImportError, ValueError):
+            raise VisionError(_("Image and color steps need PyGObject.")
+                              + "\n" + DEPS_HINT) from None
+        if self._bus is None or self._bus.is_closed():
+            self._bus = Gio.DBusConnection.new_for_address_sync(
+                self.dock.bus_address(),
+                Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+                | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+        return Gio, GLib
+
+    def ensure(self, timeout=None):
+        with self.lock:
+            try:
+                self._connect()
+            except VisionError as e:
+                self.state, self.error = "failed", str(e)
+                return False
+            except Exception as e:                 # noqa: BLE001
+                self.state = "failed"
+                self.error = _("Screen capture failed: {err}",
+                               err=getattr(e, "message", None) or str(e))
+                return False
+            self.state, self.error = "on", ""
+            return True
+
+    def start(self):
+        self.ensure()
+
+    def acquire(self):
+        with self.lock:
+            self.users += 1
+
+    def release(self):
+        with self.lock:
+            self.users = max(0, self.users - 1)
+
+    def stop(self, join=True):
+        with self.lock:
+            bus, self._bus = self._bus, None
+            self.state = "off"
+            self._cache = (0.0, [])
+        if bus is not None:
+            try:
+                bus.close_sync(None)
+            except Exception:                      # noqa: BLE001
+                pass
+
+    def frames(self):
+        with self.lock:
+            now = time.monotonic()
+            if self._cache[1] and now - self._cache[0] < self.CACHE_S:
+                return list(self._cache[1])
+            try:
+                frame = self._shot()
+            except VisionError as e:
+                self.state, self.error = "failed", str(e)
+                return []
+            except Exception as e:                 # noqa: BLE001
+                self.state = "failed"
+                self.error = _("Screen capture failed: {err}",
+                               err=getattr(e, "message", None) or str(e))
+                return []
+            self.state, self.error = "on", ""
+            self._cache = (now, [frame])
+            return [frame]
+
+    def _shot(self):
+        Gio, GLib = self._connect()
+        np = _numpy()
+        r, w = os.pipe()
+        fdl = Gio.UnixFDList.new()
+        idx = fdl.append(w)
+        os.close(w)
+        opts = {"include-cursor": GLib.Variant("b", False),
+                "native-resolution": GLib.Variant("b", True)}
+        try:
+            try:
+                res, _out = self._bus.call_with_unix_fd_list_sync(
+                    "org.kde.KWin", "/org/kde/KWin/ScreenShot2",
+                    "org.kde.KWin.ScreenShot2", "CaptureWorkspace",
+                    GLib.Variant("(a{sv}h)", (opts, idx)),
+                    GLib.VariantType.new("(a{sv})"), Gio.DBusCallFlags.NONE,
+                    10000, fdl, None)
+            finally:
+                for fd in fdl.steal_fds():
+                    os.close(fd)
+            meta = res.unpack()[0]
+            chunks, end = [], time.monotonic() + 10.0
+            while True:
+                if not select.select([r], [], [], max(0.0, end
+                                                      - time.monotonic()))[0]:
+                    raise VisionError(_("The Dock did not send its screen."))
+                c = os.read(r, 1 << 20)
+                if not c:
+                    break
+                chunks.append(c)
+        finally:
+            os.close(r)
+        W, H, stride = int(meta["width"]), int(meta["height"]), \
+            int(meta["stride"])
+        data = b"".join(chunks)
+        if W <= 0 or H <= 0 or len(data) < stride * H:
+            raise VisionError(_("The Dock did not send its screen."))
+        a = np.frombuffer(data, np.uint8)[:stride * H]
+        a = a.reshape(H, stride)[:, :W * 4].reshape(H, W, 4)
+        # QImage: RGB32 e ARGB32 (4, 5, 6) são B, G, R, A na memória;
+        # RGBX8888 e RGBA8888 (16, 17, 18), R, G, B, A
+        rgb = a[..., [2, 1, 0]] if meta.get("format") in (4, 5, 6) \
+            else a[..., :3]
+        lw, lh = self.dock.out_size or (W, H)
+        return Frame(np.ascontiguousarray(rgb), 0, 0, lw, lh)
+
+
+def _desktop_entry_field(path, key):
+    """Um campo do grupo [Desktop Entry] (não o de uma ação)."""
+    group = None
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("["):
+                    group = line
+                elif group == "[Desktop Entry]" and line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def desktop_argv(exec_line, url):
+    """A linha Exec de um .desktop com o link no lugar de %u, como o
+    lançador do desktop faria; None se não der para ler."""
+    try:
+        parts = shlex.split(exec_line)
+    except ValueError:
+        return None
+    out = []
+    for part in parts:
+        if part in ("%u", "%U", "%f", "%F"):
+            out.append(url)
+            continue
+        if part in ("%i", "%c", "%k"):
+            continue
+        part = re.sub(r"%[a-zA-Z]", "", part.replace("%%", "\0"))
+        part = part.replace("\0", "%")
+        if part:
+            out.append(part)
+    return out or None
+
+
+def scheme_handler(url):
+    """Quem o desktop usa para abrir um link roblox:// (ou outro esquema): a
+    linha de comando, já com o link, ou None."""
+    scheme = url.split(":", 1)[0].lower()
+    if not re.fullmatch(r"[a-z][a-z0-9+.-]*", scheme):
+        return None
+    try:
+        r = subprocess.run(["xdg-mime", "query", "default",
+                            "x-scheme-handler/" + scheme],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    name = r.stdout.strip()
+    if not name.endswith(".desktop") or "/" in name:
+        return None
+    dirs = [os.environ.get("XDG_DATA_HOME")
+            or os.path.expanduser("~/.local/share")]
+    dirs += (os.environ.get("XDG_DATA_DIRS")
+             or "/usr/local/share:/usr/share").split(":")
+    for d in dirs:
+        path = os.path.join(d, "applications", name)
+        if d and os.path.isfile(path):
+            line = _desktop_entry_field(path, "Exec")
+            return desktop_argv(line, url) if line else None
+    return None
+
+
+class Dock(QObject):
+    """A Doca: um KWin só do WayClick, numa janela, com o jogo dentro.
+
+    start() sobe um D-Bus próprio, o kwin_wayland em janela (tamanho fixo,
+    configuração numa pasta própria: ele grava a configuração de telas lá, e
+    não na do desktop) e, se houver comando, o jogo, com WAYLAND_DISPLAY
+    apontando para a Doca e o resto do ambiente de quem usa (o D-Bus da
+    sessão inclusive, então portais e chaveiro funcionam como sempre).
+    stop() fecha o KWin dela, e com ele o jogo. Vive na thread da UI; os
+    macros só usam input, pointer, screen, windows e open, de qualquer
+    thread.
+    """
+    changed = Signal()
+    _sized = Signal(int, int)
+    _lost = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.size = DOCK_SIZES[0]
+        self.command = DOCK_GAME
+        self.state, self.error = "off", ""
+        self.note = ""                   # aviso que não impede a Doca
+        self.kwin = self.bus_proc = None
+        self.games = []
+        self.link = self.input = self.pointer = self.windows = None
+        self.screen = DockScreen(self)
+        self.out_size = None
+        self._fixes = 0
+        self._log = None
+        self._own = False                # a pasta da Doca é desta vez
+        self._sized.connect(self._on_sized, Qt.QueuedConnection)
+        self._lost.connect(self._check, Qt.QueuedConnection)
+        self._fix_timer = QTimer(self)
+        self._fix_timer.setSingleShot(True)
+        self._fix_timer.setInterval(DOCK_FIX_MS)
+        self._fix_timer.timeout.connect(self._fix)
+        self._poll = QTimer(self)
+        self._poll.setInterval(1000)
+        self._poll.timeout.connect(self._check)
+        self._game_alive = False
+
+    # ---------------------------------------------------------- lugares --
+    @staticmethod
+    def runtime():
+        return os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+
+    def folder(self):
+        return os.path.join(self.runtime(), "wayclick-dock")
+
+    def bus_address(self):
+        return "unix:path=" + os.path.join(self.folder(), "bus")
+
+    def socket_path(self):
+        return os.path.join(self.runtime(), DOCK_SOCKET)
+
+    # ------------------------------------------------------------ estado --
+    def alive(self):
+        # os macros perguntam das threads deles: nada de ler o atributo duas
+        # vezes enquanto a UI fecha a Doca
+        kwin, link = self.kwin, self.link
+        return (self.state == "on" and kwin is not None
+                and kwin.poll() is None and link is not None
+                and not link.closed)
+
+    def game_running(self):
+        self.games = [p for p in self.games if p.poll() is None]
+        return bool(self.games)
+
+    def missing(self):
+        """O que falta neste computador para a Doca, ou ""."""
+        if not os.environ.get("WAYLAND_DISPLAY"):
+            return _("The Dock needs a Wayland session of KDE Plasma.")
+        if not shutil.which("kwin_wayland"):
+            return _("The Dock needs KWin (kwin_wayland), the compositor of "
+                     "KDE Plasma.")
+        if not shutil.which("dbus-daemon"):
+            return _("The Dock needs dbus-daemon (the dbus or dbus-daemon "
+                     "package).")
+        return ""
+
+    # ------------------------------------------------------------- abrir --
+    def start(self, launch=True):
+        """Abre a Doca (e o jogo, com launch). Na thread da UI; volta em
+        menos de um segundo, quando o KWin dela responde."""
+        if self.state == "starting":
+            return False
+        if self.alive():
+            if launch and not self.game_running():
+                self.launch()
+            return True
+        self._teardown()
+        why = self.missing()
+        if why:
+            self.state, self.error = "failed", why
+            self.changed.emit()
+            return False
+        self.state, self.error, self.note = "starting", "", ""
+        self.changed.emit()
+        try:
+            self._spawn()
+        except (DockError, OSError) as e:
+            log = self._log_tail()
+            self._teardown()
+            self.state = "failed"
+            self.error = str(e) + (("\n" + log) if log else "")
+            self.changed.emit()
+            return False
+        self.state = "on"
+        self._fixes = 0
+        self._poll.start()
+        self.changed.emit()
+        if launch and self.command.strip():
+            self.launch()
+        return True
+
+    def _write(self, path, text):
+        with open(path, "w") as fh:
+            fh.write(text)
+
+    def _spawn(self):
+        d = self.folder()
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+        self._reap_stale()
+        self._own = True
+        cfg = os.path.join(d, "config")
+        os.makedirs(cfg, exist_ok=True)
+        self._write(os.path.join(cfg, "kwinrc"), DOCK_KWINRC)
+        self._write(os.path.join(cfg, "kdeglobals"), DOCK_KDEGLOBALS)
+        for name in DOCK_COPY:
+            src, dst = os.path.join(XDG_CONFIG, name), os.path.join(cfg, name)
+            try:
+                shutil.copyfile(src, dst)
+            except OSError:
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+        bus_path = os.path.join(d, "bus")
+        try:
+            os.remove(bus_path)
+        except OSError:
+            pass
+        esc = bus_path.replace("&", "&amp;").replace("<", "&lt;") \
+            .replace(">", "&gt;")
+        conf = os.path.join(d, "bus.conf")
+        self._write(conf, DOCK_BUS_CONF % esc)
+        self._log = open(os.path.join(d, "dock.log"), "wb")
+        self.bus_proc = subprocess.Popen(
+            ["dbus-daemon", "--config-file=" + conf, "--nofork",
+             "--nopidfile", "--nosyslog"], stdin=subprocess.DEVNULL,
+            stdout=self._log, stderr=subprocess.STDOUT, start_new_session=True)
+        if not self._wait(lambda: os.path.exists(bus_path), 5.0,
+                          self.bus_proc):
+            raise DockError(_("The D-Bus of the Dock did not start."))
+        env = dict(os.environ)
+        for k in ("DISPLAY", "WAYLAND_SOCKET", "XDG_ACTIVATION_TOKEN",
+                  "DESKTOP_STARTUP_ID", "QT_QPA_PLATFORM"):
+            env.pop(k, None)
+        env.update(DBUS_SESSION_BUS_ADDRESS=self.bus_address(),
+                   XDG_CONFIG_HOME=cfg,
+                   XDG_STATE_HOME=os.path.join(d, "state"),
+                   XDG_CACHE_HOME=os.path.join(d, "cache"))
+        w, h = self.size
+        self.kwin = subprocess.Popen(
+            ["kwin_wayland", "--wayland-display",
+             os.environ["WAYLAND_DISPLAY"], "--socket", DOCK_SOCKET,
+             "--width", str(int(w)), "--height", str(int(h)),
+             "--no-lockscreen", "--no-global-shortcuts", "--no-kactivities"],
+            env=env, stdin=subprocess.DEVNULL, stdout=self._log,
+            stderr=subprocess.STDOUT, start_new_session=True)
+        self._write(os.path.join(d, "pids"), f"{self.kwin.pid} "
+                    f"{self.bus_proc.pid} {os.getpid()}\n")
+        self.windows = KWinBridge(self.bus_address())
+        if not self.windows.ok:
+            raise DockError(self.windows.error or "D-Bus")
+        sock = self.socket_path()
+        if not self._wait(lambda: os.path.exists(sock)
+                          and self.windows.has_kwin(), DOCK_START_S,
+                          self.kwin):
+            raise DockError(_("The KWin of the Dock did not start."))
+        self.link = WaylandLink(sock, on_output=self._sized.emit,
+                                on_close=self._lost.emit)
+        self.input = DockInput(self.link)
+        self.pointer = DockPointer(self.input)
+        self.out_size = self.link.size() or (int(w), int(h))
+
+    def _wait(self, cond, seconds, proc=None):
+        app = QApplication.instance()
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if cond():
+                return True
+            if proc is not None and proc.poll() is not None:
+                return False
+            if app is not None and \
+                    threading.current_thread() is threading.main_thread():
+                app.processEvents()
+            time.sleep(0.02)
+        return cond()
+
+    def _log_tail(self, n=600):
+        try:
+            with open(os.path.join(self.folder(), "dock.log"), "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - n))
+                return fh.read().decode("utf-8", "replace").strip()
+        except OSError:
+            return ""
+
+    def _reap_stale(self):
+        """Fecha a Doca que um WayClick que caiu deixou aberta. Só mata o que
+        é dela: o pid gravado, se a linha de comando ainda for a da Doca. A
+        de um WayClick que ainda está aberto fica, e esta não abre."""
+        path = os.path.join(self.folder(), "pids")
+        try:
+            with open(path) as fh:
+                nums = [int(x) for x in fh.read().split()[:3]]
+        except (OSError, ValueError):
+            return
+        pids, owner = nums[:2], (nums[2] if len(nums) > 2 else 0)
+        if owner and owner != os.getpid() and _is_wayclick(owner):
+            raise DockError(_("The Dock is already open in another WayClick "
+                              "window."))
+        conf = os.path.join(self.folder(), "bus.conf").encode()
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    argv = fh.read().split(b"\0")
+            except OSError:
+                continue
+            ours = (b"--socket" in argv and DOCK_SOCKET.encode() in argv) or \
+                (b"--config-file=" + conf) in argv
+            if not ours:
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                continue
+            end = time.monotonic() + 3.0
+            while time.monotonic() < end and os.path.exists(f"/proc/{pid}"):
+                time.sleep(0.05)
+            if os.path.exists(f"/proc/{pid}"):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------- o jogo --
+    def game_env(self):
+        e = dict(os.environ)
+        for k in ("DISPLAY", "WAYLAND_SOCKET", "XDG_ACTIVATION_TOKEN",
+                  "DESKTOP_STARTUP_ID", "QT_QPA_PLATFORM"):
+            e.pop(k, None)
+        e["WAYLAND_DISPLAY"] = DOCK_SOCKET
+        e["XDG_SESSION_TYPE"] = "wayland"
+        return e
+
+    def _run(self, argv):
+        out = self._log if self._log is not None else subprocess.DEVNULL
+        p = subprocess.Popen(argv, env=self.game_env(),
+                             stdin=subprocess.DEVNULL, stdout=out,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+        self.games.append(p)
+        threading.Thread(target=p.wait, daemon=True,
+                         name="wayclick-dock-game").start()
+        return p
+
+    SOBER = "org.vinegarhq.Sober"
+
+    def sober_outside(self, argv):
+        """O comando abre o Sober e já há um Sober aberto fora da Doca. Ele
+        roda uma cópia só (segura uma porta fixa do 127.0.0.1), então o da
+        Doca não chegaria a abrir. O que a Doca abriu não conta."""
+        if not any(self.SOBER in a for a in argv):
+            return False
+        mine = {p.pid for p in self.games if p.poll() is None}
+        for line in self._flatpak_ps().splitlines():
+            parts = line.split()
+            if len(parts) < 2 or parts[1] != self.SOBER:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            # o flatpak run vira o bwrap (mesmo pid) ou é o pai dele
+            if pid not in mine and _ppid(pid) not in mine:
+                return True
+        return False
+
+    @staticmethod
+    def _flatpak_ps():
+        try:
+            return subprocess.run(
+                ["flatpak", "ps", "--columns=pid,application"],
+                capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    def launch(self, extra=()):
+        """Abre o comando do jogo dentro da Doca. False se não deu."""
+        try:
+            argv = shlex.split(self.command) + list(extra)
+        except ValueError:
+            argv = []
+        if not argv or not self.alive():
+            return False
+        if self.sober_outside(argv):
+            self.note = _(SOBER_TWICE)
+            self.changed.emit()
+            return False
+        self.note = ""
+        try:
+            self._run(argv)
+        except OSError as e:
+            self.note = _("The game did not open: {err}", err=e)
+            self.changed.emit()
+            return False
+        self._game_alive = True
+        self.changed.emit()
+        return True
+
+    def open(self, url, report=None):
+        """O passo Abrir de um macro da Doca. Link da web (e steam://, que o
+        Steam aberto no desktop atende) abre no desktop, como sempre; um
+        link de app, como roblox://, abre o app dele dentro da Doca."""
+        url = (url or "").strip()
+        if not url or url.startswith("-"):
+            return
+        scheme = url.split(":", 1)[0].lower() if ":" in url else ""
+        if scheme in ("", "http", "https", "steam", "file", "mailto"):
+            OPENER(url)
+            return
+        if not self.alive():
+            if report:
+                report(_("the Dock is not open, so {url} was not opened.",
+                         url=url))
+            return
+        argv = scheme_handler(url)
+        if not argv:
+            try:
+                base = shlex.split(self.command)
+            except ValueError:
+                base = []
+            argv = base + [url] if base else None
+        if not argv:
+            if report:
+                report(_("nothing on this computer opens {url}.", url=url))
+            return
+        if self.sober_outside(argv):
+            if report:
+                report(_(SOBER_TWICE))
+            return
+        try:
+            self._run(argv)
+        except OSError as e:
+            if report:
+                report(_("{url} did not open: {err}", url=url, err=e))
+
+    def cursor(self):
+        """Onde está o cursor dentro da Doca (o gravador pergunta)."""
+        kw = self.windows
+        return kw.cursor() if kw is not None and kw.ok else None
+
+    # ---------------------------------------------- a janela no desktop --
+    def _host(self, fix=False, show=False):
+        if self.kwin is None or self.kwin.poll() is not None:
+            return None
+        kw = KWIN()
+        if not kw.ok:
+            return None
+        w, h = self.size
+        raw = kw.call(DOCK_HOST_JS, pid=int(self.kwin.pid),
+                      fix="true" if fix else "false",
+                      show="true" if show else "false", w=int(w), h=int(h))
+        try:
+            info = json.loads(raw) if raw else None
+        except ValueError:
+            return None
+        return info if isinstance(info, dict) else None
+
+    def show(self):
+        """Traz a janela da Doca para a frente, mesmo minimizada."""
+        return self._host(show=True)
+
+    def set_size(self, w, h):
+        self.size = (int(w), int(h))
+        if self.alive():
+            self._fixes = 0
+            self._host(fix=True)
+
+    def _on_sized(self, w, h):
+        self.out_size = (w, h)
+        if self.state != "on":
+            return
+        if (w, h) == tuple(self.size):
+            self._fixes = 0
+            if self.note:
+                self.note = ""
+            self.changed.emit()
+            return
+        self._fix_timer.start()
+        self.changed.emit()
+
+    def _fix(self):
+        if not self.alive() or self.out_size == tuple(self.size):
+            return
+        if self._fixes >= DOCK_FIX_TRIES:
+            w, h = self.out_size or (0, 0)
+            self.note = _("The Dock window is {w}×{h}, not {W}×{H}: does "
+                          "it fit on the screen? Macros made at {W}×{H} "
+                          "may miss.", w=w, h=h, W=self.size[0],
+                          H=self.size[1])
+            self.changed.emit()
+            return
+        self._fixes += 1
+        self._host(fix=True)
+        self._fix_timer.start()
+
+    # ------------------------------------------------------------ fechar --
+    def _check(self):
+        """O KWin da Doca saiu (a janela dela foi fechada) ou o jogo
+        fechou: o estado acompanha."""
+        if self.state == "on" and not self.alive():
+            self._teardown()
+            self.state, self.error = "off", ""
+            self.changed.emit()
+            return
+        running = self.game_running()
+        if running != self._game_alive:
+            self._game_alive = running
+            self.changed.emit()
+
+    def stop(self):
+        was = self.state
+        self._teardown()
+        self.state, self.error, self.note = "off", "", ""
+        if was != "off":
+            self.changed.emit()
+
+    def _teardown(self):
+        self._poll.stop()
+        self._fix_timer.stop()
+        self.screen.stop()
+        if self.link is not None:
+            self.link.on_close = None
+            self.link.close()
+        self.link = self.input = self.pointer = None
+        if self.windows is not None:
+            self.windows.close()
+            self.windows = None
+        for p in (self.kwin, self.bus_proc):
+            if p is None or p.poll() is not None:
+                continue
+            p.terminate()
+            try:
+                p.wait(3.0)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                try:
+                    p.wait(2.0)
+                except subprocess.TimeoutExpired:
+                    pass
+        self.kwin = self.bus_proc = None
+        self.out_size = None
+        self._game_alive = False
+        if self._log is not None:
+            try:
+                self._log.close()
+            except OSError:
+                pass
+            self._log = None
+        if self._own:
+            # só a Doca que abriu limpa: a de outro WayClick fica como está
+            self._own = False
+            for name in ("pids", "bus"):
+                try:
+                    os.remove(os.path.join(self.folder(), name))
+                except OSError:
+                    pass
+
+
+_DOCK = None
+
+
+def DOCK():
+    """A Doca do app, uma só (o socket dela tem nome fixo). Criada na thread
+    da UI."""
+    global _DOCK
+    if _DOCK is None:
+        _DOCK = Dock()
+    return _DOCK
+
+
+class DockEnv:
+    """O que um macro da Doca usa no lugar das peças do desktop: o ponteiro,
+    a tela e as janelas dela. Avisos vão para o motor, como os dos outros."""
+
+    def __init__(self, engine, dock):
+        self.engine, self.dock = engine, dock
+        self.pointer = dock.pointer
+        self.screen = dock.screen
+        self.windows = dock.windows
+
+    @property
+    def workspace(self):
+        w, h = self.dock.out_size or self.dock.size
+        return (0, 0, w, h)
+
+    def report(self, text):
+        self.engine.report(text)
+
+    def say(self, title, text):
+        self.engine.say(title, text)
+
+
+class DockRunner(MacroRunner):
+    """O mesmo macro, jogado dentro da Doca: teclas, botões, roda e
+    movimento vão pelo fake_input do KWin dela, e o passo Abrir abre o app
+    do link lá dentro. O resto (tela, janelas, ponteiro) vem do DockEnv."""
+
+    def __init__(self, macro, dock, loop, keep, on_done=None, env=None):
+        super().__init__(macro, dock.input, dock.input, loop, keep, on_done,
+                         env)
+        self.dock, self.link = dock, dock.link
+
+    def _set(self, code, down):
+        inp = self.kb
+        if inp is None:
+            raise BrokenPipeError("the Dock is closed")
+        if is_button(code):
+            inp.button(code, down)
+        else:
+            inp.key(code, down)
+        if down:
+            self.held.append(code)
+        elif code in self.held:
+            self.held.remove(code)
+
+    # um dente da roda: o fake_input não diz que é um dente (não tem o
+    # value120 de uma roda de verdade), e aí o app conta pela distância. O
+    # Qt conta 10 como um dente: medido na caixa, 15 (o que o KWin manda
+    # junto do dente de uma roda real) virou um dente e meio
+    WHEEL_STEP = 10.0
+
+    def _wheel(self, direction, times):
+        inp = self.kb
+        if inp is None:
+            raise BrokenPipeError("the Dock is closed")
+        axis = 1 if direction in ("left", "right") else 0
+        sign = 1 if direction in ("down", "right") else -1
+        for i in range(times):
+            if i:
+                self._sleep(0.01)
+            inp.axis(axis, self.WHEEL_STEP * sign)
+
+    def _gone(self):
+        return self.link is None or self.link.closed
+
+    def _step(self, st, i=0):
+        if self._gone():
+            raise BrokenPipeError("the Dock is closed")
+        return super()._step(st, i)
+
+    def _report(self, text):
+        # sem a Doca, cada passo acharia um problema diferente (tela, janela,
+        # ponteiro); o aviso é um só, e nenhum se foi a pessoa que parou
+        if self._gone():
+            if self.stopping:
+                return
+            text = _("the Dock closed, so the macro stopped.")
+        super()._report(text)
+
+    def _let_go(self):
+        if self._gone():
+            # com o KWin dela fechado não há o que soltar: o jogo saiu junto
+            self._report("")
+            self.held, self.pheld = [], []
+            return
+        super()._let_go()
+
+    def _open(self, url):
+        self.dock.open(url, report=self._report)
 
 
 _ICON_CACHE = {}
@@ -6623,6 +7850,80 @@ TRANSLATIONS = {
         "Open windows… lists both.":
             "O nome do app, como Sober, ou o título inteiro da janela do "
             "jogo. Janelas abertas… mostra os dois.",
+        # a Doca
+        "Dock": "Doca", "Size:": "Tamanho:", "Game:": "Jogo:",
+        "Open the Dock": "Abrir a Doca", "Close the Dock": "Fechar a Doca",
+        "Start the game": "Abrir o jogo", "Show": "Mostrar",
+        "Bring the Dock window to the front":
+            "Trazer a janela da Doca para a frente",
+        "Open, {w}×{h}.": "Aberta, {w}×{h}.",
+        "The game is running.": "O jogo está rodando.",
+        "No game is running in it.": "Nenhum jogo rodando nela.",
+        "Opening the Dock…": "Abrindo a Doca…",
+        "The Dock did not open.": "A Doca não abriu.",
+        "Closed.": "Fechada.",
+        "KWin did not find the Dock window.":
+            "O KWin não achou a janela da Doca.",
+        "The game opens in a window of its own that belongs to WayClick. "
+        "Macros set to Play in the Dock press keys, click and look at the "
+        "screen only in there, so your mouse and keyboard stay free, and the "
+        "Dock window can stay behind other windows or minimized. Sober opens "
+        "one copy at a time: close it before starting it in the Dock.":
+            "O jogo abre numa janela só dele, que é do WayClick. Os macros "
+            "marcados com Jogar na Doca apertam teclas, clicam e olham a "
+            "tela só lá dentro, então o seu mouse e o seu teclado ficam "
+            "livres, e a janela da Doca pode ficar atrás das outras ou "
+            "minimizada. O Sober abre uma cópia por vez: feche o seu antes "
+            "de abrir ele na Doca.",
+        "Play in the Dock": "Jogar na Doca",
+        "Keys, clicks and screen steps go only to the game in the Dock, "
+        "never to the window in front, and positions are those of the Dock "
+        "screen. Open the Dock on the Dock tab.":
+            "Teclas, cliques e passos de tela vão só para o jogo na Doca, "
+            "nunca para a janela da frente, e as posições são as da tela da "
+            "Doca. Abra a Doca na aba Doca.",
+        "in the Dock": "na Doca",
+        "The Dock is not open.": "A Doca não está aberta.",
+        "The Dock is not open. Open it on the Dock tab first.":
+            "A Doca não está aberta. Abra ela antes, na aba Doca.",
+        "the Dock is not open, so the macro did not start.":
+            "a Doca não está aberta, então o macro não começou.",
+        "the Dock closed, so the macro stopped.":
+            "a Doca fechou, então o macro parou.",
+        "the Dock is not open, so {url} was not opened.":
+            "a Doca não está aberta, então {url} não foi aberto.",
+        "nothing on this computer opens {url}.":
+            "nada neste computador abre {url}.",
+        "{url} did not open: {err}": "{url} não abriu: {err}",
+        "The game did not open: {err}": "O jogo não abriu: {err}",
+        "The Dock did not send its screen.":
+            "A Doca não mandou a tela dela.",
+        "The Dock needs a Wayland session of KDE Plasma.":
+            "A Doca precisa de uma sessão Wayland do KDE Plasma.",
+        "The Dock needs KWin (kwin_wayland), the compositor of KDE Plasma.":
+            "A Doca precisa do KWin (kwin_wayland), o compositor do KDE "
+            "Plasma.",
+        "The Dock needs dbus-daemon (the dbus or dbus-daemon package).":
+            "A Doca precisa do dbus-daemon (pacote dbus ou dbus-daemon).",
+        "The D-Bus of the Dock did not start.":
+            "O D-Bus da Doca não iniciou.",
+        "The KWin of the Dock did not start.":
+            "O KWin da Doca não iniciou.",
+        "The Dock window is {w}×{h}, not {W}×{H}: does it fit on the screen? "
+        "Macros made at {W}×{H} may miss.":
+            "A janela da Doca está com {w}×{h}, não {W}×{H}: ela cabe na "
+            "tela? Macros feitos em {W}×{H} podem errar.",
+        "Sober is already open outside the Dock, and it opens one copy at a "
+        "time. Close it, then press Start the game.":
+            "O Sober já está aberto fora da Doca, e ele abre uma cópia por "
+            "vez. Feche ele e aperte Abrir o jogo.",
+        "Recording in {n} s, play inside the Dock window…":
+            "Gravando em {n} s, jogue dentro da janela da Doca…",
+        "Capturing the Dock in {n} s…": "Capturando a Doca em {n} s…",
+        "Image and color steps need PyGObject.":
+            "Os passos de imagem e cor precisam do PyGObject.",
+        "The Dock is already open in another WayClick window.":
+            "A Doca já está aberta em outra janela do WayClick.",
     },
 }
 LANGS = {"English": "en_US", "Português (BR)": "pt_BR"}
@@ -7261,16 +8562,18 @@ def _ui_wait(seconds, done=lambda: False):
         time.sleep(0.02)
 
 
-def grab_frames(delay, note=None):
+def grab_frames(delay, note=None, dock=None):
     """Um quadro de cada tela depois de `delay` segundos, tempo de trocar
     para a janela do jogo. Devolve (quadros, erro); note (um QLabel) mostra
-    a contagem."""
+    a contagem. Com dock, o quadro é o da tela da Doca, sem portal."""
     def say(text):
         if note is not None:
             note.setText(text)
-    cap = SCREEN()
+    if dock is not None and not dock.alive():
+        return [], _("The Dock is not open. Open it on the Dock tab first.")
+    cap = dock.screen if dock is not None else SCREEN()
     frames = []
-    say(_("Waiting for screen sharing…"))
+    say("" if dock is not None else _("Waiting for screen sharing…"))
     try:
         cap.start()
         _ui_wait(SCREEN_ASK_S, lambda: cap.state != "starting")
@@ -7279,7 +8582,9 @@ def grab_frames(delay, note=None):
         cap.acquire()
         try:
             for left in range(int(delay), 0, -1):
-                say(_("Capturing in {n} s, switch to the game window…",
+                say(_("Capturing the Dock in {n} s…", n=left)
+                    if dock is not None else
+                    _("Capturing in {n} s, switch to the game window…",
                       n=left))
                 _ui_wait(1.0)
             frames = cap.frames()
@@ -7460,24 +8765,13 @@ class StepDialog(QDialog):
     def _sync_count(self, _v=0):
         self.cok.setEnabled(self.cevery.value() > 0)
 
+    def _dock(self):
+        """A Doca, se o macro deste passo joga nela."""
+        f = getattr(self.parent(), "target_dock", None)
+        return f() if callable(f) else None
+
     def _list_windows(self):
-        kw = KWIN()
-        wins = kw.windows() if kw.ok else []
-        if not wins:
-            self.error.setText(kw.error or _("No window list: this needs KDE "
-                                             "Plasma."))
-            return
-        self.error.setText("")
-        keep = self.match.currentText()
-        self.match.clear()
-        names = []
-        for w in wins:
-            for name in (w.get("cls"), w.get("title")):
-                if name and name not in names:
-                    names.append(name)
-        self.match.addItems(names)
-        self.match.setEditText(keep)
-        self.match.showPopup()
+        window_names(self.match, self.error, self._dock())
 
     # ------------------------------------------- passos que olham a tela --
     def _screen_widgets(self, step):
@@ -7653,7 +8947,8 @@ class StepDialog(QDialog):
         self.error.setText("")
         self._busy(True)
         try:
-            frames, err = grab_frames(self.delay.value(), self.cap_note)
+            frames, err = grab_frames(self.delay.value(), self.cap_note,
+                                      self._dock())
         finally:
             self._busy(False)
             self._sync()
@@ -7912,6 +9207,9 @@ class MacroDialog(QDialog):
         self.limit.setToolTip(_("Stops the macro by itself after this many "
                                 "runs, like 20 matches of a farm. A run that "
                                 "starts over does not count."))
+        self.dock_box = QCheckBox(_("Play in the Dock"))
+        self.dock_box.setChecked(bool(m.get("dock")))
+        self.dock_box.setToolTip(_(DOCK_BOX_TIP))
 
         form = QFormLayout()
         form.addRow(QLabel(_("Name:")), self.name)
@@ -7936,6 +9234,7 @@ class MacroDialog(QDialog):
         self.limit_lbl = QLabel(_("Stop after:"))
         form.addRow(self.limit_lbl, self.limit)
         form.addRow(QLabel(_("Key press time:")), self.press)
+        form.addRow("", self.dock_box)
 
         self.steps = list(m["steps"])
         self.step_list = QListWidget()
@@ -8025,8 +9324,20 @@ class MacroDialog(QDialog):
         self.steps[at:at] = new
         self._fill_steps(at)
 
+    def target_dock(self):
+        """A Doca, quando o macro joga nela (os passos capturam e listam
+        janelas de lá), ou None."""
+        return DOCK() if self.dock_box.isChecked() else None
+
     def _record(self):
-        dlg = RecordDialog(self)
+        dock = self.target_dock()
+        if dock is not None and not dock.alive():
+            self.error.setText(_("The Dock is not open. Open it on the Dock "
+                                 "tab first."))
+            return
+        self.error.setText("")
+        dlg = RecordDialog(self, cursor=dock.cursor if dock else None,
+                           dock=dock is not None)
         if dlg.exec() == QDialog.Accepted:
             self.insert_steps(dlg.steps)
 
@@ -8124,7 +9435,8 @@ class MacroDialog(QDialog):
             "period_ms": self.period.value(),
             "press_ms": self.press.value(),
             "limit": self.limit.value() if self.limit.isEnabled() else 0,
-            "block": self.block.isChecked(), "steps": self.steps})
+            "block": self.block.isChecked(), "steps": self.steps,
+            "dock": self.dock_box.isChecked()})
 
 
 def arm_clash_text(macros, code, name):
@@ -8187,10 +9499,18 @@ class ImportDialog(QDialog):
         col.addWidget(buttons)
 
 
-def window_names(combo, error):
+def window_names(combo, error, dock=None):
     """Põe na lista do combo as janelas abertas agora (app e título), sem
-    perder o que já estava escrito. error: QLabel para quando não dá."""
-    kw = KWIN()
+    perder o que já estava escrito. error: QLabel para quando não dá. Com
+    dock, as janelas de dentro da Doca."""
+    if dock is not None:
+        if not dock.alive() or dock.windows is None:
+            error.setText(_("The Dock is not open. Open it on the Dock tab "
+                            "first."))
+            return False
+        kw = dock.windows
+    else:
+        kw = KWIN()
     wins = kw.windows() if kw.ok else []
     if not wins:
         error.setText(kw.error or _("No window list: this needs KDE Plasma."))
@@ -8215,12 +9535,13 @@ class RecordDialog(QDialog):
     antes de acrescentar."""
     TICK_MS = 250
 
-    def __init__(self, parent=None, hub=None, cursor=None):
+    def __init__(self, parent=None, hub=None, cursor=None, dock=False):
         super().__init__(parent)
         self.setWindowTitle(_("Record steps"))
         self.resize(460, 480)
         self.hub = hub
         self.cursor = cursor            # None: pergunta ao KWin na hora
+        self.dock = dock                # grava o que se joga dentro da Doca
         self.events, self.steps = [], []
         self.rec = None
         self._left = 0
@@ -8300,6 +9621,10 @@ class RecordDialog(QDialog):
             self._begin()
 
     def _say_left(self):
+        if self.dock:
+            self.state.setText(_("Recording in {n} s, play inside the Dock "
+                                 "window…", n=self._left))
+            return
         self.state.setText(_("Recording in {n} s, switch to the game "
                              "window…", n=self._left))
 
@@ -8500,8 +9825,11 @@ class FarmDialog(QDialog):
             "window. Open windows… lists both."))
         b_wins = QPushButton(_("Open windows…"))
         b_wins.setToolTip(_("List the windows that are open now"))
-        b_wins.clicked.connect(lambda: window_names(self.window_name,
-                                                    self.error))
+        b_wins.clicked.connect(lambda: window_names(
+            self.window_name, self.error, self.target_dock()))
+        self.dock_box = QCheckBox(_("Play in the Dock"))
+        self.dock_box.setChecked(bool(spec.get("dock")))
+        self.dock_box.setToolTip(_(DOCK_BOX_TIP))
         self.link = QLineEdit(spec.get("link") or "")
         self.link.setPlaceholderText("https://www.roblox.com/games/…")
         self.link.setToolTip(_(
@@ -8583,6 +9911,7 @@ class FarmDialog(QDialog):
         form.addRow(QLabel(_("Hotkey:")), self.hotkey)
         form.addRow(QLabel(_("Game window:")), _hrow(self.window_name,
                                                      b_wins))
+        form.addRow("", self.dock_box)
         form.addRow(QLabel(_("Reopen with:")), self.link)
         form.addRow(QLabel(_("Lobby buttons:")), lobby_w)
         form.addRow(QLabel(_("Wait for each:")), self.lobby_wait)
@@ -8620,11 +9949,15 @@ class FarmDialog(QDialog):
             self._add_lobby("")
         self._sync()
 
+    def target_dock(self):
+        return DOCK() if self.dock_box.isChecked() else None
+
     def _grab(self):
         self.scroll.setEnabled(False)
         self.buttons.setEnabled(False)
         try:
-            frames, err = grab_frames(self.delay.value(), self.cap_note)
+            frames, err = grab_frames(self.delay.value(), self.cap_note,
+                                      self.target_dock())
         finally:
             self.scroll.setEnabled(True)
             self.buttons.setEnabled(True)
@@ -8673,7 +10006,8 @@ class FarmDialog(QDialog):
                 "over": self.over.path, "over_wait": self.over_wait.value(),
                 "hook": hook, "report": self.report.text(),
                 "shot": self.shot.isChecked() and bool(hook),
-                "limit": self.limit.value()}
+                "limit": self.limit.value(),
+                "dock": self.dock_box.isChecked()}
 
     def _ok(self):
         s = self.spec()
@@ -8748,9 +10082,18 @@ class MacroFileDialog(QDialog):
 # modo com gatilhos diferentes, e obrigavam a escolher o modo certo antes de
 # poder escolher o gatilho — que é onde todo mundo tropeçava. Agora o campo
 # Gatilho aceita os dois e o modo só diz se ele segura ou não.
+DOCK_BOX_TIP = ("Keys, clicks and screen steps go only to the game in the "
+                "Dock, never to the window in front, and positions are those "
+                "of the Dock screen. Open the Dock on the Dock tab.")
 MACRO_TAB_HINT = ("Each macro has its own hotkey and works in any window, even "
                   "with WayClick stopped, like an AutoHotkey script. Import "
                   "AHK converts the hotkeys of a .ahk file.")
+DOCK_TAB_HINT = ("The game opens in a window of its own that belongs to "
+                 "WayClick. Macros set to Play in the Dock press keys, click "
+                 "and look at the screen only in there, so your mouse and "
+                 "keyboard stay free, and the Dock window can stay behind "
+                 "other windows or minimized. Sober opens one copy at a "
+                 "time: close it before starting it in the Dock.")
 MODES = {"No trigger (hotkey toggles)": "toggle",
          "Runs while the trigger is held": "hold"}
 CFG = os.path.join(XDG_CONFIG, "wayclick.json")
@@ -9049,6 +10392,47 @@ class App(QWidget):
         checks.addWidget(self.autostart)
         checks.addStretch()
 
+        # --- a Doca: o jogo numa tela só do WayClick ---
+        self.dock = DOCK()
+        self.dock_size = QComboBox()
+        for dw, dh in DOCK_SIZES:
+            self.dock_size.addItem(f"{dw} × {dh}", f"{dw}x{dh}")
+        self.dock_size.setCurrentIndex(max(0, self.dock_size.findData(
+            str(cfg.get("dock_size") or ""))))
+        self.dock.size = self._dock_size_value()
+        self.dock_size.currentIndexChanged.connect(self._dock_size_changed)
+        cmd = cfg.get("dock_command", DOCK_GAME)
+        self.dock_cmd = QLineEdit(cmd if isinstance(cmd, str) else DOCK_GAME)
+        self.dock_cmd.setMaxLength(1000)
+        self.dock.command = self.dock_cmd.text().strip()
+        self.dock_cmd.textChanged.connect(self._dock_cmd_changed)
+        self.dock_open = QPushButton("")
+        self.dock_open.clicked.connect(self._dock_toggle)
+        self.dock_game = QPushButton("")
+        self.dock_game.clicked.connect(self._dock_launch)
+        self.dock_show = QPushButton("")
+        self.dock_show.clicked.connect(self._dock_show)
+        dock_row = QHBoxLayout()
+        for b in (self.dock_open, self.dock_game, self.dock_show):
+            dock_row.addWidget(b)
+        dock_row.addStretch()
+        dock_form = QFormLayout()
+        self._row(dock_form, "Size:", self.dock_size)
+        self._row(dock_form, "Game:", self.dock_cmd)
+        dock_form.addRow(dock_row)
+        self.dock_state = QLabel("")
+        self.dock_state.setWordWrap(True)
+        self.dock_state.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.dock_note = QLabel("")
+        self.dock_note.setWordWrap(True)
+        self.dock_note.setStyleSheet("color:#c86000;font-size:11px;")
+        self.dock_note.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.dock_note.hide()
+        self.dock_hint = QLabel(_(DOCK_TAB_HINT))
+        self.dock_hint.setWordWrap(True)
+        self.dock_hint.setEnabled(False)
+        self._hints.append((self.dock_hint, DOCK_TAB_HINT))
+
         # Abas em vez de tudo empilhado: com todos os grupos numa tela só a
         # janela passava de 900 px de altura e não cabia num 1366x768.
         self.tabs = QTabWidget()
@@ -9065,8 +10449,11 @@ class App(QWidget):
                                     extra=self.win_warn), "")
         self.tabs.addTab(self._page(None, trigger_form, None,
                                     extra=[afk_row, checks]), "")
+        self.tabs.addTab(self._page(None, dock_form, None,
+                                    extra=[self.dock_state, self.dock_note,
+                                           self.dock_hint]), "")
         self._tab_names = ["Click", "Keyboard", "Hotkeys", "Window",
-                           "Trigger"]
+                           "Trigger", "Dock"]
         self._sync_tabs()
         for w_ in (self.click_box, self.key_box, self.target_box,
                    self.macro_box):
@@ -9120,6 +10507,9 @@ class App(QWidget):
         self.engine.problem.connect(self._macro_problem)
         self.engine.message.connect(self._macro_message)
         self.engine.screen = SCREEN()
+        self.engine.dock = self.dock
+        self.dock.changed.connect(self._dock_changed)
+        self._show_dock()
         self.pointer = None
         self._track_screens()
         self.macro_box.toggled.connect(lambda _on: self._apply_macros())
@@ -9259,10 +10649,93 @@ class App(QWidget):
         on = [self.click_box.isChecked(), self.key_box.isChecked(),
               self.macro_box.isChecked() and any(
                   m["enabled"] for m in getattr(self, "macros", [])),
-              self.target_box.isChecked(), self.mode_key() != "toggle"]
+              self.target_box.isChecked(), self.mode_key() != "toggle",
+              getattr(self, "dock", None) is not None and self.dock.alive()]
         for i, name in enumerate(self._tab_names):
             mark = "● " if on[i] else ""
             self.tabs.setTabText(i, mark + _(name))
+
+    # ------------------------------------------------------------- a Doca --
+    def _dock_size_value(self):
+        try:
+            w, h = (int(x) for x in
+                    str(self.dock_size.currentData()).split("x"))
+        except ValueError:
+            return DOCK_SIZES[0]
+        return (w, h)
+
+    def _dock_size_changed(self, _i=0):
+        self.dock.set_size(*self._dock_size_value())
+        self._show_dock()
+
+    def _dock_cmd_changed(self, text):
+        self.dock.command = text.strip()
+        self._show_dock()
+
+    def _dock_toggle(self):
+        if self.dock.state == "starting":
+            return
+        if self.dock.alive():
+            self.engine.stop_dock()
+            self.dock.stop()
+            return
+        self.dock.size = self._dock_size_value()
+        self.dock.command = self.dock_cmd.text().strip()
+        self.dock.start(launch=bool(self.dock.command))
+
+    def _dock_launch(self):
+        if self.dock.state == "starting":
+            return
+        self.dock.command = self.dock_cmd.text().strip()
+        if self.dock.alive():
+            self.dock.launch()
+        else:
+            self.dock.size = self._dock_size_value()
+            self.dock.start(launch=True)
+
+    def _dock_show(self):
+        if self.dock.show() is None and self.dock.alive():
+            self.dock.note = _("KWin did not find the Dock window.")
+            self._show_dock()
+
+    def _dock_changed(self):
+        if not self.dock.alive():
+            self.engine.stop_dock()
+        self._show_dock()
+        # os macros "sempre" da Doca começam quando ela abre
+        self._apply_macros()
+
+    def _show_dock(self):
+        d = self.dock
+        st = d.state
+        if st == "on":
+            w, h = d.out_size or d.size
+            text = _("Open, {w}×{h}.", w=w, h=h) + " " + (
+                _("The game is running.") if d.game_running()
+                else _("No game is running in it."))
+        elif st == "starting":
+            text = _("Opening the Dock…")
+        elif st == "failed":
+            text = d.error or _("The Dock did not open.")
+        else:
+            text = _("Closed.")
+        self.dock_state.setText(text)
+        self.dock_state.setStyleSheet("color:#d04030;" if st == "failed"
+                                      else "")
+        self.dock_note.setText(d.note)
+        self.dock_note.setVisible(bool(d.note))
+        on = st == "on"
+        self.dock_open.setText(_("Close the Dock") if on
+                               else _("Open the Dock"))
+        self.dock_open.setEnabled(st != "starting")
+        self.dock_game.setText(_("Start the game"))
+        self.dock_game.setEnabled(st != "starting"
+                                  and bool(self.dock_cmd.text().strip()))
+        self.dock_show.setText(_("Show"))
+        self.dock_show.setToolTip(_("Bring the Dock window to the front"))
+        self.dock_show.setEnabled(on)
+        if hasattr(self, "tabs"):
+            self._sync_tabs()
 
     @staticmethod
     def _scrollable(combo, visible=5):
@@ -9412,6 +10885,7 @@ class App(QWidget):
         for lbl, src in self._hints:
             lbl.setText(_(src))
         self._sync_tabs()
+        self._show_dock()
         self._update_win_warn()
         self.sound.setText(_("Sound feedback on hotkey"))
         self.autostart.setText(_("Start with system"))
@@ -10377,7 +11851,7 @@ class App(QWidget):
         if not self.macro_box.isChecked():
             return False
         return any(CompiledMacro(m).uses_keys for m in self.macros
-                   if m["enabled"] and m["steps"])
+                   if m["enabled"] and m["steps"] and not m.get("dock"))
 
     def _apply_macros(self):
         """Entrega a lista ao motor. Roda a cada mudança: é barato, e só o
@@ -10388,11 +11862,12 @@ class App(QWidget):
         if active and self._macros_need_keyboard():
             self.ensure_keyboard()
         if active and any(CompiledMacro(m).uses_pointer for m in self.macros
-                          if m["enabled"] and m["steps"]):
+                          if m["enabled"] and m["steps"]
+                          and not m.get("dock")):
             self.ensure_pointer()
         if active and self.engine.windows is None and any(
                 CompiledMacro(m).uses_windows for m in self.macros
-                if m["enabled"] and m["steps"]):
+                if m["enabled"] and m["steps"] and not m.get("dock")):
             kw = KWIN()                 # na thread da UI, onde ela vive
             self.engine.windows = kw if kw.ok else None
         path = self.selected_mouse()[0]
@@ -10676,6 +12151,8 @@ class App(QWidget):
         self.target_timer.stop()
         if self.bridge or _KWIN:
             (self.bridge or _KWIN).cleanup()
+        self.engine.stop_dock()
+        self.dock.stop()
         self.engine.close()
         self.watcher.stop()
         if self.trig_watcher:
@@ -10725,6 +12202,9 @@ class App(QWidget):
                            "hotkey_block": self.hk_block.isChecked(),
                            "macros": self.macros,
                            "macros_enabled": self.macro_box.isChecked(),
+                           "dock_size": "x".join(
+                               map(str, self._dock_size_value())),
+                           "dock_command": self.dock_cmd.text().strip(),
                            "update_check": self.update_auto,
                            "update_tag": self._update_tag,
                            "update_url": self._update_url,

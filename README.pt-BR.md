@@ -37,6 +37,10 @@ compositor e sem nada rodando como root.
   que você joga em passos, o **Assistente de farm** monta o laço de lobby,
   partida, fim e de novo de um jogo de tower defense, e **Exportar /
   Importar** compartilha um macro com as imagens num arquivo `.wayclick` só
+- **A Doca** abre o jogo num KWin só dela, numa janela do WayClick, e os
+  macros marcados com *Jogar na Doca* apertam teclas, clicam e olham a tela
+  só lá dentro, então seu mouse e seu teclado ficam livres e a Doca pode
+  ficar atrás de outras janelas ou minimizada
 - **Mandar tecla para uma janela** — escolha uma janela aberta e alimente ela
   com uma tecla; em alvo X11 chega sem mexer no foco, mesmo minimizada
 - **Anti-AFK** — mexe o ponteiro e devolve, com deriva zero
@@ -158,12 +162,13 @@ wayclick --import script.ahk --dry-run   # no que um script do AutoHotkey vira
 wayclick --version
 ```
 
-São cinco abas. **Atalhos** guarda os macros estilo AutoHotkey, que rodam nos
+São seis abas. **Atalhos** guarda os macros estilo AutoHotkey, que rodam nos
 próprios atalhos e não precisam do Iniciar. **Clique**, **Teclado** e
 **Janela** são as três coisas que o Iniciar executa. Cada uma tem sua caixa de
 habilitar, e a aba ganha um ponto quando está ligada, então dá para ver o que está armado sem abrir. Habilite
 qualquer combinação. **Acionamento** é como tudo liga e desliga, mais o
-Anti-AFK, que roda por fora do Iniciar/Parar. O status e o botão Iniciar ficam
+Anti-AFK, que roda por fora do Iniciar/Parar. **Doca** abre o jogo na
+[Doca](#a-doca). O status e o botão Iniciar ficam
 sempre visíveis abaixo das abas, e a janela cabe numa tela de 1366×768.
 
 O resto está na barra de menus: **Arquivo** inicia, para, esconde na bandeja e
@@ -431,6 +436,44 @@ abriria qualquer coisa que não seja um link da web, `roblox://` ou
 `steam://` vira uma espera vazia, para os outros passos manterem os números,
 e os macros importados chegam desligados.
 
+### A Doca
+
+Os macros de tower defense do Windows jogam numa visão própria, para o PC
+continuar usável enquanto farmam. **A Doca** faz o mesmo no KDE Plasma: um
+KWin só dela que o WayClick abre numa janela, com o jogo dentro. Macros
+marcados com **Jogar na Doca** funcionam só lá:
+
+- teclas, cliques, a roda e arrastos vão para o jogo na Doca, nunca para a
+  janela da frente, e o ponteiro e o foco do seu desktop ficam onde estão;
+- passos de tela, imagem, cor e janela olham a Doca, sem diálogo de
+  compartilhar tela;
+- a janela da Doca pode ficar atrás de outras janelas ou minimizada, e o
+  jogo continua rodando e o macro continua vendo (medido com um jogo que
+  espera o vsync no `tests/t_dock_hidden.py`, 60 quadros por segundo na
+  frente, coberto e minimizado);
+- as posições são as da tela da Doca, com 0,0 no canto de cima à esquerda, e
+  a Doca mantém o tamanho escolhido (1280×720 por padrão; redimensionada,
+  ela volta), então os pontos de um macro são os mesmos onde quer que a
+  janela esteja;
+- um link `roblox://` num macro da Doca abre dentro da Doca, e links da web
+  abrem no seu desktop como sempre.
+
+Na aba **Doca** escolha o **Tamanho** e o comando do **Jogo** (`flatpak run
+org.vinegarhq.Sober` por padrão) e aperte **Abrir a Doca**, e o jogo abre
+dentro dela. **Abrir o jogo** abre de novo depois que você fecha, abrindo a
+Doca antes se precisar. **Mostrar** traz a janela da Doca para a frente, e a
+aba mostra ● enquanto a Doca está aberta. A Doca é uma janela comum, então
+você também pode clicar nela e jogar você mesmo. No editor de macro e no
+Assistente de farm marque **Jogar na Doca**; **● Gravar…** e **Escolher na
+tela…** passam a funcionar na Doca também. Fechar a janela da Doca, ou
+**Fechar a Doca**, fecha o jogo e para os macros dela, e um macro da Doca
+iniciado com a Doca fechada avisa e não roda.
+
+O Sober abre uma cópia por vez, então feche o Sober que estiver aberto antes
+de abrir ele na Doca; a aba Doca avisa quando encontra um. A Doca precisa de
+uma sessão Wayland do Plasma (`kwin_wayland`) e do `dbus-daemon`, que vêm
+com o Plasma.
+
 ### Acionamento
 
 **Modo**
@@ -647,6 +690,26 @@ D-Bus do WayClick com a resposta. Medido contra um KWin aninhado
 (`tests/t_farm_kwin.py`), uma pergunta leva de 5 a 10 ms, e um passo de
 janela pergunta no máximo uma vez por segundo.
 
+**A Doca.** A Doca é o `kwin_wayland --wayland-display $WAYLAND_DISPLAY
+--socket wayland-wayclick-dock` com largura e altura fixas, então ele roda
+como uma janela do seu desktop (o backend Wayland do KWin), ao lado de um
+`dbus-daemon` só dele. Configuração, estado e cache ficam em
+`$XDG_RUNTIME_DIR/wayclick-dock`, então a configuração de telas que ele grava
+nunca encosta na do desktop, e só o layout do teclado e as configurações de
+entrada (`kxkbrc`, `kcminputrc`) são copiados para lá. O kwinrc dele maximiza
+janelas novas sem borda, para o jogo encher a tela, e desliga os cantos de
+tela e a Visão geral, que um macro num canto abriria. O jogo roda com
+`WAYLAND_DISPLAY` apontando para a Doca e sem `DISPLAY`, com o resto do seu
+ambiente, o D-Bus da sessão inclusive, então portais e chaveiro funcionam
+como sempre. Os macros falam direto com esse KWin. A entrada vai pelo
+`org_kde_kwin_fake_input` no socket da Doca, o mesmo caminho de um device de
+verdade dentro do KWin, então o desktop nunca vê nada, e a tela vem do
+`org.kde.KWin.ScreenShot2.CaptureWorkspace` no D-Bus da Doca (uns 5 ms para
+1280×720, também com a janela escondida). Passos de janela rodam scripts do
+KWin nesse D-Bus. Um script pequeno no KWin do desktop acha a janela da Doca
+pelo processo dela para manter o tamanho, trazer para a frente e fechar.
+Medido no KWin aninhado do `tests/t_dock_kwin.py`, a Doca abre em uns 0,2 s.
+
 ## Problemas comuns
 
 **"Atalho global DESLIGADO"** — você não está no grupo `input`, ou a sessão
@@ -716,7 +779,11 @@ sg input -c "python3 tests/t_screen_ui.py"          # editor de passo, Escolher 
 sg input -c "python3 tests/t_abs_pointer_libinput.py"  # o ponteiro absoluto como o libinput lê
 sg input -c "python3 tests/t_farm_macros.py"        # vigias, janelas, contadores, o gravador, um farm inteiro num jogo falso
 sg input -c "python3 tests/t_farm_ui.py"            # editores, gravador, assistente de farm, arquivos .wayclick
+python3 tests/t_dock_ui.py                          # a aba Doca, macros da Doca, editores e links numa Doca falsa
 python3 tests/t_farm_kwin.py                        # passos de janela e o cursor contra um KWin de verdade, aninhado
+python3 tests/t_dock_kwin.py                        # a Doca num KWin de verdade, aninhado: teclas, cliques, roda, tela, janelas, tamanho, links, fechar
+python3 tests/t_dock_hidden.py                      # um jogo continua desenhando na Doca atrás de outras janelas e minimizada
+python3 tests/t_sober_dock.py                       # o Sober abrindo na Doca, com o botão Close achado e clicado
 python3 tests/t_screen_portal.py                    # o portal de verdade, dentro do bubblewrap
 python3 tests/bench_find_image.py                   # busca de imagem, acha ou não e com que rapidez
 python3 tests/t_sober_kwin.py                       # tudo isso contra o Roblox (Sober), num KWin aninhado
@@ -746,6 +813,17 @@ restauração e pelas escolhas do diálogo. Precisa do Sober com o Roblox já
 baixado uma vez, `pasta`, `bwrap`, `kwin_wayland`, `wl-clipboard` e
 `kscreen-doctor`, e pula quando falta algum (`WCTEST_PASTA=/caminho/do/pasta`
 usa um que não esteja instalado).
+
+O `t_dock_kwin.py`, o `t_dock_hidden.py` e o `t_sober_dock.py` abrem a Doca
+dentro da mesma caixa, então a janela dela cai no KWin aninhado e nada chega
+ao seu desktop. O `t_sober_dock.py` deixa a Doca abrir o Sober com o comando
+dela. A caixa não tem rede, então esse Sober nunca encontra o seu pela porta
+fixa do 127.0.0.1 e não vê conta nenhuma (só os APKs do Roblox e a versão
+são copiados, como acima), e ele para na tela "Failed to fetch remote
+manifest" dele. Um macro da Doca então acha o botão Close dessa tela pela
+imagem e clica, e o Sober fecha. O Roblox em si precisa de rede, então essa
+parte fica com o `t_sober_kwin.py`. O `t_dock_hidden.py` precisa do
+`es2gears_wayland` (mesa-demos) e pula sem ele.
 
 Rode com `QT_QPA_PLATFORM=offscreen`. Os outros precisam do compositor; rode a
 partir da raiz do projeto:

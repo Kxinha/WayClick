@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.8.0
+Version:        1.9.0
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -76,6 +76,16 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Fri Nov 20 2026 gabrielmf1998 <noreply@github.com> - 1.9.0-1
+- The Dock opens the game (Sober by default) inside a KWin of its own, in a
+  window of fixed size, and Dock macros send keys, clicks and the wheel only
+  to it and capture only it, so the desktop keeps its mouse and keyboard
+- Screen, image, color and window steps of a Dock macro look at the Dock
+  with no screen sharing dialog, even while its window is covered or
+  minimized
+- A roblox:// link in a Dock macro opens inside the Dock
+- Record, Pick on screen and the Farm assistant work in the Dock
+
 * Fri Nov 20 2026 gabrielmf1998 <noreply@github.com> - 1.8.0-1
 - Watch steps keep looking for an image, a pixel color or a window while
   the next steps run, and can click it or take the macro to another step

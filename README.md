@@ -36,6 +36,10 @@ running as root.
   play into steps, the **Farm assistant** builds a lobby, match, end and again
   loop for a tower defense game, and **Export / Import** shares a macro with
   its pictures in one `.wayclick` file
+- **The Dock** opens the game in a KWin of its own, in a window of WayClick,
+  and macros set to *Play in the Dock* press keys, click and look at the
+  screen only in there, so your mouse and keyboard stay free and the Dock can
+  sit behind other windows or minimized
 - **Send key to a window** — pick an open window and feed it a key; for X11
   targets it arrives with no focus change, even minimized
 - **Anti-AFK** — nudges the pointer and puts it back, with zero drift
@@ -157,12 +161,12 @@ wayclick --import script.ahk --dry-run   # what an AutoHotkey script becomes
 wayclick --version
 ```
 
-Five tabs. **Hotkeys** holds the AutoHotkey style macros, which run on their
+Six tabs. **Hotkeys** holds the AutoHotkey style macros, which run on their
 own hotkeys and do not need Start. **Click**, **Keyboard** and **Window** are
 the three things Start can run. Each has an *enable* box, and the tab shows a
 dot when it is on, so you can see what is armed without opening it. Enable any combination. **Trigger** is
 how it all starts and stops, plus Anti-AFK, which runs on its own outside
-Start/Stop. Status and the Start button stay visible below the tabs, and the
+Start/Stop. **Dock** opens the game in [the Dock](#the-dock). Status and the Start button stay visible below the tabs, and the
 window is small enough for a 1366×768 screen.
 
 The menu bar has the rest: **File** starts, stops, hides to tray and quits;
@@ -424,6 +428,44 @@ step that would open anything other than a web, `roblox://` or `steam://`
 link becomes an empty wait, so the other steps keep their numbers, and the
 imported macros arrive turned off.
 
+### The Dock
+
+The tower defense macros for Windows play in a view of their own, so the PC
+stays usable while they farm. **The Dock** does the same on KDE Plasma: a
+KWin of its own that WayClick opens in a window, with the game inside.
+Macros set to **Play in the Dock** work only in there:
+
+- keys, clicks, the wheel and drags go to the game in the Dock, never to the
+  window in front, and the pointer and the focus of your desktop stay where
+  they are;
+- screen, image, color and window steps look at the Dock, with no screen
+  sharing dialog;
+- the Dock window can sit behind other windows or be minimized, and the game
+  keeps running and the macro keeps seeing it (measured with a game that
+  waits for vsync in `tests/t_dock_hidden.py`, 60 frames a second in front,
+  covered and minimized);
+- positions are those of the Dock screen, with 0,0 at its top left corner,
+  and the Dock keeps the size you chose (1280×720 by default; resized, it
+  goes back), so the spots of a macro stay the same wherever the window is;
+- a `roblox://` link in a Dock macro opens inside the Dock, while web links
+  open on your desktop as always.
+
+On the **Dock** tab choose the **Size** and the **Game** command
+(`flatpak run org.vinegarhq.Sober` by default) and press **Open the Dock**,
+and the game starts in it. **Start the game** opens it again after you close
+it, opening the Dock first if needed. **Show** brings the Dock window to the
+front, and the tab shows ● while the Dock is open. The Dock is an ordinary
+window, so you can also click into it and play yourself. In the macro editor
+and in the Farm assistant tick **Play in the Dock**; **● Record…** and **Pick
+on screen…** then work on the Dock too. Closing the Dock window, or **Close
+the Dock**, closes the game and stops its macros, and a Dock macro started
+while the Dock is closed says so and does not run.
+
+Sober opens one copy at a time, so close the Sober you have open before you
+start it in the Dock; the Dock tab tells you when it finds one. The Dock
+needs a Plasma Wayland session (`kwin_wayland`) and `dbus-daemon`, which come
+with Plasma.
+
 ### Trigger
 
 **Mode**
@@ -638,6 +680,26 @@ WayClick back with the answer. Measured against a nested KWin
 (`tests/t_farm_kwin.py`), a question takes 5 to 10 ms, and a window step asks
 at most once a second.
 
+**The Dock.** The Dock is `kwin_wayland --wayland-display $WAYLAND_DISPLAY
+--socket wayland-wayclick-dock` with a fixed width and height, so it runs as
+a window of your desktop (KWin's Wayland backend), next to a `dbus-daemon` of
+its own. Its settings, state and cache live in
+`$XDG_RUNTIME_DIR/wayclick-dock`, so the screen settings it saves never touch
+the desktop's, and only your keyboard layout and input settings (`kxkbrc`,
+`kcminputrc`) are copied in. Its kwinrc maximizes new windows with no border,
+so the game fills it, and turns off the screen edges and the Overview, which
+a macro in a corner would open. The game runs with `WAYLAND_DISPLAY`
+pointing at the Dock and no `DISPLAY`, with the rest of your environment, the
+session D-Bus included, so portals and the keyring work as usual. Macros talk
+to that KWin directly. Input goes through `org_kde_kwin_fake_input` on the
+Dock socket, the same path a real device takes inside KWin, so the desktop
+never sees it, and the screen comes from
+`org.kde.KWin.ScreenShot2.CaptureWorkspace` on the Dock's D-Bus (about 5 ms
+for 1280×720, also while the window is hidden). Window steps run KWin scripts
+on that D-Bus. A small script in the desktop's KWin finds the Dock window by
+its process to keep its size, bring it forward and close it. Measured in the
+nested KWin of `tests/t_dock_kwin.py`, the Dock opens in about 0.2 s.
+
 ## Troubleshooting
 
 **"Global hotkey OFF"** — you are not in the `input` group, or the session
@@ -704,7 +766,11 @@ sg input -c "python3 tests/t_screen_ui.py"          # step editor, Pick on scree
 sg input -c "python3 tests/t_abs_pointer_libinput.py"  # the absolute pointer as libinput reads it
 sg input -c "python3 tests/t_farm_macros.py"        # watches, windows, counters, the recorder, a whole farm on a fake game
 sg input -c "python3 tests/t_farm_ui.py"            # editors, recorder, farm assistant, .wayclick files
+python3 tests/t_dock_ui.py                          # the Dock tab, Dock macros, editors and links on a fake Dock
 python3 tests/t_farm_kwin.py                        # window steps and the cursor against a real KWin, nested
+python3 tests/t_dock_kwin.py                        # the Dock in a real KWin, nested: keys, clicks, wheel, screen, windows, size, links, closing
+python3 tests/t_dock_hidden.py                      # a game keeps drawing in the Dock behind other windows and minimized
+python3 tests/t_sober_dock.py                       # Sober opening in the Dock, its Close button found and clicked
 python3 tests/t_screen_portal.py                    # the real portal, inside bubblewrap
 python3 tests/bench_find_image.py                   # image search, found or not and how fast
 python3 tests/t_sober_kwin.py                       # all of it against Roblox (Sober), in a nested KWin
@@ -734,6 +800,18 @@ the restore token and the dialog choices. It needs Sober with Roblox
 downloaded once, `pasta`, `bwrap`, `kwin_wayland`, `wl-clipboard` and
 `kscreen-doctor`, and skips when one is missing (`WCTEST_PASTA=/path/to/pasta`
 uses one that is not installed).
+
+`t_dock_kwin.py`, `t_dock_hidden.py` and `t_sober_dock.py` open the Dock
+inside the same box, so its window lands on the nested KWin and nothing
+reaches your desktop. `t_sober_dock.py` lets the Dock start Sober with its
+own command. The box has no network, so that Sober never meets yours over its
+fixed 127.0.0.1 port and sees no account (only the Roblox APKs and the
+version string are copied, as above), and it stops at its own "Failed to
+fetch remote manifest" screen. A Dock macro then finds the Close button of
+that screen by its picture and clicks it, and Sober closes. Roblox itself
+needs the network, so that part stays with `t_sober_kwin.py`.
+`t_dock_hidden.py` needs `es2gears_wayland` (mesa-demos) and skips without
+it.
 
 Run them with `QT_QPA_PLATFORM=offscreen`. The rest need the compositor; run
 them from the project root:
