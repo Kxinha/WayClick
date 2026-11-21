@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.9.0
+Version:        1.10.0
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -76,6 +76,18 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Sat Nov 21 2026 gabrielmf1998 <noreply@github.com> - 1.10.0-1
+- The Tower Defense tab shows the game of the Dock inside WayClick about
+  20 times a second, and mouse, wheel and keys over it go to the game
+- Strategies with five towers and their spots, a timeline recorded by
+  playing on the view or edited by hand, the lobby buttons and a lobby
+  macro, shared as .wayclick files with their pictures
+- A farm that only looks at the screen plays the matches by itself, with
+  Start F4, Stop F5 and Pause F6, tries a tower again until it goes down,
+  clicks skip wave, counts victories and defeats, reconnects and opens the
+  game again by its link when it closes
+- A log, the counts and a Discord report after each match
+
 * Fri Nov 20 2026 gabrielmf1998 <noreply@github.com> - 1.9.0-1
 - The Dock opens the game (Sober by default) inside a KWin of its own, in a
   window of fixed size, and Dock macros send keys, clicks and the wheel only

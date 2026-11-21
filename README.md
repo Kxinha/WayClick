@@ -40,6 +40,11 @@ running as root.
   and macros set to *Play in the Dock* press keys, click and look at the
   screen only in there, so your mouse and keyboard stay free and the Dock can
   sit behind other windows or minimized
+- **The Tower Defense tab** shows the game of the Dock inside WayClick and
+  farms a tower defense game from there, with five towers and their spots, a
+  timeline you record by playing, the lobby, pictures of the end of a match,
+  Start F4, Stop F5 and Pause F6, a log and the counts. It only looks at the
+  screen and presses keys, never reading the memory of the game
 - **Send key to a window** — pick an open window and feed it a key; for X11
   targets it arrives with no focus change, even minimized
 - **Anti-AFK** — nudges the pointer and puts it back, with zero drift
@@ -466,6 +471,121 @@ start it in the Dock; the Dock tab tells you when it finds one. The Dock
 needs a Plasma Wayland session (`kwin_wayland`) and `dbus-daemon`, which come
 with Plasma.
 
+### The Tower Defense tab
+
+The tower defense macros for Windows show the game inside their own window
+and farm from there. The **Tower Defense** tab does the same with the Dock:
+the game of the Dock shows in the middle of the tab about 20 times a second,
+and mouse, wheel and keys over it go to the game, so you can also play from
+the tab. The farm only looks at the screen of the Dock and presses keys and
+clicks in it. It never reads or touches the memory of the game.
+
+| Part | What is there |
+|---|---|
+| Left | **Start (F4)**, **Stop (F5)** and **Pause (F6)**, what the farm is doing, how long it has been running, matches, wins and losses, **Open the Dock**, **Dock the game** (minimizes the Dock window while the game keeps playing in the tab) and **Undock**, **Join the game** (opens the game link in the Dock), and the log |
+| Middle | The game. **Line up the camera** zooms out and drags down as at the start of each match, and **Show the spots** marks where each tower goes |
+| Right | The **Strategy**, **Screens** and **Settings** tabs |
+
+On this tab the WayClick window grows to 1600×900 (less on a smaller screen)
+and goes back to its size when you leave the tab. The view stops while the
+tab is hidden and drops to 5 frames a second while WayClick is behind
+another window.
+
+**Strategy.** A strategy has a name, notes, five towers with the spots where
+each goes, a timeline and the lobby.
+
+- **Pick** on a tower, then click on the game where it goes. A right click
+  removes a spot and Esc ends.
+- **● Record** lines up the camera and then notes what you play on the view.
+  1 to 5 takes a tower and a click places it (within 8 px of a spot the tower
+  already has, it is that spot), clicking a tower and then E or Z upgrades it
+  on the top or bottom path, Q drops the tower in hand, and F10 undoes the
+  last action. The times count from when the recording starts, so start it
+  when the match starts.
+- **Add…**, **Edit…** and **Remove** change the timeline by hand, with
+  place, upgrade on either path, sell, press a key, click a picture and wait
+  for a picture.
+- **Lobby** holds the buttons clicked in order to get into a match, and a
+  lobby macro (one of the Hotkeys tab) that plays before them, like walking
+  into an elevator.
+- **Export…** and **Import…** share a strategy in one `.wayclick` file with
+  its pictures. A strategy file given to the import of the Hotkeys tab is
+  offered to this tab, and a file of macros given here points to the Hotkeys
+  tab.
+- A strategy keeps the size of the Dock it was made at, and the tab warns
+  when the Dock is another size, since the spots are places on the screen.
+
+**Screens.** Pictures of the game, captured from the Dock with **Capture…**
+while it shows them.
+
+| Picture | What the farm does with it |
+|---|---|
+| Match started | Optional. The clock of the strategy starts when it shows up, and without it right after the lobby |
+| Tower placed | A piece of the panel that opens when a tower goes down. With it, a tower that did not go down, like when there is not enough cash yet, is tried again |
+| Skip wave | Optional. Clicked whenever it shows up during the match |
+| Victory, Defeat | Something that only shows when the match is won, or lost. Counts a win or a loss |
+| Reconnect | Optional. Clicked whenever it shows up, and the farm starts over from the lobby |
+| Sell button | Optional. Clicked to sell after clicking the tower. Without it the sell key of Settings is pressed |
+| After the match | The buttons clicked in order when the match ends, like the one that plays again. With no Victory and Defeat pictures the first one is also how the end of a match is seen |
+
+In the settings of the game turn off Camera Shake and Low Quality Rings,
+turn on Show Tower Options (the panel that the Tower placed picture comes
+from), keep Cancel Placement on Q and the Switch Hotbar key off Q, and keep
+the UI Scale as it was when you captured the pictures.
+
+**Settings.**
+
+| Setting | What it does |
+|---|---|
+| Game window | The app name of the game window in the Dock, `Sober` by default |
+| Game link | Opens the game in the Dock with **Join the game**, and again when the game closes. A Roblox game page becomes `roblox://placeId=ID` and a private server link (`…?privateServerLinkCode=…`) becomes `roblox://placeId=ID&linkCode=CODE`, the two forms on the [Roblox page about deep linking](https://create.roblox.com/docs/production/promotion/deeplinks); a `roblox://` link stays as it is |
+| Waits, Longest match, Stop after | How long to wait for each lobby button and for the match to start, how long a match may take before the farm moves on, and how many matches to play (never stops by default) |
+| Action speed | Fast, Balanced or Slow, the pauses between pressing, clicking and looking |
+| Keep trying to place for, Try again every | How long a tower that does not go down is tried again, and how often |
+| Skip waves until | Minutes from the start of the match after which Skip wave is left alone (the whole match by default) |
+| Camera | **Line up the camera when a match starts** holds the zoom out key (O) for some time and then drags down with the right button from the middle of the screen |
+| Game keys | Upgrade on the top path (E) and on the bottom path (Z), sell (none), cancel placing (Q) |
+| Hotkeys | Start F4, Stop F5 and Pause F6, in any window while the Dock is open. A hotkey macro or the WayClick hotkey on the same key takes it first |
+| Report | A Discord webhook that gets a line after each match, with a screenshot if you want, filled with `{run}`, `{result}`, `{wins}`, `{losses}` and `{time}` |
+
+Share links (`roblox.com/share?code=…`) are refused. The
+[Roblox page about share links](https://create.roblox.com/docs/production/promotion/share-links)
+gives them no `roblox://` form, so they would open in the browser, outside
+the Dock. Use the game page or a link with `privateServerLinkCode`, or open
+the server by hand in the Dock before you press Start.
+
+**How a farm goes.**
+
+1. The game window has to be open in the Dock. When it is not, the farm
+   opens the game link in the Dock and waits up to 2 minutes for it.
+2. It plays the lobby macro, if there is one, and clicks the lobby buttons
+   in order. When the first one does not show up, a match is already on.
+3. It waits for Match started, starts the clock of the strategy and lines up
+   the camera.
+4. Each action runs at its time. A placement presses the key of the tower,
+   clicks its spot and waits for the Tower placed picture. When that does not
+   show up, Q cancels and the tower is tried again, and Skip wave keeps being
+   clicked meanwhile. An upgrade clicks the tower and presses E or Z.
+5. Victory, Defeat or the first After the match button end the match. The
+   farm counts it, posts the report, clicks the After the match buttons and
+   starts over, until the number of matches you set.
+6. When the game window closes or the Reconnect button shows up, the round
+   starts over, and the game opens again by its link. Five rounds in a row
+   without a match stop the farm, since the pictures probably do not match
+   the game.
+
+Pause lets go of everything and stops the clock of the match with it, so the
+strategy goes on where it was.
+
+This was measured against a fake tower defense game in a nested KWin
+(`tests/t_tower_kwin.py`): two matches, with the game crashing in the second
+one and opening again by its `roblox://` link, and the view at 20 frames a
+second, each capture of a 960×540 Dock taking 2.9 ms, about 7% of a core for
+WayClick and 4% for the KWin of the Dock. It has not been tried against
+Tower Defense Simulator itself yet, and no ready strategies come with
+WayClick. Check the rules of the game first, since many online games ban
+automated farming.
+
 ### Trigger
 
 **Mode**
@@ -700,6 +820,19 @@ on that D-Bus. A small script in the desktop's KWin finds the Dock window by
 its process to keep its size, bring it forward and close it. Measured in the
 nested KWin of `tests/t_dock_kwin.py`, the Dock opens in about 0.2 s.
 
+**The Tower Defense tab.** The view is a widget that asks the KWin of the
+Dock for the same ScreenShot2 capture up to 20 times a second, from a thread
+of its own, and draws it scaled into the tab, keeping its shape. A press, a
+release, a move, the wheel or a key over it becomes the matching
+`org_kde_kwin_fake_input` request on the Dock socket, at the point of the
+Dock under the pointer, and while the right or middle button is held the
+motion is sent relative, since a game may lock the pointer while it turns
+the camera. Keys the farm uses as hotkeys are not sent. The farm is a Dock
+macro runner of its own, with the clock of the match, watches for the end of
+a match, a closed window, the reconnect button and skip wave, and waits in
+slices of a quarter of a second, so Pause and Stop act at once. Nothing in it
+reads the memory of the game or of Sober.
+
 ## Troubleshooting
 
 **"Global hotkey OFF"** — you are not in the `input` group, or the session
@@ -767,9 +900,11 @@ sg input -c "python3 tests/t_abs_pointer_libinput.py"  # the absolute pointer as
 sg input -c "python3 tests/t_farm_macros.py"        # watches, windows, counters, the recorder, a whole farm on a fake game
 sg input -c "python3 tests/t_farm_ui.py"            # editors, recorder, farm assistant, .wayclick files
 python3 tests/t_dock_ui.py                          # the Dock tab, Dock macros, editors and links on a fake Dock
+python3 tests/t_tower_ui.py                         # the Tower Defense tab: strategies, recorder, files and a whole farm on a fake game
 python3 tests/t_farm_kwin.py                        # window steps and the cursor against a real KWin, nested
 python3 tests/t_dock_kwin.py                        # the Dock in a real KWin, nested: keys, clicks, wheel, screen, windows, size, links, closing
 python3 tests/t_dock_hidden.py                      # a game keeps drawing in the Dock behind other windows and minimized
+python3 tests/t_tower_kwin.py                       # the farm and the view of the Tower Defense tab on a fake game in the real Dock
 python3 tests/t_sober_dock.py                       # Sober opening in the Dock, its Close button found and clicked
 python3 tests/t_screen_portal.py                    # the real portal, inside bubblewrap
 python3 tests/bench_find_image.py                   # image search, found or not and how fast
@@ -801,7 +936,7 @@ downloaded once, `pasta`, `bwrap`, `kwin_wayland`, `wl-clipboard` and
 `kscreen-doctor`, and skips when one is missing (`WCTEST_PASTA=/path/to/pasta`
 uses one that is not installed).
 
-`t_dock_kwin.py`, `t_dock_hidden.py` and `t_sober_dock.py` open the Dock
+`t_dock_kwin.py`, `t_dock_hidden.py`, `t_tower_kwin.py` and `t_sober_dock.py` open the Dock
 inside the same box, so its window lands on the nested KWin and nothing
 reaches your desktop. `t_sober_dock.py` lets the Dock start Sober with its
 own command. The box has no network, so that Sober never meets yours over its

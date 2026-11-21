@@ -7,8 +7,8 @@ import signal, subprocess, sys, tempfile, threading, time, urllib.request
 import wave
 
 try:
-    from PySide6.QtCore import (Qt, QObject, QPointF, QRectF, QTimer, QUrl, Signal,
-                                Slot)
+    from PySide6.QtCore import (Qt, QEvent, QObject, QPointF, QRectF, QTimer,
+                                QUrl, Signal, Slot)
     from PySide6.QtGui import (QAction, QBrush, QColor, QDesktopServices, QIcon,
                                QImage, QLinearGradient,
                                QKeySequence, QPainter, QPainterPath, QPen,
@@ -17,11 +17,13 @@ try:
     from PySide6.QtWidgets import (QAbstractItemView, QApplication,
                                    QCheckBox, QComboBox, QDialog,
                                    QDialogButtonBox, QFileDialog,
-                                   QFormLayout, QDoubleSpinBox, QGroupBox,
+                                   QFormLayout, QDoubleSpinBox, QGridLayout,
+                                   QGroupBox,
                                    QHBoxLayout, QLabel, QLineEdit,
                                    QListWidget, QListWidgetItem, QMenu,
                                    QMenuBar, QMessageBox, QPlainTextEdit,
-                                   QPushButton, QScrollArea, QSpinBox,
+                                   QPushButton, QScrollArea, QSizePolicy,
+                                   QSpinBox,
                                    QSystemTrayIcon, QVBoxLayout, QWidget,
                                    QFrame, QListView, QTabWidget)
 except ImportError:
@@ -32,7 +34,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -3776,16 +3778,24 @@ def recorded_steps(events, pauses=True):
 ROBLOX_GAME_RE = re.compile(
     r"^https?://(?:www\.|web\.)?roblox\.com/games/(?:start\?(?:.*&)?"
     r"placeId=)?(\d+)", re.I)
+ROBLOX_PRIVATE_RE = re.compile(
+    r"[?&]privateServerLinkCode=([\w-]{1,200})(?:&|#|$)", re.I)
 
 
 def farm_link(text):
     """O link que reabre o jogo. Página de jogo do Roblox
     (roblox.com/games/ID/...) vira roblox://placeId=ID, o formato que a
-    página de deep links do Roblox documenta para abrir direto no app; o
+    página de deep links do Roblox documenta para abrir direto no app, e o
+    link de um servidor privado (...?privateServerLinkCode=CÓDIGO) leva o
+    código junto, como linkCode, o parâmetro da mesma página para isso; o
     resto fica como veio."""
     text = (text or "").strip()
     m = ROBLOX_GAME_RE.match(text)
-    return f"roblox://placeId={m.group(1)}" if m else text
+    if not m:
+        return text
+    code = ROBLOX_PRIVATE_RE.search(text)
+    return f"roblox://placeId={m.group(1)}" + (
+        f"&linkCode={code.group(1)}" if code else "")
 
 
 def farm_macro(spec):
@@ -3891,39 +3901,51 @@ def _no_hook(st):
     return st
 
 
+class _Packer:
+    """Imagens de um arquivo .wayclick: cada caminho vira um nome, e o
+    conteúdo vai em base64 (o mesmo arquivo uma vez só)."""
+
+    def __init__(self):
+        self.images, self.names, self.missing = {}, {}, []
+
+    def __call__(self, path):
+        if not path:
+            return ""
+        if path in self.names:
+            return self.names[path] or ""
+        try:
+            with open(path, "rb") as fh:
+                data = base64.b64encode(fh.read()).decode()
+        except OSError:
+            self.missing.append(path)
+            self.names[path] = None
+            return ""
+        stem, ext = os.path.splitext(os.path.basename(path))
+        ext = ext.lower() if ext.lower() in IMAGE_EXTS else ".png"
+        name, n = stem + ext, 2
+        while name in self.images and self.images[name] != data:
+            name, n = f"{stem}-{n}{ext}", n + 1
+        self.images[name] = data
+        self.names[path] = name
+        return name
+
+
 def export_macros(macros):
     """(dados para json.dump, caminhos de imagem que não deu para ler,
     quantos webhooks ficaram de fora)."""
-    names, images, missing, out, hooks = {}, {}, [], [], 0
+    pack, out, hooks = _Packer(), [], 0
     for m in macros:
         m = normalize_macro(m)
         for st in m["steps"]:
             if st["op"] == "notify" and st.get("url"):
                 hooks += 1
                 _no_hook(st)
-            path = st.get("path")
-            if not path:
-                continue
-            if path not in names:
-                try:
-                    with open(path, "rb") as fh:
-                        data = base64.b64encode(fh.read()).decode()
-                except OSError:
-                    missing.append(path)
-                    names[path] = None
-                    continue
-                stem, ext = os.path.splitext(os.path.basename(path))
-                ext = ext.lower() if ext.lower() in IMAGE_EXTS else ".png"
-                name, n = stem + ext, 2
-                while name in images and images[name] != data:
-                    name, n = f"{stem}-{n}{ext}", n + 1
-                images[name] = data
-                names[path] = name
-            if names[path]:
-                st["path"] = names[path]
+            name = pack(st.get("path"))
+            if name:
+                st["path"] = name
         out.append(m)
     return ({"wayclick": 1, "app": f"WayClick {VERSION}", "macros": out,
-             "images": images}, missing, hooks)
+             "images": pack.images}, pack.missing, hooks)
 
 
 def _safe_image_name(name):
@@ -3933,21 +3955,12 @@ def _safe_image_name(name):
     return stem, ext
 
 
-def import_macros(data, folder=None, dry=False):
-    """Lê o que export_macros gravou. As imagens vão para a pasta de imagens
-    (a mesma imagem não é copiada duas vezes; outra com o mesmo nome ganha
-    um número), cada macro ganha id novo e chega desligado, webhooks saem,
-    e um passo que abriria algo que não é web, Roblox ou Steam vira uma
-    espera vazia (os saltos continuam apontando para o passo certo).
-    Devolve (macros, avisos); dry só confere, sem gravar nada. ValueError
-    se não for um arquivo de macros."""
-    if not isinstance(data, dict) or data.get("wayclick") != 1 \
-            or not isinstance(data.get("macros"), list):
-        raise ValueError("not a WayClick macro file")
-    folder = folder or images_dir()
-    saved, notes = {}, []
-    images = data.get("images") if isinstance(data.get("images"), dict) \
-        else {}
+def _save_file_images(images, folder, dry=False):
+    """As imagens de um arquivo .wayclick (nome -> base64) na pasta de
+    imagens: {nome no arquivo: caminho}. A mesma imagem não é copiada duas
+    vezes, outra com o mesmo nome ganha um número, e o que não é imagem de
+    verdade fica de fora. dry só confere, sem gravar nada."""
+    saved = {}
     for name, b64 in list(images.items())[:MAX_FILE_IMAGES]:
         if not isinstance(name, str) or not isinstance(b64, str):
             continue
@@ -3975,6 +3988,24 @@ def import_macros(data, folder=None, dry=False):
             with open(path, "wb") as fh:
                 fh.write(raw)
         saved[name] = path
+    return saved
+
+
+def import_macros(data, folder=None, dry=False):
+    """Lê o que export_macros gravou. As imagens vão para a pasta de imagens
+    (a mesma imagem não é copiada duas vezes; outra com o mesmo nome ganha
+    um número), cada macro ganha id novo e chega desligado, webhooks saem,
+    e um passo que abriria algo que não é web, Roblox ou Steam vira uma
+    espera vazia (os saltos continuam apontando para o passo certo).
+    Devolve (macros, avisos); dry só confere, sem gravar nada. ValueError
+    se não for um arquivo de macros."""
+    if not isinstance(data, dict) or data.get("wayclick") != 1 \
+            or not isinstance(data.get("macros"), list):
+        raise ValueError("not a WayClick macro file")
+    notes = []
+    images = data.get("images") if isinstance(data.get("images"), dict) \
+        else {}
+    saved = _save_file_images(images, folder or images_dir(), dry)
     macros, hooks, links, broken = [], 0, [], 0
     for m in data["macros"][:MAX_MACROS]:
         if not isinstance(m, dict):
@@ -5969,6 +6000,7 @@ for (var i = 0; i < ws.length; i++) {
     if (w.minimized) w.minimized = false;
     workspace.activeWindow = w;
   }
+  if (%(hide)s) w.minimized = true;
   out.w = w.clientGeometry.width;
   out.h = w.clientGeometry.height;
   out.minimized = w.minimized === true;
@@ -6267,10 +6299,11 @@ class DockScreen:
         self._bus = None
         self._cache = (0.0, [])
 
-    def _connect(self):
+    def _connect(self, np=True):
         if not self.dock.alive():
             raise VisionError(_("The Dock is not open."))
-        _numpy()
+        if np:
+            _numpy()
         try:
             import gi
             gi.require_version("Gio", "2.0")
@@ -6341,9 +6374,31 @@ class DockScreen:
             self._cache = (now, [frame])
             return [frame]
 
-    def _shot(self):
-        Gio, GLib = self._connect()
-        np = _numpy()
+    def qimage(self):
+        """A tela da Doca como QImage, para a visão da aba Tower Defense: o
+        mesmo ScreenShot2, sem passar por numpy. QImage() vazia se não
+        deu."""
+        with self.lock:
+            try:
+                meta, data = self._capture(np=False)
+            except VisionError as e:
+                self.state, self.error = "failed", str(e)
+                return QImage()
+            except Exception as e:                 # noqa: BLE001
+                self.state = "failed"
+                self.error = _("Screen capture failed: {err}",
+                               err=getattr(e, "message", None) or str(e))
+                return QImage()
+            self.state, self.error = "on", ""
+        W, H, stride = int(meta["width"]), int(meta["height"]), \
+            int(meta["stride"])
+        fmt = QImage.Format_RGB32 if meta.get("format") in (4, 5, 6) \
+            else QImage.Format_RGBX8888
+        return QImage(data, W, H, stride, fmt).copy()
+
+    def _capture(self, np=True):
+        """Uma captura do KWin da Doca: (metadados, bytes)."""
+        Gio, GLib = self._connect(np)
         r, w = os.pipe()
         fdl = Gio.UnixFDList.new()
         idx = fdl.append(w)
@@ -6378,6 +6433,13 @@ class DockScreen:
         data = b"".join(chunks)
         if W <= 0 or H <= 0 or len(data) < stride * H:
             raise VisionError(_("The Dock did not send its screen."))
+        return meta, data
+
+    def _shot(self):
+        np = _numpy()
+        meta, data = self._capture()
+        W, H, stride = int(meta["width"]), int(meta["height"]), \
+            int(meta["stride"])
         a = np.frombuffer(data, np.uint8)[:stride * H]
         a = a.reshape(H, stride)[:, :W * 4].reshape(H, W, 4)
         # QImage: RGB32 e ARGB32 (4, 5, 6) são B, G, R, A na memória;
@@ -6821,7 +6883,7 @@ class Dock(QObject):
         return kw.cursor() if kw is not None and kw.ok else None
 
     # ---------------------------------------------- a janela no desktop --
-    def _host(self, fix=False, show=False):
+    def _host(self, fix=False, show=False, hide=False):
         if self.kwin is None or self.kwin.poll() is not None:
             return None
         kw = KWIN()
@@ -6830,7 +6892,8 @@ class Dock(QObject):
         w, h = self.size
         raw = kw.call(DOCK_HOST_JS, pid=int(self.kwin.pid),
                       fix="true" if fix else "false",
-                      show="true" if show else "false", w=int(w), h=int(h))
+                      show="true" if show else "false",
+                      hide="true" if hide else "false", w=int(w), h=int(h))
         try:
             info = json.loads(raw) if raw else None
         except ValueError:
@@ -6840,6 +6903,11 @@ class Dock(QObject):
     def show(self):
         """Traz a janela da Doca para a frente, mesmo minimizada."""
         return self._host(show=True)
+
+    def hide(self):
+        """Minimiza a janela da Doca no desktop (o jogo segue, e a aba Tower
+        Defense mostra ele)."""
+        return self._host(hide=True)
 
     def set_size(self, w, h):
         self.size = (int(w), int(h))
@@ -7039,6 +7107,1056 @@ class DockRunner(MacroRunner):
 
     def _open(self, url):
         self.dock.open(url, report=self._report)
+
+
+# ------------------------------------------------- Tower Defense --------
+# A aba Tower Defense: o jeito do NoName Macro (o jogo encaixado na janela,
+# as 5 torres com os lugares de cada uma, gravar jogando, F4 começa e F5
+# para), só que olhando a tela da Doca: nada lê a memória do Roblox. Sem ler
+# dinheiro nem onda, colocar uma torre é tentar até aparecer a imagem de
+# "colocou" (o painel da torre), e cada ação tem a hora dela, contada do
+# começo da partida. Os lugares são posições na tela da Doca, por isso a
+# câmera é alinhada do mesmo jeito em toda partida e na gravação.
+TOWER_SLOTS = 5
+TOWER_MAX_POINTS = 30          # lugares de uma torre
+TOWER_MAX_ACTIONS = 500
+TOWER_MAX_STRATS = 50
+TOWER_MAX_LOBBY = 8
+TOWER_MAX_AFTER = 4
+TOWER_ACTS = ("place", "upgrade", "sell", "key", "image")
+TOWER_SPEEDS = {"fast": 0.6, "balanced": 1.0, "slow": 1.8}
+TOWER_PRESS_MS = {"fast": 40.0, "balanced": 50.0, "slow": 80.0}
+TOWER_SCREENS = ("start", "placed", "skip", "victory", "defeat",
+                 "reconnect", "sell")
+# teclas do TDS segundo o guia do Tower Defense Macro: 1 a 5 as torres, Q
+# cancela, E melhora o caminho de cima e Z o de baixo, O afasta a câmera.
+# Vender não tem tecla conhecida: fica sem, até a pessoa escolher
+TOWER_KEYS = {"top": "E", "bottom": "Z", "sell": "", "cancel": "Q",
+              "zoom": "O"}
+TOWER_HOTKEYS = {"start": "F4", "stop": "F5", "pause": "F6"}
+TOWER_NEAR = 24                # px: um clique a isso de um lugar é a torre dele
+TOWER_SAME = 8                 # px: colocar a isso de um lugar é o mesmo lugar
+TOWER_COLORS = ("#3daee9", "#f67400", "#27ae60", "#da4453", "#9b59b6")
+TOWER_REPORT = ("Match {run}: {result}. {wins} wins, {losses} losses, "
+                "farming for {time}.")
+TOWER_FILE_KIND = "tower"      # o .wayclick de uma estratégia leva isto
+
+
+def _tower_point(p):
+    if not isinstance(p, (list, tuple)) or len(p) != 2:
+        return None
+    x, y = (_num(v, -1, -1, COORD, int) for v in p)
+    return [x, y] if x >= 0 and y >= 0 else None
+
+
+def _tower_action(a, towers):
+    """Uma ação da linha do tempo, conferida contra as torres (o lugar tem
+    que existir). None se não vale."""
+    if not isinstance(a, dict) or a.get("do") not in TOWER_ACTS:
+        return None
+    out = {"t": round(_num(a.get("t"), 0.0, 0.0, 86400.0), 2),
+           "do": a["do"]}
+    if a["do"] in ("place", "upgrade", "sell"):
+        k = _num(a.get("tower"), -1, -1, TOWER_SLOTS - 1, int)
+        j = _num(a.get("point"), -1, -1, TOWER_MAX_POINTS - 1, int)
+        if k < 0 or j < 0 or j >= len(towers[k]["points"]):
+            return None
+        out["tower"], out["point"] = k, j
+        if a["do"] == "upgrade":
+            out["path"] = "bottom" if a.get("path") == "bottom" else "top"
+        return out
+    if a["do"] == "key":
+        code = _num(a.get("code"), 0, 0, 0x2ff, int)
+        if not code or is_button(code):
+            return None
+        out["code"] = code
+        out["name"] = str(a.get("name") or key_label(code))[:40]
+        return out
+    path = str(a.get("path") or "")[:4096]
+    if not path:
+        return None
+    out["path"] = path
+    out["click"] = a.get("click", True) is not False
+    out["wait"] = round(_num(a.get("wait", 10.0), 10.0, 0.0, 3600.0), 1)
+    return out
+
+
+def normalize_tower_strategy(s):
+    """Uma estratégia: as 5 torres (nome e lugares), a linha do tempo, o
+    caminho do lobby e o tamanho da Doca em que foi feita."""
+    s = s if isinstance(s, dict) else {}
+    raw = s.get("towers") if isinstance(s.get("towers"), list) else []
+    towers, remap = [], []
+    for k in range(TOWER_SLOTS):
+        t = raw[k] if k < len(raw) and isinstance(raw[k], dict) else {}
+        pts, where = [], {}
+        given = t.get("points") if isinstance(t.get("points"), list) else []
+        for j, p in enumerate(given[:TOWER_MAX_POINTS]):
+            p = _tower_point(p)
+            if p is not None:
+                where[j] = len(pts)
+                pts.append(p)
+        towers.append({"name": " ".join(str(t.get("name") or "").split())
+                       [:40], "points": pts})
+        remap.append(where)
+    acts = []
+    given = s.get("actions") if isinstance(s.get("actions"), list) else []
+    for a in given[:TOWER_MAX_ACTIONS]:
+        if isinstance(a, dict) and a.get("do") in ("place", "upgrade",
+                                                    "sell"):
+            # um lugar que não valeu sumiu: a ação aponta para o certo
+            k = _num(a.get("tower"), -1, -1, TOWER_SLOTS - 1, int)
+            j = _num(a.get("point"), -1, -1, TOWER_MAX_POINTS - 1, int)
+            if k < 0 or j not in remap[k]:
+                continue
+            a = dict(a, point=remap[k][j])
+        a = _tower_action(a, towers)
+        if a:
+            acts.append(a)
+    acts.sort(key=lambda a: a["t"])
+    size = s.get("size")
+    if isinstance(size, (list, tuple)) and len(size) == 2:
+        size = [_num(v, 0, 0, COORD, int) for v in size]
+        size = size if size[0] > 0 and size[1] > 0 else None
+    else:
+        size = None
+    lobby = [str(p)[:4096] for p in (s.get("lobby") or [])
+             if isinstance(p, str) and p][:TOWER_MAX_LOBBY] \
+        if isinstance(s.get("lobby"), list) else []
+    return {"id": str(s.get("id") or new_macro_id())[:16],
+            "name": " ".join(str(s.get("name") or "").split())[:60]
+            or "Strategy",
+            "notes": str(s.get("notes") or "")[:2000],
+            "size": size, "towers": towers, "actions": acts, "lobby": lobby,
+            "lobby_macro": str(s.get("lobby_macro") or "")[:16]}
+
+
+def _tower_key(value, default):
+    code = _num(value, 0, 0, 0x2ff, int)
+    if code and not is_button(code):
+        return code
+    return KEYS.get(default, 0) if default else 0
+
+
+def normalize_tower(c):
+    """A configuração inteira da aba (cfg["tower"]): as estratégias, a
+    escolhida, as imagens do jogo e os ajustes."""
+    c = c if isinstance(c, dict) else {}
+    strats, seen = [], set()
+    given = c.get("strategies") if isinstance(c.get("strategies"), list) \
+        else []
+    for s in given[:TOWER_MAX_STRATS]:
+        if isinstance(s, dict):
+            s = normalize_tower_strategy(s)
+            if s["id"] in seen:
+                s["id"] = new_macro_id()
+            seen.add(s["id"])
+            strats.append(s)
+    cur = c.get("current")
+    if cur not in seen:
+        cur = strats[0]["id"] if strats else ""
+    sc = c.get("screens") if isinstance(c.get("screens"), dict) else {}
+    screens = {k: str(sc.get(k) or "")[:4096] for k in TOWER_SCREENS}
+    after = sc.get("after") if isinstance(sc.get("after"), list) else []
+    screens["after"] = [str(p)[:4096] for p in after
+                        if isinstance(p, str) and p][:TOWER_MAX_AFTER]
+    kc = c.get("keys") if isinstance(c.get("keys"), dict) else {}
+    keys = {}
+    for name, dflt in TOWER_KEYS.items():
+        keys[name] = _tower_key(kc.get(name, KEYS.get(dflt, 0)), dflt) \
+            if name in kc or dflt else 0
+    hc = c.get("hotkeys") if isinstance(c.get("hotkeys"), dict) else {}
+    hot = {n: _tower_key(hc.get(n, KEYS[d]), d)
+           for n, d in TOWER_HOTKEYS.items()}
+    return {
+        "strategies": strats, "current": cur, "screens": screens,
+        "window": " ".join(str(c.get("window") or "").split())[:100]
+        or "Sober",
+        "link": str(c.get("link") or "").strip()[:2000],
+        "lobby_wait": _num(c.get("lobby_wait", 60), 60, 1, 3600, int),
+        "start_wait": _num(c.get("start_wait", 180), 180, 1, 3600, int),
+        "match_max": _num(c.get("match_max", 40), 40, 1, 600, int),
+        "limit": _num(c.get("limit", 0), 0, 0, MAX_RUNS, int),
+        "speed": c.get("speed") if c.get("speed") in TOWER_SPEEDS
+        else "balanced",
+        "place_for": _num(c.get("place_for", 120), 120, 5, 3600, int),
+        "retry": round(_num(c.get("retry", 2.0), 2.0, 0.2, 60.0), 1),
+        "skip_until": _num(c.get("skip_until", 0), 0, 0, 600, int),
+        "camera": bool(c.get("camera", True)),
+        "zoom_ms": _num(c.get("zoom_ms", 1500), 1500, 0, 10000, int),
+        "drag": _num(c.get("drag", 300), 300, -3000, 3000, int),
+        "keys": keys, "hotkeys": hot,
+        "hook": str(c.get("hook") or "").strip()[:500],
+        "shot": bool(c.get("shot", True)),
+        "report": str(c.get("report") or TOWER_REPORT)[:1000],
+        "conf": round(_num(c.get("conf", 0.85), 0.85, 0.5, 1.0), 3),
+    }
+
+
+def tower_link(text):
+    """O link que abre o jogo dentro da Doca, ou "" se ele abriria fora
+    dela. roblox:// fica como veio; a página de um jogo do Roblox vira
+    roblox://placeId=ID e o link de um servidor privado
+    (privateServerLinkCode) roblox://placeId=ID&linkCode=CÓDIGO, os dois
+    parâmetros que a página de deep links do Roblox documenta. Link de
+    compartilhar (roblox.com/share) não tem forma documentada no app e
+    abriria no navegador, fora da Doca."""
+    link = farm_link(text)
+    return link if link.lower().startswith("roblox://") else ""
+
+
+def tower_name(s, k):
+    name = s["towers"][k]["name"]
+    return f"{k + 1} {name}" if name else _("tower {n}", n=k + 1)
+
+
+def tower_action_text(a, s):
+    """'Place 1 Scout at spot 2' para a lista e o registro."""
+    do = a["do"]
+    if do in ("place", "upgrade", "sell"):
+        who = tower_name(s, a["tower"])
+        spot = a["point"] + 1
+        if do == "place":
+            return _("Place {tower} at spot {n}", tower=who, n=spot)
+        if do == "sell":
+            return _("Sell {tower} at spot {n}", tower=who, n=spot)
+        return (_("Upgrade {tower} at spot {n}, top path", tower=who, n=spot)
+                if a["path"] == "top" else
+                _("Upgrade {tower} at spot {n}, bottom path", tower=who,
+                  n=spot))
+    if do == "key":
+        return _("Press {key}", key=a["name"])
+    name = os.path.basename(a["path"])
+    return (_("Click the picture {name}", name=name) if a["click"]
+            else _("Wait for the picture {name}", name=name))
+
+
+def tower_time(t):
+    """1:02.5, a hora de uma ação contada do começo da partida."""
+    m, s = divmod(max(0.0, float(t)), 60.0)
+    return f"{int(m)}:{s:04.1f}"
+
+
+def tower_uses(s, k, j=None):
+    """Ações da linha do tempo que usam a torre k (no lugar j)."""
+    return [a for a in s["actions"] if a.get("tower") == k
+            and (j is None or a.get("point") == j)]
+
+
+def tower_drop_point(s, k, j):
+    """Tira o lugar j da torre k e as ações que usavam ele; as dos lugares
+    seguintes passam a apontar um a menos."""
+    s["towers"][k]["points"].pop(j)
+    keep = []
+    for a in s["actions"]:
+        if a.get("tower") == k and "point" in a:
+            if a["point"] == j:
+                continue
+            if a["point"] > j:
+                a = dict(a, point=a["point"] - 1)
+        keep.append(a)
+    s["actions"] = keep
+
+
+def export_tower(strategy, screens):
+    """(dados para json.dump, caminhos que não deu para ler). A estratégia
+    com as imagens dentro, e as telas do jogo junto, para quem recebe não
+    precisar capturar tudo de novo. O macro do lobby não vai: ele é um
+    macro da aba Atalhos, e o webhook nem entra aqui."""
+    s = normalize_tower_strategy(strategy)
+    pack = _Packer()
+    s["lobby_macro"] = ""
+    s["lobby"] = [x for x in (pack(p) for p in s["lobby"]) if x]
+    for a in s["actions"]:
+        if a["do"] == "image":
+            a["path"] = pack(a["path"])
+    s["actions"] = [a for a in s["actions"] if a.get("path", "x")]
+    sc = {k: pack(screens.get(k) or "") for k in TOWER_SCREENS}
+    sc["after"] = [x for x in (pack(p) for p in screens.get("after") or ())
+                   if x]
+    return ({"wayclick": 1, "app": f"WayClick {VERSION}",
+             "kind": TOWER_FILE_KIND,
+             "tower": {"strategy": s, "screens": sc},
+             "images": pack.images}, pack.missing)
+
+
+def import_tower(data, screens, folder=None, dry=False):
+    """Lê o que export_tower gravou: (estratégia, telas a preencher,
+    avisos). As imagens vão para a pasta de imagens (a mesma não é copiada
+    duas vezes); das telas do jogo, só as que estão vazias aqui ganham as
+    do arquivo. ValueError se não for um arquivo de estratégia."""
+    if not isinstance(data, dict) or data.get("wayclick") != 1 \
+            or data.get("kind") != TOWER_FILE_KIND \
+            or not isinstance(data.get("tower"), dict):
+        raise ValueError("not a WayClick Tower Defense file")
+    images = data.get("images") if isinstance(data.get("images"), dict) \
+        else {}
+    saved = _save_file_images(images, folder or images_dir(), dry)
+    t = data["tower"]
+    raw = t.get("strategy") if isinstance(t.get("strategy"), dict) else {}
+    s = dict(raw, id=new_macro_id(), lobby_macro="")
+    s["lobby"] = [saved.get(p, "") for p in (raw.get("lobby") or [])
+                  if isinstance(p, str)] \
+        if isinstance(raw.get("lobby"), list) else []
+    acts = []
+    for a in raw.get("actions") or [] if isinstance(raw.get("actions"),
+                                                    list) else []:
+        if isinstance(a, dict) and a.get("do") == "image":
+            a = dict(a, path=saved.get(str(a.get("path")), ""))
+        acts.append(a)
+    s["actions"] = acts
+    s = normalize_tower_strategy(s)
+    given = t.get("screens") if isinstance(t.get("screens"), dict) else {}
+    fill, kept = {}, 0
+    for k in TOWER_SCREENS:
+        got = saved.get(str(given.get(k) or ""), "")
+        if got and not screens.get(k):
+            fill[k] = got
+        elif got:
+            kept += 1
+    after = [saved.get(p, "") for p in (given.get("after") or [])
+             if isinstance(p, str)] if isinstance(given.get("after"),
+                                                  list) else []
+    after = [p for p in after if p][:TOWER_MAX_AFTER]
+    if after and not screens.get("after"):
+        fill["after"] = after
+    elif after:
+        kept += 1
+    notes = []
+    if fill:
+        notes.append(_("{n} empty pictures of the Screens tab come from the "
+                       "file.", n=len(fill)))
+    if kept:
+        notes.append(_("{n} pictures of the Screens tab were kept as you "
+                       "captured them.", n=kept))
+    if s["size"]:
+        notes.append(_("It was made with the Dock at {w}×{h}.",
+                       w=s["size"][0], h=s["size"][1]))
+    return s, fill, notes
+
+
+class _TowerStop(Exception):
+    """O farm acabou: mandaram parar, chegou no limite ou não tem como."""
+
+
+class TowerEnv(DockEnv):
+    """O DockEnv do farm: avisos e o registro vão para a fila que a aba
+    lê, em vez do motor dos macros."""
+
+    def __init__(self, dock):
+        super().__init__(None, dock)
+        self.lines = []
+        self.lock = threading.Lock()
+
+    def log(self, text, warn=False):
+        with self.lock:
+            self.lines.append((time.time(), bool(warn), str(text)))
+            del self.lines[:-500]
+
+    def take(self):
+        with self.lock:
+            out, self.lines = self.lines, []
+        return out
+
+    def report(self, text):
+        self.log(text, warn=True)
+
+    def say(self, title, text):
+        self.log(text)
+
+
+class TowerRunner(DockRunner):
+    """O farm da aba Tower Defense, na Doca. Um laço de partidas: o jogo
+    aberto (pelo link, se fechou), o lobby (o macro dele e os botões, em
+    ordem), o começo da partida, a câmera, a estratégia na hora de cada ação
+    e o fim (vitória, derrota ou o botão de depois), contando e avisando.
+    Teclas, cliques, tela e vigias são os do DockRunner; os vigias do farm
+    (jogo fechado, reconectar, fim, pular onda) têm índice negativo e
+    convivem com os de um macro de lobby."""
+    W_CLOSED, W_RECONNECT, W_VICTORY, W_DEFEAT, W_AFTER, W_SKIP = range(-6, 0)
+    SLICE_S = 0.25           # esperas em fatias: pausa e parar valem logo
+    OPEN_S = 120.0           # quanto esperar o jogo abrir pelo link
+    MAX_MISSES = 5           # rodadas seguidas sem partida: algo não bate
+
+    def __init__(self, plan, dock, env, on_done=None, camera_only=False):
+        m = normalize_macro({"name": "Tower Defense", "dock": True,
+                             "mode": "once", "repeat": False,
+                             "press_ms": TOWER_PRESS_MS[plan["speed"]],
+                             "steps": [{"op": "wait", "ms": 0}]})
+        super().__init__(CompiledMacro(m), dock, False, False, on_done, env)
+        self.plan = plan
+        self.k = TOWER_SPEEDS[plan["speed"]]
+        self.camera_only = camera_only
+        self.counters = {"matches": 0, "wins": 0, "losses": 0}
+        self.result = ""
+        self.paused = False
+        self.paused_s = 0.0      # tempo total em pausa
+        self.t0 = None           # começo da partida (perf_counter)
+        self._skip_held = None   # o vigia de pular onda, tirado numa ação
+        self.phase = ""
+        self._phase_back = ""
+
+    # ------------------------------------------------------- o registro --
+    def _log(self, text):
+        self.env.log(text)
+
+    def _say(self, text):
+        self.phase = text
+
+    def _report(self, text):
+        # um aviso por problema, como nos macros, mas sem o nome na frente:
+        # o registro já é só do farm
+        if self._gone():
+            if self.stopping:
+                return
+            text = _("the Dock closed, so the farm stopped.")
+        if not text or text in self._told:
+            return
+        self._told.add(text)
+        self.env.report(text[:1].upper() + text[1:])
+
+    def fill(self, text):
+        c = self.counters
+        vals = {"run": str(c["matches"]), "matches": str(c["matches"]),
+                "wins": str(c["wins"]), "losses": str(c["losses"]),
+                "result": self.result,
+                "time": clock_text(time.perf_counter() - self.began)}
+        return FIELD_RE.sub(lambda mo: vals.get(mo.group(1).lower(),
+                                                mo.group(0)), text)
+
+    def _flow(self, st, ok):
+        tag = st.get("tag")
+        if tag:
+            return tag if ok else None
+        return super()._flow(st, ok)
+
+    # ------------------------------------------------------- as esperas --
+    def _hold(self):
+        """Em pausa: nada fica apertado e o relógio da partida para.
+        Devolve quanto tempo ficou parado."""
+        if not self.paused or self._halt.is_set():
+            return 0.0
+        self._let_go()
+        t = time.perf_counter()
+        self._phase_back, self.phase = self.phase, _("Paused")
+        self._log(_("Paused."))
+        while self.paused and not self._halt.is_set():
+            self._halt.wait(0.1)
+        took = time.perf_counter() - t
+        self.paused_s += took
+        if self.t0 is not None:
+            self.t0 += took
+        for w in self.watches.values():
+            w[2] += took
+        if not self._halt.is_set():
+            self.phase = self._phase_back
+            self._log(_("Resumed."))
+        return took
+
+    def _rest(self, seconds):
+        self._hold()
+        super()._rest(seconds)
+
+    def _nap(self, seconds):
+        """Uma fatia de espera com os vigias, sem a pausa (quem chama
+        cuida dela)."""
+        MacroRunner._rest(self, seconds)
+
+    def _wait(self, seconds):
+        end = time.perf_counter() + seconds
+        while True:
+            if self._halt.is_set():
+                raise _TowerStop()
+            end += self._hold()
+            left = end - time.perf_counter()
+            if left <= 0:
+                return
+            self._nap(min(left, self.SLICE_S))
+
+    def _img(self, path, want="seen"):
+        return {"op": "image", "kind": "image", "path": path,
+                "conf": self.plan["conf"], "want": want}
+
+    def _seek(self, path, wait, want="seen"):
+        """Espera a imagem aparecer (ou sumir) por até wait segundos, com
+        vigias e pausa: (aconteceu, ponto achado)."""
+        if not path:
+            return False, None
+        cap = self._screen()
+        if cap is None:
+            return False, None
+        st = self._img(path, want)
+        end = time.perf_counter() + wait
+        while True:
+            if self._halt.is_set():
+                raise _TowerStop()
+            end += self._hold()
+            frames = cap.frames()
+            if not frames:
+                self._blind = True
+                self._report(cap.error or _("Screen sharing stopped."))
+                return False, None
+            try:
+                hit = self._check(st, frames)
+            except VisionError as e:
+                self._report(str(e))
+                return False, None
+            if (hit is not None) == (want == "seen"):
+                return True, hit
+            left = end - time.perf_counter()
+            if left <= 0:
+                return False, None
+            self._nap(min(self.POLL_S, left))
+
+    def _click(self, at):
+        if at is not None and self._go(int(at[0]), int(at[1])):
+            self._pclick("left")
+
+    # -------------------------------------------------------- os vigias --
+    def _arm(self, *names):
+        sc, now = self.plan["screens"], time.perf_counter()
+        for name in names:
+            if name == "closed":
+                st = {"op": "watch", "kind": "window", "want": "gone",
+                      "match": self.plan["window"], "act": "none",
+                      "tag": "closed"}
+                self.watches[self.W_CLOSED] = [st, 5.0, now + 5.0]
+                continue
+            if name == "skip" and not self._skipping():
+                continue
+            if name == "after":
+                path = sc["after"][0] if sc["after"] else ""
+            else:
+                path = sc.get(name) or ""
+            if not path:
+                continue
+            st = dict(self._img(path), op="watch",
+                      act="left" if name in ("skip", "reconnect") else "none")
+            if name == "skip":
+                st["ok"] = "next"
+            else:
+                st["tag"] = "over" if name == "after" else name
+            key = {"reconnect": self.W_RECONNECT, "victory": self.W_VICTORY,
+                   "defeat": self.W_DEFEAT, "after": self.W_AFTER,
+                   "skip": self.W_SKIP}[name]
+            every = 1.0 if name == "skip" else 1.5
+            self.watches[key] = [st, every, now + every]
+
+    def _skipping(self):
+        until = self.plan["skip_until"]
+        return bool(self.plan["screens"]["skip"]) and (
+            not until or self.t0 is None
+            or time.perf_counter() - self.t0 < until * 60.0)
+
+    def _pass(self, steps):
+        """Uma volta pelos passos de um macro (o do lobby), como no laço do
+        MacroRunner. Os vigias dos passos valem só nela; um vigia do farm
+        (índice negativo) que dispara sobe."""
+        mine = {k: w for k, w in self.watches.items() if k < 0}
+        i = 0
+        while i < len(steps):
+            if self._halt.is_set():
+                raise _TowerStop()
+            self._hold()
+            try:
+                if self.watches:
+                    self._watch()
+                to = self._step(steps[i], i)
+            except _Jump as j:
+                if not isinstance(j.to, int):
+                    raise
+                to = j.to
+                self.watches = dict(mine)
+                self._let_go()
+            if to is None:
+                i += 1
+            elif to == self.STOP:
+                break
+            else:
+                if to <= i:
+                    self._sleep(self.MIN_JUMP_S)
+                i = max(0, to)
+                for idx in [k for k in self.watches if k >= i]:
+                    del self.watches[idx]
+        self._let_go()
+        for idx in [k for k in self.watches if k >= 0]:
+            del self.watches[idx]
+
+    # ---------------------------------------------------------- o farm --
+    def run(self):
+        try:
+            if self.camera_only:
+                self._camera()
+            else:
+                self._farm()
+        except _TowerStop:
+            pass
+        except OSError:
+            pass                       # a Doca fechou no meio
+        except Exception as e:         # noqa: BLE001
+            self._report(_("the farm stopped on an error: {err}", err=e))
+        finally:
+            self.watches.clear()
+            try:
+                self._let_go()
+            except OSError:
+                pass
+            if self._seeing:
+                self._seeing = False
+                self.env.screen.release()
+            self.t0 = None
+            if self.on_done:
+                self.on_done(self)
+
+    def _farm(self):
+        s = self.plan["strategy"]
+        self._log(_("Farm started with {name}.", name=s["name"]))
+        if not s["actions"]:
+            self._log(_("This strategy has no actions yet: the farm only "
+                        "plays the matches."))
+        misses = 0
+        while True:
+            if self._halt.is_set():
+                raise _TowerStop()
+            self._blind = False
+            self.watches.clear()
+            self.t0 = None
+            if not self._game():
+                raise _TowerStop()
+            self._arm("closed", "reconnect")
+            try:
+                played = self._round()
+            except _Jump as j:
+                self.watches.clear()
+                self._let_go()
+                self.t0 = None
+                if j.to == "reconnect":
+                    self._log(_("Disconnected: clicked Reconnect, starting "
+                                "over."))
+                    self._wait(5.0 * self.k)
+                elif j.to == "closed":
+                    self._log(_("The game window closed."))
+                    self._wait(2.0)
+                continue
+            misses = 0 if played else misses + 1
+            if misses >= self.MAX_MISSES:
+                self._log(_("{n} rounds in a row without a match: the "
+                            "pictures on the Screens tab may not match the "
+                            "game. Stopping.", n=misses))
+                raise _TowerStop()
+
+    def _has_game(self):
+        info = self._find_window({"match": self.plan["window"]})
+        return bool(info and info.get("found"))
+
+    def _game(self):
+        """A janela do jogo existe na Doca; abre pelo link quando não."""
+        if self._has_game():
+            return True
+        link = tower_link(self.plan["link"])
+        if not link:
+            self._log(_("The game is not open in the Dock. Open it there, or "
+                        "put the game link in Settings, then press Start "
+                        "again."))
+            return False
+        self._say(_("Opening the game…"))
+        self._log(_("Opening the game in the Dock…"))
+        self.dock.open(link, report=self._report)
+        end = time.perf_counter() + self.OPEN_S
+        while time.perf_counter() < end:
+            self._wait(2.0)
+            if self._has_game():
+                self._log(_("The game is open."))
+                self._wait(3.0 * self.k)
+                return True
+        self._log(_("The game did not open in {n} s.", n=int(self.OPEN_S)))
+        return False
+
+    def _round(self):
+        """Lobby, partida e fim. False quando a partida não chegou a
+        começar."""
+        after = self.plan["screens"]["after"]
+        if after and self._seek(after[0], 0)[0]:
+            self._log(_("An end of match screen is open: leaving it first."))
+            self._after()
+        if not self._lobby():
+            return False
+        try:
+            result = self._match()
+        except _Jump as j:
+            if j.to not in ("victory", "defeat", "over"):
+                raise
+            result = j.to
+        finally:
+            for key in (self.W_VICTORY, self.W_DEFEAT, self.W_AFTER,
+                        self.W_SKIP):
+                self.watches.pop(key, None)
+        self._let_go()
+        if result is None:
+            return False
+        self._end(result)
+        return True
+
+    def _lobby(self):
+        s, steps = self.plan["strategy"], self.plan.get("lobby_steps") or ()
+        if steps:
+            self._say(_("Lobby: playing the lobby macro…"))
+            self._log(_("Lobby: playing the lobby macro."))
+            self._pass(steps)
+        lobby = s["lobby"]
+        for k, path in enumerate(lobby):
+            self._say(_("Lobby: waiting for button {n} of {total}…",
+                        n=k + 1, total=len(lobby)))
+            ok, at = self._seek(path, self.plan["lobby_wait"])
+            if not ok:
+                if k == 0:
+                    self._log(_("The first lobby button did not show up: "
+                                "taking it that the match already started."))
+                    return True
+                self._log(_("Lobby button {n} did not show up, starting "
+                            "over.", n=k + 1))
+                return False
+            self._click(at)
+            self._log(_("Lobby: clicked button {n}.", n=k + 1))
+            self._wait(0.5 * self.k)
+        return True
+
+    def _match(self):
+        p, s = self.plan, self.plan["strategy"]
+        n = self.counters["matches"] + 1
+        if p["screens"]["start"]:
+            self._say(_("Waiting for match {n} to start…", n=n))
+            if not self._seek(p["screens"]["start"], p["start_wait"])[0]:
+                self._log(_("The match did not start in {n} s, starting "
+                            "over.", n=p["start_wait"]))
+                return None
+        self.t0 = time.perf_counter()
+        self._log(_("Match {n} started.", n=n))
+        self._arm("victory", "defeat", "after", "skip")
+        if p["camera"]:
+            self._camera()
+        limit = p["match_max"] * 60.0
+        for a in s["actions"]:
+            self._say(_("Match {n}: next, {what} at {t}.", n=n,
+                        what=tower_action_text(a, s), t=tower_time(a["t"])))
+            if not self._at(min(a["t"], limit)) or a["t"] > limit:
+                break
+            skip = self._skip_held = self.watches.pop(self.W_SKIP, None)
+            try:
+                self._do(a)
+            finally:
+                self._skip_held = None
+                if skip is not None and self._skipping():
+                    self.watches[self.W_SKIP] = skip
+        self._say(_("Match {n}: the strategy is done, waiting for the end "
+                    "of the match…", n=n))
+        self._at(limit)
+        self._log(_("Match {n} took longer than {m} min.", n=n,
+                    m=p["match_max"]))
+        return "timeout"
+
+    def _at(self, t):
+        """Espera a hora t (s) da partida, com os vigias e a pausa. False
+        se a partida passou do tempo máximo antes."""
+        limit = self.plan["match_max"] * 60.0
+        while True:
+            if self._halt.is_set():
+                raise _TowerStop()
+            self._hold()
+            if self.W_SKIP in self.watches and not self._skipping():
+                del self.watches[self.W_SKIP]
+                self._log(_("Stopped skipping waves, as set in Settings."))
+            now = time.perf_counter() - self.t0
+            if now >= limit and t < limit:
+                return False
+            left = t - now
+            if left <= 0:
+                return True
+            self._nap(min(left, self.SLICE_S))
+
+    # ------------------------------------------------------- as ações --
+    def _do(self, a):
+        s, keys = self.plan["strategy"], self.plan["keys"]
+        what = tower_action_text(a, s)
+        if a["do"] == "place":
+            self._place(a)
+        elif a["do"] == "upgrade":
+            self._select(a)
+            self._tap(keys["top" if a["path"] == "top" else "bottom"])
+            self._log(_("{what}.", what=what))
+            self._wait(0.2 * self.k)
+        elif a["do"] == "sell":
+            self._select(a)
+            sell = self.plan["screens"]["sell"]
+            if sell:
+                ok, at = self._seek(sell, 2.0 * self.k)
+                if ok:
+                    self._click(at)
+                    self._log(_("{what}.", what=what))
+                else:
+                    self._log(_("{what}: the Sell button did not show up.",
+                                what=what))
+            elif keys["sell"]:
+                self._tap(keys["sell"])
+                self._log(_("{what}.", what=what))
+            else:
+                self._log(_("{what}: choose the sell key in Settings or "
+                            "capture the Sell button.", what=what))
+            self._wait(0.2 * self.k)
+        elif a["do"] == "key":
+            self._tap(a["code"])
+            self._log(_("{what}.", what=what))
+        else:
+            ok, at = self._seek(a["path"], a["wait"])
+            if ok and a["click"]:
+                self._click(at)
+            self._log(_("{what}.", what=what) if ok else
+                      _("{what}: it did not show up.", what=what))
+
+    def _spot(self, a):
+        return self.plan["strategy"]["towers"][a["tower"]]["points"][
+            a["point"]]
+
+    def _close_panel(self):
+        """O painel de uma torre está aberto: fecha, senão ele confirmaria
+        a próxima."""
+        placed = self.plan["screens"]["placed"]
+        if placed and self._seek(placed, 0)[0]:
+            self._tap(self.plan["keys"]["cancel"])
+            self._seek(placed, 1.0 * self.k, want="gone")
+
+    def _place(self, a):
+        p, s = self.plan, self.plan["strategy"]
+        x, y = self._spot(a)
+        slot = KEYS[str(a["tower"] + 1)]
+        cancel = p["keys"]["cancel"]
+        placed = p["screens"]["placed"]
+        what = tower_action_text(a, s)
+        start, paused = time.perf_counter(), self.paused_s
+        tries = 0
+        while True:
+            tries += 1
+            self._close_panel()
+            self._tap(slot)
+            # sem vigia entre a tecla e o clique: um clique no pular onda
+            # com a torre na mão poderia largar ela lá
+            self._sleep(0.15 * self.k)
+            if self._go(x, y):
+                self._pclick("left")
+            if not placed:
+                self._log(_("{what} (not confirmed: there is no Tower placed "
+                            "picture).", what=what))
+                self._wait(0.3 * self.k)
+                return True
+            if self._seek(placed, 1.5 * self.k)[0]:
+                self._log(_("{what}.", what=what) if tries == 1 else
+                          _("{what}, after {n} tries.", what=what, n=tries))
+                return True
+            self._tap(cancel)
+            spent = time.perf_counter() - start - (self.paused_s - paused)
+            if spent >= p["place_for"]:
+                self._log(_("{what}: it did not go down in {n} s, going on.",
+                            what=what, n=p["place_for"]))
+                return False
+            if tries == 1:
+                self._log(_("{what}: not yet, maybe not enough cash. Trying "
+                            "again every {n} s.", what=what, n=p["retry"]))
+            self._idle(p["retry"])
+
+    def _idle(self, seconds):
+        """Uma espera sem torre na mão no meio de uma ação: o vigia de pular
+        onda volta a valer nela, senão juntar dinheiro para uma torre
+        deixaria passar o botão."""
+        skip = self._skip_held
+        if skip is not None and self._skipping():
+            self.watches[self.W_SKIP] = skip
+        try:
+            self._wait(seconds)
+        finally:
+            self.watches.pop(self.W_SKIP, None)
+
+    def _select(self, a):
+        x, y = self._spot(a)
+        placed = self.plan["screens"]["placed"]
+        self._close_panel()
+        if self._go(x, y):
+            self._pclick("left")
+        if not placed:
+            self._wait(0.3 * self.k)
+            return True
+        if self._seek(placed, 1.5 * self.k)[0]:
+            return True
+        self._log(_("{tower} at spot {n} did not open its panel when "
+                    "clicked.", tower=tower_name(self.plan["strategy"],
+                                                 a["tower"]),
+                    n=a["point"] + 1))
+        return False
+
+    def _camera(self):
+        """Afasta a câmera (segura a tecla) e arrasta com o botão direito
+        para baixo: a mesma vista em toda partida, que os lugares precisam."""
+        p = self.plan
+        zoom = p["keys"]["zoom"]
+        if zoom and p["zoom_ms"]:
+            self._set(zoom, True)
+            self._sleep(p["zoom_ms"] / 1000.0)
+            self._set(zoom, False)
+        if p["drag"] and self.mouse is not None:
+            w, h = self.env.workspace[2:]
+            if self._go(w // 2, h // 2):
+                self._sleep(0.05)
+                self._set(BTN["Right"], True)
+                n = max(1, abs(p["drag"]) // 20)
+                for _i in range(n):
+                    if self._halt.is_set():
+                        break
+                    self.mouse.move(0, p["drag"] / n)
+                    self._sleep(0.012)
+                self._set(BTN["Right"], False)
+        self._let_go()
+        self._log(_("Camera lined up."))
+        self._sleep(0.3)
+
+    def _end(self, result):
+        c, p = self.counters, self.plan
+        c["matches"] += 1
+        if result == "victory":
+            c["wins"] += 1
+        elif result == "defeat":
+            c["losses"] += 1
+        self.result = {"victory": _("victory"), "defeat": _("defeat"),
+                       "over": _("over"), "timeout": _("too long")}[result]
+        took = time.perf_counter() - self.t0 if self.t0 else 0.0
+        self.t0 = None
+        self._log(_("Match {n}: {result}, {time}.", n=c["matches"],
+                    result=self.result, time=clock_text(took)))
+        if p["hook"]:
+            self._notify({"op": "notify", "url": p["hook"],
+                          "text": p["report"], "shot": p["shot"]})
+        self._after()
+        if p["limit"] and c["matches"] >= p["limit"]:
+            self._log(_("Done: {n} matches, as set in Settings.",
+                        n=c["matches"]))
+            raise _TowerStop()
+
+    def _after(self):
+        after, p = self.plan["screens"]["after"], self.plan
+        for k, path in enumerate(after):
+            self._say(_("After the match: waiting for button {n}…", n=k + 1))
+            ok, at = self._seek(path, 60.0 if k == 0 else p["lobby_wait"])
+            if not ok:
+                self._log(_("The button {n} after the match did not show "
+                            "up.", n=k + 1))
+                return False
+            self._click(at)
+            self._wait(0.5 * self.k)
+        if after:
+            self._log(_("Left the match screen."))
+        self._wait(2.0 * self.k)
+        return True
+
+
+def tower_near(s, x, y, only=None, radius=TOWER_NEAR):
+    """O lugar mais perto de (x, y), (torre, lugar), dentro do raio; com
+    only, só os daquela torre."""
+    best = None
+    for k, t in enumerate(s["towers"]):
+        if only is not None and k != only:
+            continue
+        for j, (px, py) in enumerate(t["points"]):
+            d = (px - x) ** 2 + (py - y) ** 2
+            if d <= radius ** 2 and (best is None or d < best[0]):
+                best = (d, k, j)
+    return best[1:] if best else None
+
+
+class TowerRecorder:
+    """Gravar jogando pela visão da Doca: 1 a 5 escolhe a torre e o clique
+    seguinte coloca ela (o lugar entra na torre, ou é um que já existia);
+    clicar numa torre colocada e apertar a tecla de melhorar ou de vender
+    anota isso. A hora de cada ação conta de quando a gravação começou."""
+
+    def __init__(self, strategy, keys, clock=time.monotonic):
+        self.s, self.keys, self.clock = strategy, keys, clock
+        self.t0 = clock()
+        self.pending = None          # torre na mão (0 a 4)
+        self.selected = None         # (torre, lugar) com o painel aberto
+        self.undos = []              # (ação, lugar que ela criou ou None)
+
+    def now(self):
+        return round(self.clock() - self.t0, 2)
+
+    def key(self, code):
+        """Uma tecla apertada no jogo: a ação anotada, ou None."""
+        for k in range(TOWER_SLOTS):
+            if code == KEYS[str(k + 1)]:
+                self.pending, self.selected = k, None
+                return None
+        if code == self.keys["cancel"]:
+            self.pending = None
+            return None
+        if self.selected is None:
+            return None
+        k, j = self.selected
+        if code in (self.keys["top"], self.keys["bottom"]):
+            return self._add({"t": self.now(), "do": "upgrade", "tower": k,
+                              "point": j, "path": "top"
+                              if code == self.keys["top"] else "bottom"})
+        if self.keys["sell"] and code == self.keys["sell"]:
+            self.selected = None
+            return self._add({"t": self.now(), "do": "sell", "tower": k,
+                              "point": j})
+        return None
+
+    def click(self, x, y, button=BTN["Left"]):
+        """Um clique no jogo: a ação anotada (colocar), ou None."""
+        if button != BTN["Left"]:
+            return None
+        if self.pending is None:
+            self.selected = self.near(x, y)
+            return None
+        k, self.pending = self.pending, None
+        pts = self.s["towers"][k]["points"]
+        j = self.near(x, y, k, TOWER_SAME)
+        new = None
+        if j is None:
+            if len(pts) >= TOWER_MAX_POINTS:
+                return None
+            pts.append([int(x), int(y)])
+            j, new = len(pts) - 1, k
+        else:
+            j = j[1]
+        self.selected = (k, j)
+        return self._add({"t": self.now(), "do": "place", "tower": k,
+                          "point": j}, new)
+
+    def near(self, x, y, only=None, radius=TOWER_NEAR):
+        return tower_near(self.s, x, y, only, radius)
+
+    def _add(self, act, new=None):
+        if len(self.s["actions"]) >= TOWER_MAX_ACTIONS:
+            return None
+        self.s["actions"].append(act)
+        self.undos.append((act, new))
+        return act
+
+    def undo(self):
+        """Desfaz a última ação gravada (e o lugar novo que ela criou)."""
+        while self.undos:
+            act, new = self.undos.pop()
+            idx = next((i for i, a in enumerate(self.s["actions"])
+                        if a is act), None)
+            if idx is None:
+                continue               # já tirada à mão
+            del self.s["actions"][idx]
+            if new is not None:
+                pts = self.s["towers"][new]["points"]
+                j = act["point"]
+                if j == len(pts) - 1 and not tower_uses(self.s, new, j):
+                    pts.pop()
+            self.selected = self.pending = None
+            return act
+        return None
 
 
 _ICON_CACHE = {}
@@ -7924,6 +9042,441 @@ TRANSLATIONS = {
             "Os passos de imagem e cor precisam do PyGObject.",
         "The Dock is already open in another WayClick window.":
             "A Doca já está aberta em outra janela do WayClick.",
+        # ---- Tower Defense ----
+        "Tower Defense":
+            "Tower Defense",
+        "tower {n}":
+            "torre {n}",
+        "Place {tower} at spot {n}":
+            "Colocar {tower} no lugar {n}",
+        "Sell {tower} at spot {n}":
+            "Vender {tower} do lugar {n}",
+        "Upgrade {tower} at spot {n}, top path":
+            "Melhorar {tower} do lugar {n}, caminho de cima",
+        "Upgrade {tower} at spot {n}, bottom path":
+            "Melhorar {tower} do lugar {n}, caminho de baixo",
+        "Press {key}":
+            "Apertar {key}",
+        "Click the picture {name}":
+            "Clicar na imagem {name}",
+        "Wait for the picture {name}":
+            "Esperar a imagem {name}",
+        "{n} empty pictures of the Screens tab come from the file.":
+            "{n} imagens vazias da aba Telas vieram do arquivo.",
+        "{n} pictures of the Screens tab were kept as you captured them.":
+            "{n} imagens da aba Telas ficaram como você capturou.",
+        "It was made with the Dock at {w}×{h}.":
+            "Ela foi feita com a Doca em {w}×{h}.",
+        "the Dock closed, so the farm stopped.":
+            "a Doca fechou, então o farm parou.",
+        "Paused":
+            "Pausado",
+        "Paused.":
+            "Pausado.",
+        "Resumed.":
+            "Continuando.",
+        "the farm stopped on an error: {err}":
+            "o farm parou num erro: {err}",
+        "Farm started with {name}.":
+            "Farm começou com {name}.",
+        "This strategy has no actions yet: the farm only plays the matches.":
+            "Esta estratégia ainda não tem ações: o farm só joga as partidas.",
+        "Disconnected: clicked Reconnect, starting over.":
+            "Desconectado: cliquei em Reconectar, recomeçando.",
+        "The game window closed.":
+            "A janela do jogo fechou.",
+        "{n} rounds in a row without a match: the pictures on the Screens tab may not match the game. Stopping.":
+            "{n} rodadas seguidas sem partida: as imagens da aba Telas podem não bater com o jogo. Parando.",
+        "The game is not open in the Dock. Open it there, or put the game link in Settings, then press Start again.":
+            "O jogo não está aberto na Doca. Abra ele lá, ou ponha o link do jogo nas Configurações, e aperte Iniciar de novo.",
+        "Opening the game…":
+            "Abrindo o jogo…",
+        "Opening the game in the Dock…":
+            "Abrindo o jogo na Doca…",
+        "The game is open.":
+            "O jogo abriu.",
+        "The game did not open in {n} s.":
+            "O jogo não abriu em {n} s.",
+        "An end of match screen is open: leaving it first.":
+            "Uma tela de fim de partida está aberta: saindo dela primeiro.",
+        "Lobby: playing the lobby macro…":
+            "Lobby: rodando o macro do lobby…",
+        "Lobby: playing the lobby macro.":
+            "Lobby: rodando o macro do lobby.",
+        "Lobby: waiting for button {n} of {total}…":
+            "Lobby: esperando o botão {n} de {total}…",
+        "The first lobby button did not show up: taking it that the match already started.":
+            "O primeiro botão do lobby não apareceu: contando que a partida já começou.",
+        "Lobby button {n} did not show up, starting over.":
+            "O botão {n} do lobby não apareceu, recomeçando.",
+        "Lobby: clicked button {n}.":
+            "Lobby: cliquei no botão {n}.",
+        "Waiting for match {n} to start…":
+            "Esperando a partida {n} começar…",
+        "The match did not start in {n} s, starting over.":
+            "A partida não começou em {n} s, recomeçando.",
+        "Match {n} started.":
+            "Partida {n} começou.",
+        "Match {n}: next, {what} at {t}.":
+            "Partida {n}: a seguir, {what} em {t}.",
+        "Match {n}: the strategy is done, waiting for the end of the match…":
+            "Partida {n}: a estratégia acabou, esperando o fim da partida…",
+        "Match {n} took longer than {m} min.":
+            "A partida {n} passou de {m} min.",
+        "Stopped skipping waves, as set in Settings.":
+            "Parei de pular ondas, como está nas Configurações.",
+        "{what}.":
+            "{what}.",
+        "{what}: the Sell button did not show up.":
+            "{what}: o botão de vender não apareceu.",
+        "{what}: choose the sell key in Settings or capture the Sell button.":
+            "{what}: escolha a tecla de vender nas Configurações ou capture o botão de vender.",
+        "{what}: it did not show up.":
+            "{what}: ela não apareceu.",
+        "{what} (not confirmed: there is no Tower placed picture).":
+            "{what} (sem confirmar: falta a imagem Torre colocada).",
+        "{what}, after {n} tries.":
+            "{what}, depois de {n} tentativas.",
+        "{what}: it did not go down in {n} s, going on.":
+            "{what}: ela não foi colocada em {n} s, seguindo.",
+        "{what}: not yet, maybe not enough cash. Trying again every {n} s.":
+            "{what}: ainda não, talvez falte dinheiro. Tentando de novo a cada {n} s.",
+        "{tower} at spot {n} did not open its panel when clicked.":
+            "{tower} do lugar {n} não abriu o painel ao ser clicada.",
+        "Camera lined up.":
+            "Câmera alinhada.",
+        "defeat":
+            "derrota",
+        "victory":
+            "vitória",
+        "over":
+            "fim",
+        "too long":
+            "longa demais",
+        "Match {n}: {result}, {time}.":
+            "Partida {n}: {result}, {time}.",
+        "Done: {n} matches, as set in Settings.":
+            "Pronto: {n} partidas, como está nas Configurações.",
+        "After the match: waiting for button {n}…":
+            "Depois da partida: esperando o botão {n}…",
+        "The button {n} after the match did not show up.":
+            "O botão {n} de depois da partida não apareceu.",
+        "Left the match screen.":
+            "Saí da tela da partida.",
+        "Place a tower":
+            "Colocar uma torre",
+        "Upgrade, top path":
+            "Melhorar, caminho de cima",
+        "Upgrade, bottom path":
+            "Melhorar, caminho de baixo",
+        "Sell a tower":
+            "Vender uma torre",
+        "Press a key":
+            "Apertar uma tecla",
+        "Click a picture":
+            "Clicar numa imagem",
+        "Wait for a picture":
+            "Esperar uma imagem",
+        "Action":
+            "Ação",
+        "Seconds from the start of the match.":
+            "Segundos desde o começo da partida.",
+        "How long to wait for the picture before going on.":
+            "Quanto esperar a imagem antes de seguir.",
+        "At:":
+            "Em:",
+        "Do:":
+            "Fazer:",
+        "Tower:":
+            "Torre:",
+        "Spot:":
+            "Lugar:",
+        "Picture:":
+            "Imagem:",
+        "spot {n} ({x}, {y})":
+            "lugar {n} ({x}, {y})",
+        "This tower has no spots yet: pick them on the game with Pick.":
+            "Esta torre ainda não tem lugares: marque no jogo com Marcar.",
+        "Press a key of the keyboard.":
+            "Aperte uma tecla do teclado.",
+        "Capture the picture first.":
+            "Capture a imagem primeiro.",
+        "This action is not complete.":
+            "Esta ação não está completa.",
+        "Running:":
+            "Rodando:",
+        "Matches:":
+            "Partidas:",
+        "Wins:":
+            "Vitórias:",
+        "Losses:":
+            "Derrotas:",
+        "Log:":
+            "Registro:",
+        "Lobby macro:":
+            "Macro do lobby:",
+        "Match started:":
+            "Partida começou:",
+        "Optional. Something that only shows once the match has begun, like the wave counter. The clock of the strategy starts when it shows up; without it, right after the lobby.":
+            "Opcional. Algo que só aparece com a partida já começada, como o contador de ondas. O relógio da estratégia começa quando isso aparece; sem ele, logo depois do lobby.",
+        "Tower placed:":
+            "Torre colocada:",
+        "A piece of the panel that opens when a tower goes down (turn on Show Tower Options in the game settings). With it, a tower that did not go down, like when there is not enough cash yet, is tried again.":
+            "Um pedaço do painel que abre quando uma torre é colocada (ligue Show Tower Options nas configurações do jogo). Com ele, uma torre que não foi colocada, como quando ainda falta dinheiro, é tentada de novo.",
+        "Skip wave:":
+            "Pular onda:",
+        "Optional. Clicked whenever it shows up during the match.":
+            "Opcional. Clicado sempre que aparece durante a partida.",
+        "Victory:":
+            "Vitória:",
+        "Something that only shows when the match is won. Counts a win.":
+            "Algo que só aparece quando a partida é ganha. Conta uma vitória.",
+        "Defeat:":
+            "Derrota:",
+        "Something that only shows when the match is lost. Counts a loss.":
+            "Algo que só aparece quando a partida é perdida. Conta uma derrota.",
+        "Reconnect:":
+            "Reconectar:",
+        "Sell button:":
+            "Botão de vender:",
+        "Optional. Clicked to sell, after clicking the tower. Without it, the sell key of Settings is pressed.":
+            "Opcional. Clicado para vender, depois de clicar na torre. Sem ele, a tecla de vender das Configurações é apertada.",
+        "The buttons clicked in order when the match ends, like the one that plays again or the one that goes back to the lobby. With no Victory and Defeat pictures, the first one is also how the end of the match is seen.":
+            "Os botões clicados em ordem quando a partida acaba, como o de jogar de novo ou o de voltar ao lobby. Sem as imagens de Vitória e Derrota, o primeiro também é como o fim da partida é visto.",
+        "After the match:":
+            "Depois da partida:",
+        "The app name of the game window in the Dock, like Sober.":
+            "O nome do app da janela do jogo na Doca, como Sober.",
+        "Game link:":
+            "Link do jogo:",
+        "A Roblox game page, a private server link (…?privateServerLinkCode=…) or a roblox:// link. It opens in the Dock with Join the game, and again when the game closes.":
+            "Uma página de jogo do Roblox, um link de servidor privado (…?privateServerLinkCode=…) ou um link roblox://. Ele abre na Doca com Entrar no jogo, e de novo quando o jogo fecha.",
+        "Wait for each lobby button:":
+            "Esperar cada botão do lobby:",
+        "Wait for the match to start:":
+            "Esperar a partida começar:",
+        "Fast":
+            "Rápida",
+        "Balanced":
+            "Equilibrada",
+        "Slow":
+            "Lenta",
+        "Action speed:":
+            "Velocidade das ações:",
+        "How long to wait between pressing, clicking and looking. Slow suits a slow computer or connection.":
+            "Quanto esperar entre apertar, clicar e olhar. Lenta serve para computador ou conexão lentos.",
+        "Keep trying to place for:":
+            "Tentar colocar por até:",
+        "Try again every:":
+            "Tentar de novo a cada:",
+        "whole match":
+            "a partida toda",
+        "Skip waves until:":
+            "Pular ondas até:",
+        "Minutes from the start of the match. After that the Skip wave button is left alone.":
+            "Minutos desde o começo da partida. Depois disso o botão de pular onda fica quieto.",
+        "Zoom out with:":
+            "Afastar com:",
+        "Then drag down:":
+            "Depois arrastar para baixo:",
+        "With the right button, from the middle of the screen. A negative number drags up.":
+            "Com o botão direito, do meio da tela. Um número negativo arrasta para cima.",
+        "Upgrade, top path:":
+            "Melhorar, caminho de cima:",
+        "Upgrade, bottom path:":
+            "Melhorar, caminho de baixo:",
+        "Sell:":
+            "Vender:",
+        "Cancel placing:":
+            "Cancelar a colocação:",
+        "Start:":
+            "Iniciar:",
+        "Stop:":
+            "Parar:",
+        "Pause or resume:":
+            "Pausar ou continuar:",
+        "{run} is the number of the match, {result} how it ended, {wins} and {losses} the counts, and {time} how long the farm has been running.":
+            "{run} é o número da partida, {result} como ela acabou, {wins} e {losses} as contagens, e {time} há quanto tempo o farm está rodando.",
+        "Match {run}: {result}. {wins} wins, {losses} losses, farming for {time}.":
+            "Partida {run}: {result}. {wins} vitórias, {losses} derrotas, farmando há {time}.",
+        "This link would open the game outside the Dock. Use a Roblox game page, a private server link (…?privateServerLinkCode=…) or a roblox:// link.":
+            "Este link abriria o jogo fora da Doca. Use uma página de jogo do Roblox, um link de servidor privado (…?privateServerLinkCode=…) ou um link roblox://.",
+        "no spots":
+            "sem lugares",
+        "{n} set ✓":
+            "{n} marcados ✓",
+        "The list holds {n} strategies.":
+            "A lista comporta {n} estratégias.",
+        "Strategy {n}":
+            "Estratégia {n}",
+        "Delete {name}? Its towers, spots and timeline go with it.":
+            "Apagar {name}? As torres, os lugares e a linha do tempo vão junto.",
+        "Delete strategy":
+            "Apagar estratégia",
+        "Strategy":
+            "Estratégia",
+        "This strategy was made with the Dock at {w}×{h}, and the Dock is {W}×{H} now: the spots and pictures will miss. Change the size on the Dock tab.":
+            "Esta estratégia foi feita com a Doca em {w}×{h}, e a Doca está em {W}×{H} agora: os lugares e as imagens vão errar. Troque o tamanho na aba Doca.",
+        "Open the Dock first: the spots are picked on the game.":
+            "Abra a Doca primeiro: os lugares são marcados no jogo.",
+        "Stop recording first.":
+            "Pare a gravação primeiro.",
+        "{n} actions of the timeline use spot {spot} of {tower}, and they go with it. Remove it?":
+            "{n} ações da linha do tempo usam o lugar {spot} de {tower}, e elas vão junto. Remover?",
+        "Remove spot":
+            "Remover lugar",
+        "A tower holds {n} spots.":
+            "Uma torre comporta {n} lugares.",
+        "Remove the {n} spots of {tower}?":
+            "Remover os {n} lugares de {tower}?",
+        "{n} actions of the timeline use them and go too.":
+            "{n} ações da linha do tempo usam eles e vão junto.",
+        "Remove spots":
+            "Remover lugares",
+        "Timeline ({n})":
+            "Linha do tempo ({n})",
+        "A timeline holds {n} actions.":
+            "Uma linha do tempo comporta {n} ações.",
+        "Clear the timeline":
+            "Limpar a linha do tempo",
+        "Remove the {n} actions of {name}? The towers and their spots stay.":
+            "Remover as {n} ações de {name}? As torres e os lugares delas ficam.",
+        "Make a strategy first: New, at the top.":
+            "Crie uma estratégia primeiro: Novo, lá em cima.",
+        "Open the Dock first: you record by playing in it.":
+            "Abra a Doca primeiro: a gravação é jogando nela.",
+        "Stop the farm first.":
+            "Pare o farm primeiro.",
+        "Record":
+            "Gravar",
+        "The timeline already has {n} actions. Replace them with the new recording, or add the new ones to them?":
+            "A linha do tempo já tem {n} ações. Trocar pela gravação nova, ou juntar as novas a elas?",
+        "Replace them":
+            "Trocar",
+        "Add to them":
+            "Juntar",
+        "Lining up the camera…":
+            "Alinhando a câmera…",
+        "None":
+            "Nenhum",
+        "Export strategy":
+            "Exportar estratégia",
+        "Saved {file}.":
+            "{file} salvo.",
+        "{n} pictures could not be read and are not in it.":
+            "{n} imagens não puderam ser lidas e ficaram de fora.",
+        "Import strategy":
+            "Importar estratégia",
+        "{file} is not a Tower Defense strategy file of WayClick.":
+            "{file} não é um arquivo de estratégia de Tower Defense do WayClick.",
+        "{file} holds macros, not a strategy: import it on the Hotkeys tab.":
+            "{file} traz macros, não uma estratégia: importe na aba Atalhos.",
+        "Imported {name}.":
+            "{name} importada.",
+        "Make a strategy first: New, at the top of the Strategy tab.":
+            "Crie uma estratégia primeiro: Novo, no alto da aba Estratégia.",
+        "Capture how a match ends on the Screens tab: Victory, Defeat or a button After the match.":
+            "Capture como uma partida acaba na aba Telas: Vitória, Derrota ou um botão de Depois da partida.",
+        "Farm stopped.":
+            "Farm parado.",
+        "Open the Dock first.":
+            "Abra a Doca primeiro.",
+        "Running…":
+            "Rodando…",
+        "Pause":
+            "Pausar",
+        "Resume":
+            "Continuar",
+        "● Recording {t}":
+            "● Gravando {t}",
+        "The farm is running. Close the Dock, and the game with it?":
+            "O farm está rodando. Fechar a Doca, e o jogo junto?",
+        "Put the game link in Settings: a Roblox game page or a private server link.":
+            "Ponha o link do jogo nas Configurações: uma página de jogo do Roblox ou um link de servidor privado.",
+        "{start} starts · {stop} stops · {pause} pauses or resumes, in any window while the Dock is open":
+            "{start} inicia · {stop} para · {pause} pausa ou continua, em qualquer janela com a Doca aberta",
+        "Start ({key})":
+            "Iniciar ({key})",
+        "Stop ({key})":
+            "Parar ({key})",
+        "Open the Dock on the left: it opens with the game link of Settings, and the game shows up here.":
+            "Abra a Doca à esquerda: ela abre com o link do jogo das Configurações, e o jogo aparece aqui.",
+        "Picking the spots of {tower}: click where it goes, right click a spot to remove it, Esc ends.":
+            "Marcando os lugares de {tower}: clique onde ela vai, botão direito num lugar tira ele, Esc termina.",
+        "Recording: 1 to 5 picks a tower and a click places it. Click a tower, then {top} or {bottom} upgrades it{sell}. F10 undoes.":
+            "Gravando: 1 a 5 escolhe a torre e um clique coloca ela. Clique numa torre, e {top} ou {bottom} melhora ela{sell}. F10 desfaz.",
+        ", {key} sells it":
+            ", {key} vende ela",
+        "The game of the Dock: mouse, wheel and keys over it go to the game.":
+            "O jogo da Doca: mouse, roda e teclas em cima dele vão para o jogo.",
+        "The Dock is closed.":
+            "A Doca está fechada.",
+        "Waiting for the picture of the Dock…":
+            "Esperando a imagem da Doca…",
+        "Delete":
+            "Apagar",
+        "● Record":
+            "● Gravar",
+        "Undo (F10)":
+            "Desfazer (F10)",
+        "Add…":
+            "Adicionar…",
+        "Edit…":
+            "Editar…",
+        "Clear":
+            "Limpar",
+        "+ Add a button":
+            "+ Adicionar um botão",
+        "Dock the game":
+            "Encaixar o jogo",
+        "Undock":
+            "Desencaixar",
+        "Join the game":
+            "Entrar no jogo",
+        "Clear the log":
+            "Limpar o registro",
+        "Line up the camera":
+            "Alinhar a câmera",
+        "Pick":
+            "Marcar",
+        "Pick the spots of this tower on the game":
+            "Marcar os lugares desta torre no jogo",
+        "Remove the spots of this tower":
+            "Tirar os lugares desta torre",
+        "Minimize the Dock window: the game keeps playing here":
+            "Minimizar a janela da Doca: o jogo segue aqui",
+        "Open the game link of Settings in the Dock":
+            "Abrir na Doca o link do jogo das Configurações",
+        "Zoom out and drag the camera down, as at the start of each match":
+            "Afastar e arrastar a câmera para baixo, como no começo de cada partida",
+        "No sell key":
+            "Sem tecla de vender",
+        "Show the spots":
+            "Mostrar os lugares",
+        "Towers":
+            "Torres",
+        "Lobby":
+            "Lobby",
+        "Game keys":
+            "Teclas do jogo",
+        "Report":
+            "Relatório",
+        "Line up the camera when a match starts":
+            "Alinhar a câmera quando a partida começa",
+        "The spots are places on the screen, so the camera has to be the same in every match: zoomed all the way out and looking down. Recording lines it up too.":
+            "Os lugares são pontos da tela, então a câmera precisa ser a mesma em toda partida: afastada ao máximo e olhando para baixo. A gravação também alinha.",
+        "Map, mode, the guide it follows…":
+            "Mapa, modo, o guia que ela segue…",
+        "The buttons clicked in order to get into a match. The lobby macro, if any, plays before them, like walking into an elevator.":
+            "Os botões clicados em ordem para entrar numa partida. O macro do lobby, se houver, roda antes deles, como andar até um elevador.",
+        "Pictures of the game, captured from the Dock while it shows them. The farm looks for them on the screen, nothing reads the memory of the game. In the settings of the game, turn off Camera Shake, Low Quality Rings and the Switch Hotbar key (Q also cancels placing), turn on Show Tower Options, and keep the UI Scale as it was when you captured them.":
+            "Imagens do jogo, capturadas da Doca enquanto ela mostra elas. O farm procura elas na tela, nada lê a memória do jogo. Nas configurações do jogo, desligue Camera Shake, Low Quality Rings e a tecla Switch Hotbar (o Q também cancela a colocação), ligue Show Tower Options, e mantenha a UI Scale como estava quando você capturou.",
+        "They work in any window while the Dock is open. A hotkey macro or the WayClick hotkey on the same key takes it first.":
+            "Eles valem em qualquer janela com a Doca aberta. Um macro de atalho ou o atalho do WayClick na mesma tecla fica com ela primeiro.",
+        "Screens":
+            "Telas",
+        "{file} holds a Tower Defense strategy, not macros. Import it on the Tower Defense tab?":
+            "{file} traz uma estratégia de Tower Defense, não macros. Importar na aba Tower Defense?",
     },
 }
 LANGS = {"English": "en_US", "Português (BR)": "pt_BR"}
@@ -9742,6 +11295,15 @@ class ImageField(QWidget):
         self._show()
         self.changed.emit()
 
+    def retranslate(self):
+        self.b_cap.setText(_("Capture…"))
+        self.b_cap.setToolTip(_("Capture from screen…"))
+        self.b_open.setText(_("Open…"))
+        self.b_open.setToolTip(_("Open file…"))
+        self.b_clear.setToolTip(_("Remove this button") if self._remove else
+                                _("Remove the image"))
+        self._show()
+
     def _show(self):
         image_thumb(self.view, self.path, box=(160, 48), empty=_("none"))
         self.b_clear.setEnabled(bool(self.path) or self._remove is not None)
@@ -10073,6 +11635,1932 @@ class MacroFileDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         col.addWidget(buttons)
+
+
+# a janela com a aba Tower Defense aberta: o jogo, a lista e o registro lado
+# a lado (até onde a tela deixa)
+TOWER_WINDOW = (1600, 900)
+
+
+class DockView(QWidget):
+    """A tela da Doca dentro do WayClick, como o NoName Macro encaixa o
+    Roblox na janela dele: uma captura muitas vezes por segundo, e o que se
+    faz em cima dela (mouse, roda e teclas) vai para o jogo pelo fake_input
+    da Doca, como se a janela dele estivesse aqui. No modo de escolher, o
+    clique vira uma posição (o lugar de uma torre) e não chega ao jogo."""
+    picked = Signal(int, int, int)       # x, y na Doca, botão
+    # ("key", código, 0, 0), ("click", botão, x, y) e ("hotkey", código, 0,
+    # 0) para as teclas que não vão para o jogo
+    acted = Signal(str, int, int, int)
+    escaped = Signal()
+    _framed = Signal()
+    FPS = 20
+
+    def __init__(self, dock, parent=None):
+        super().__init__(parent)
+        self.dock = dock
+        self.image = QImage()
+        self.markers = []            # (x, y, texto, cor)
+        self.pick = False
+        self.empty_text = ""
+        self.skip_keys = set()       # não vão para o jogo (atalhos do farm)
+        self.fps = self.FPS
+        self._keys, self._buttons = set(), set()
+        self._rel = False            # direito ou meio segurado: relativo
+        self._last = None            # último ponto (Doca, float)
+        self._target = QRectF()
+        self._lock = threading.Lock()
+        self._fresh = None
+        self._halt = threading.Event()
+        self._thread = None
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMinimumSize(320, 180)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._framed.connect(self._take, Qt.QueuedConnection)
+
+    # ---------------------------------------------------------- captura --
+    def running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        if self.running():
+            return
+        self._halt.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="wayclick-dock-view")
+        self._thread.start()
+
+    def stop(self):
+        self._halt.set()
+        t, self._thread = self._thread, None
+        if t is not None:
+            t.join(timeout=1.0)
+        self.release_all()
+
+    def _loop(self):
+        while not self._halt.is_set():
+            t = time.monotonic()
+            img = self.dock.screen.qimage() if self.dock.alive() else QImage()
+            with self._lock:
+                self._fresh = img
+            self._framed.emit()
+            self._halt.wait(max(0.005, 1.0 / max(1, self.fps)
+                                - (time.monotonic() - t)))
+
+    def _take(self):
+        with self._lock:
+            img, self._fresh = self._fresh, None
+        if img is not None:
+            self.image = img
+            self.update()
+
+    # --------------------------------------------------------- desenho --
+    def dock_size(self):
+        s = self.dock.out_size or self.dock.size
+        if s:
+            return int(s[0]), int(s[1])
+        return self.image.width(), self.image.height()
+
+    def _fit(self):
+        lw, lh = self.dock_size()
+        if lw <= 0 or lh <= 0:
+            return QRectF()
+        W, H = self.width(), self.height()
+        k = min(W / lw, H / lh)
+        return QRectF((W - lw * k) / 2.0, (H - lh * k) / 2.0, lw * k, lh * k)
+
+    def to_dock(self, pos):
+        """Ponto da visão -> ponto da Doca (float), ou None fora do jogo."""
+        t = self._fit()
+        if t.isEmpty():
+            return None
+        lw, lh = self.dock_size()
+        x = (pos.x() - t.x()) * lw / t.width()
+        y = (pos.y() - t.y()) * lh / t.height()
+        if x < 0 or y < 0 or x >= lw or y >= lh:
+            return None
+        return (x, y)
+
+    def to_view(self, x, y):
+        t = self._fit()
+        lw, lh = self.dock_size()
+        return QPointF(t.x() + (x + 0.5) * t.width() / max(1, lw),
+                       t.y() + (y + 0.5) * t.height() / max(1, lh))
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(18, 18, 20))
+        t = self._fit()
+        if self.image.isNull() or t.isEmpty() or not self.dock.alive():
+            text = self.empty_text
+            err = self.dock.screen.error if self.dock.alive() else ""
+            if err and self.dock.screen.state == "failed":
+                text = err
+            p.setPen(QColor(170, 170, 170))
+            p.drawText(self.rect().adjusted(20, 20, -20, -20),
+                       Qt.AlignCenter | Qt.TextWordWrap, text)
+            return
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.drawImage(t, self.image)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        font = p.font()
+        font.setPixelSize(11)
+        font.setBold(True)
+        p.setFont(font)
+        for x, y, text, color in self.markers:
+            c, col = self.to_view(x, y), QColor(color)
+            p.setPen(QPen(QColor(0, 0, 0, 200), 4))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(c, 9, 9)
+            p.setPen(QPen(col, 2))
+            p.setBrush(QColor(col.red(), col.green(), col.blue(), 80))
+            p.drawEllipse(c, 9, 9)
+            box = QRectF(c.x() - 18, c.y() - 27, 36, 15)
+            p.setPen(QColor(0, 0, 0, 220))
+            p.drawText(box.translated(1, 1), Qt.AlignCenter, text)
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(box, Qt.AlignCenter, text)
+        if self.pick or self.hasFocus():
+            p.setPen(QPen(QColor("#3daee9" if self.pick else "#27ae60"), 2))
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(t.adjusted(1, 1, -1, -1))
+
+    # ------------------------------------------------- para dentro do jogo --
+    def _send(self, how, *args):
+        inp = self.dock.input
+        if inp is None or not self.dock.alive():
+            return False
+        try:
+            getattr(inp, how)(*args)
+        except OSError:
+            return False
+        return True
+
+    def event(self, e):
+        # com a visão em foco, toda tecla é do jogo: nem o atalho de uma
+        # janela do WayClick (Ctrl+Q, o de armar) rouba ela
+        if e.type() == QEvent.ShortcutOverride and not self.pick:
+            e.accept()
+            return True
+        return super().event(e)
+
+    def focusNextPrevChild(self, nxt):
+        return False                 # Tab vai para o jogo
+
+    def mouseMoveEvent(self, e):
+        at = self.to_dock(e.position())
+        if self.pick or at is None:
+            return
+        if self._rel and self._last is not None:
+            dx, dy = at[0] - self._last[0], at[1] - self._last[1]
+            if dx or dy:
+                # o jogo pode ter travado o ponteiro (câmera do Roblox com o
+                # direito): movimento relativo, que ele vê mesmo travado
+                self._send("move", dx, dy)
+        else:
+            self._send("absolute", int(at[0]) + 0.5, int(at[1]) + 0.5)
+        self._last = at
+
+    def mousePressEvent(self, e):
+        at = self.to_dock(e.position())
+        code = QT_BUTTONS.get(e.button())
+        self.setFocus(Qt.MouseFocusReason)
+        if at is None or code is None:
+            return
+        if self.pick:
+            self.picked.emit(int(at[0]), int(at[1]), code)
+            return
+        self._send("absolute", int(at[0]) + 0.5, int(at[1]) + 0.5)
+        self._last = at
+        if self._send("button", code, True):
+            self._buttons.add(code)
+            if code in (BTN["Right"], BTN["Middle"]):
+                self._rel = True
+            self.acted.emit("click", code, int(at[0]), int(at[1]))
+
+    def mouseReleaseEvent(self, e):
+        code = QT_BUTTONS.get(e.button())
+        if code is None or code not in self._buttons:
+            return
+        self._buttons.discard(code)
+        self._send("button", code, False)
+        if self._rel and not self._buttons & {BTN["Right"], BTN["Middle"]}:
+            self._rel = False
+            at = self.to_dock(e.position())
+            if at is not None:
+                self._send("absolute", int(at[0]) + 0.5, int(at[1]) + 0.5)
+                self._last = at
+
+    def wheelEvent(self, e):
+        e.accept()
+        if self.pick:
+            return
+        d = e.angleDelta()
+        # um dente (120) é DockRunner.WHEEL_STEP; para cima é negativo
+        k = DockRunner.WHEEL_STEP / 120.0
+        if d.y():
+            self._send("axis", 0, -d.y() * k)
+        if d.x():
+            self._send("axis", 1, -d.x() * k)
+
+    @staticmethod
+    def _code(e):
+        n = e.nativeScanCode()
+        return n - 8 if n > 8 else None
+
+    def keyPressEvent(self, e):
+        code = self._code(e)
+        if code is None:
+            return super().keyPressEvent(e)
+        if self.pick:
+            if code == KEYS["Esc"]:
+                self.escaped.emit()
+            return
+        if e.isAutoRepeat():
+            return
+        if code in self.skip_keys:
+            self.acted.emit("hotkey", code, 0, 0)
+            return
+        if self._send("key", code, True):
+            self._keys.add(code)
+            self.acted.emit("key", code, 0, 0)
+
+    def keyReleaseEvent(self, e):
+        code = self._code(e)
+        if code is None or e.isAutoRepeat() or code not in self._keys:
+            return
+        self._keys.discard(code)
+        self._send("key", code, False)
+
+    def focusOutEvent(self, e):
+        self.release_all()
+        self.update()
+        super().focusOutEvent(e)
+
+    def focusInEvent(self, e):
+        self.update()
+        super().focusInEvent(e)
+
+    def release_all(self):
+        """Nada fica apertado no jogo quando a visão perde o foco."""
+        for code in list(self._keys):
+            self._send("key", code, False)
+        for code in list(self._buttons):
+            self._send("button", code, False)
+        self._keys.clear()
+        self._buttons.clear()
+        self._rel = False
+
+
+class TowerActionDialog(QDialog):
+    """Uma ação da linha do tempo, à mão: a hora e o que fazer, em qual
+    torre e lugar, ou a tecla, ou a imagem."""
+    KINDS = (("place", "Place a tower"), ("top", "Upgrade, top path"),
+             ("bottom", "Upgrade, bottom path"), ("sell", "Sell a tower"),
+             ("key", "Press a key"), ("click", "Click a picture"),
+             ("wait", "Wait for a picture"))
+
+    def __init__(self, parent, strategy, action=None, grab=None):
+        super().__init__(parent)
+        self.setWindowTitle(_("Action"))
+        self.s = strategy
+        a = dict(action or {"t": 0.0, "do": "place", "tower": 0, "point": 0})
+        self.error = QLabel("")
+        self.error.setStyleSheet("color:#d04030;")
+        self.error.setWordWrap(True)
+        self.t = QDoubleSpinBox()
+        self.t.setRange(0.0, 86400.0)
+        self.t.setDecimals(2)          # como a gravação anota
+        self.t.setSingleStep(1.0)
+        self.t.setSuffix(" s")
+        self.t.setValue(float(a.get("t", 0.0)))
+        self.t.setToolTip(_("Seconds from the start of the match."))
+        self.kind = QComboBox()
+        for key, label in self.KINDS:
+            self.kind.addItem(_(label), key)
+        kind = a["do"]
+        if kind == "upgrade":
+            kind = a.get("path", "top")
+        elif kind == "image":
+            kind = "click" if a.get("click", True) else "wait"
+        self.kind.setCurrentIndex(max(0, self.kind.findData(kind)))
+        self.tower = QComboBox()
+        for k in range(TOWER_SLOTS):
+            self.tower.addItem(tower_name(strategy, k), k)
+        self.tower.setCurrentIndex(max(0, min(TOWER_SLOTS - 1,
+                                              int(a.get("tower", 0)))))
+        self.spot = QComboBox()
+        self._spots(a.get("point", 0))
+        self.tower.currentIndexChanged.connect(lambda _i: self._spots(0))
+        self.key = KeyCatcher(a.get("code") or KEYS["E"],
+                              a.get("name") or "E")
+        # "path" é o caminho da melhoria (top/bottom) numa ação de melhorar,
+        # e só é o arquivo da imagem numa ação de imagem
+        self.image = ImageField(a.get("path") or "" if a["do"] == "image"
+                                else "", grab, self.error, optional=False)
+        self.wait = QDoubleSpinBox()
+        self.wait.setRange(0.0, 3600.0)
+        self.wait.setDecimals(1)
+        self.wait.setSuffix(" s")
+        self.wait.setValue(float(a.get("wait", 10.0)))
+        self.wait.setToolTip(_("How long to wait for the picture before going "
+                               "on."))
+        self.form = QFormLayout()
+        self.rows = {}
+        for key, text, w in (("t", "At:", self.t), ("kind", "Do:", self.kind),
+                             ("tower", "Tower:", self.tower),
+                             ("spot", "Spot:", self.spot),
+                             ("key", "Key:", self.key),
+                             ("image", "Picture:", self.image),
+                             ("wait", "Wait up to:", self.wait)):
+            lbl = QLabel(_(text))
+            self.form.addRow(lbl, w)
+            self.rows[key] = (lbl, w)
+        self.kind.currentIndexChanged.connect(self._sync)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                   | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._ok)
+        buttons.rejected.connect(self.reject)
+        col = QVBoxLayout(self)
+        col.addLayout(self.form)
+        col.addWidget(self.error)
+        col.addWidget(buttons)
+        self._sync()
+
+    def _spots(self, keep=0):
+        k = self.tower.currentData() or 0
+        self.spot.clear()
+        for j, (x, y) in enumerate(self.s["towers"][k]["points"]):
+            self.spot.addItem(_("spot {n} ({x}, {y})", n=j + 1, x=x, y=y), j)
+        self.spot.setCurrentIndex(max(0, min(self.spot.count() - 1,
+                                             int(keep or 0))))
+
+    def _sync(self, _i=0):
+        kind = self.kind.currentData()
+        show = {"tower": kind in ("place", "top", "bottom", "sell"),
+                "spot": kind in ("place", "top", "bottom", "sell"),
+                "key": kind == "key", "image": kind in ("click", "wait"),
+                "wait": kind in ("click", "wait")}
+        for key, on in show.items():
+            for w in self.rows[key]:
+                w.setVisible(on)
+
+    def action(self):
+        kind = self.kind.currentData()
+        a = {"t": round(self.t.value(), 2)}
+        if kind in ("place", "top", "bottom", "sell"):
+            a.update(do="upgrade" if kind in ("top", "bottom") else kind,
+                     tower=self.tower.currentData(),
+                     point=self.spot.currentData())
+            if kind in ("top", "bottom"):
+                a["path"] = kind
+        elif kind == "key":
+            a.update(do="key", code=self.key.code, name=self.key.name)
+        else:
+            a.update(do="image", path=self.image.path, click=kind == "click",
+                     wait=round(self.wait.value(), 1))
+        return _tower_action(a, self.s["towers"])
+
+    def _ok(self):
+        kind = self.kind.currentData()
+        if kind in ("place", "top", "bottom", "sell") \
+                and self.spot.currentData() is None:
+            self.error.setText(_("This tower has no spots yet: pick them on "
+                                 "the game with Pick."))
+            return
+        if kind == "key" and (not self.key.code or is_button(self.key.code)):
+            self.error.setText(_("Press a key of the keyboard."))
+            return
+        if kind in ("click", "wait") and not self.image.path:
+            self.error.setText(_("Capture the picture first."))
+            return
+        if self.action() is None:
+            self.error.setText(_("This action is not complete."))
+            return
+        self.accept()
+
+
+class TowerTab(QWidget):
+    """A aba Tower Defense: o jogo da Doca dentro da janela, as estratégias
+    (as 5 torres com os lugares, a linha do tempo, gravar jogando), as telas
+    do jogo e os ajustes, com F4 começando e F5 parando o farm."""
+    changed = Signal()                 # algo para gravar na configuração
+    running_changed = Signal()
+    _done = Signal(object)
+    _cam_done = Signal(object)
+
+    def __init__(self, cfg, dock, macros=lambda: [], claims=None):
+        super().__init__()
+        self.dock, self.macros, self.claims = dock, macros, claims
+        self.c = normalize_tower(cfg)
+        self.runner = self.cam = self.rec = self.env = None
+        self._cam_then = None
+        self.began = None
+        self.picking = None
+        self.watchers = {}
+        self.lobby_fields, self.after_fields = [], []
+        self._loading = False
+        self._labels, self._tips, self._specials = [], [], []
+        self._done.connect(self._finished, Qt.QueuedConnection)
+        self._cam_done.connect(self._cam_finished, Qt.QueuedConnection)
+        self.error = QLabel("")
+        self.error.setWordWrap(True)
+        self.error.setStyleSheet("color:#d04030;")
+        self.error.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        # ------------------------------------------------------ esquerda --
+        self.b_start = QPushButton()
+        self.b_start.setMinimumHeight(40)
+        self.b_start.clicked.connect(self.start)
+        self.b_stop = QPushButton()
+        self.b_stop.clicked.connect(self.stop)
+        self.b_pause = QPushButton()
+        self.b_pause.clicked.connect(self.pause)
+        self.phase = QLabel("")
+        self.phase.setWordWrap(True)
+        self.stats = {k: QLabel("0") for k in ("time", "matches", "wins",
+                                               "losses")}
+        self.stats["time"].setText("0:00")
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        for row, (key, text) in enumerate((("time", "Running:"),
+                                           ("matches", "Matches:"),
+                                           ("wins", "Wins:"),
+                                           ("losses", "Losses:"))):
+            grid.addWidget(self._label(text), row, 0)
+            grid.addWidget(self.stats[key], row, 1)
+        grid.setColumnStretch(1, 1)
+        self.b_dock = QPushButton()
+        self.b_dock.clicked.connect(self._dock_toggle)
+        self.b_in = QPushButton()
+        self.b_in.clicked.connect(self._dock_in)
+        self.b_out = QPushButton()
+        self.b_out.clicked.connect(self._dock_out)
+        self.b_join = QPushButton()
+        self.b_join.clicked.connect(self._join)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(1000)
+        self.b_log = QPushButton()
+        self.b_log.clicked.connect(self.log.clear)
+        left_w = QWidget()
+        left_w.setFixedWidth(250)
+        left = QVBoxLayout(left_w)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.addWidget(self.b_start)
+        left.addWidget(_hrow(self.b_stop, self.b_pause, stretch=False))
+        left.addWidget(self.phase)
+        left.addLayout(grid)
+        left.addWidget(self.b_dock)
+        left.addWidget(_hrow(self.b_in, self.b_out, stretch=False))
+        left.addWidget(self.b_join)
+        self.log_lbl = self._label("Log:")
+        left.addWidget(self.log_lbl)
+        left.addWidget(self.log, 1)
+        left.addWidget(self.b_log, 0, Qt.AlignRight)
+
+        # -------------------------------------------------------- centro --
+        self.view = DockView(dock)
+        self.view.picked.connect(self._picked)
+        self.view.acted.connect(self._acted)
+        self.view.escaped.connect(lambda: self._pick(None))
+        self.b_cam = QPushButton()
+        self.b_cam.clicked.connect(self._camera_now)
+        self.show_spots = QCheckBox()
+        self.show_spots.setChecked(True)
+        self.show_spots.toggled.connect(lambda _on: self._markers())
+        self.view_note = QLabel("")
+        self.view_note.setWordWrap(True)
+        self.view_note.setEnabled(False)
+        center = QVBoxLayout()
+        center.setContentsMargins(0, 0, 0, 0)
+        center.addWidget(self.view, 1)
+        center.addWidget(_hrow(self.b_cam, self.show_spots))
+        center.addWidget(self.view_note)
+
+        # ------------------------------------------------------- direita --
+        self.side = QTabWidget()
+        self.side.setMinimumWidth(340)
+        self.side.setMaximumWidth(460)
+        for page in (self._strategy_page(), self._screens_page(),
+                     self._settings_page()):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidget(page)
+            self.side.addTab(scroll, "")
+
+        self.footer = QLabel("")
+        self.footer.setEnabled(False)
+        top = QHBoxLayout()
+        top.addWidget(left_w)
+        top.addLayout(center, 1)
+        top.addWidget(self.side)
+        col = QVBoxLayout(self)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.addLayout(top, 1)
+        col.addWidget(self.error)
+        col.addWidget(self.footer)
+        self.setMinimumSize(980, 600)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(250)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+        dock.changed.connect(self._dock_changed)
+        if not self.c["strategies"]:
+            # a primeira já existe: dá para marcar os lugares de cara
+            s = normalize_tower_strategy({"name": _("Strategy {n}", n=1)})
+            self.c["strategies"].append(s)
+            self.c["current"] = s["id"]
+        self._load_settings()
+        self.shot.setEnabled(bool(self.c["hook"]))
+        self._link_note()
+        self._fill_strategies()
+        self.retranslate()
+        self._dock_changed()
+
+    # ----------------------------------------------------------- montagem --
+    def _label(self, text):
+        lbl = QLabel(_(text))
+        self._labels.append((lbl, text))
+        return lbl
+
+    def _form_row(self, form, text, widget, tip=None):
+        lbl = self._label(text)
+        form.addRow(lbl, widget)
+        if tip:
+            self._tips.append((widget, tip))
+        return lbl
+
+    def _strategy_page(self):
+        page = QWidget()
+        col = QVBoxLayout(page)
+        self.strat = QComboBox()
+        self.strat.currentIndexChanged.connect(self._strategy_changed)
+        self.b_new = QPushButton()
+        self.b_new.clicked.connect(self._new)
+        self.b_del = QPushButton()
+        self.b_del.clicked.connect(self._delete)
+        self.b_export = QPushButton()
+        self.b_export.clicked.connect(self._export)
+        self.b_import = QPushButton()
+        self.b_import.clicked.connect(self._import)
+        col.addWidget(_hrow(self.strat, self.b_new, self.b_del,
+                            stretch=False))
+        col.addWidget(_hrow(self.b_import, self.b_export))
+        form = QFormLayout()
+        self.name = QLineEdit()
+        self.name.setMaxLength(60)
+        self.name.textEdited.connect(self._renamed)
+        self._form_row(form, "Name:", self.name)
+        self.notes = QPlainTextEdit()
+        self.notes.setMaximumHeight(64)
+        self.notes.textChanged.connect(self._notes_changed)
+        self._form_row(form, "Notes:", self.notes)
+        col.addLayout(form)
+        self.size_note = QLabel("")
+        self.size_note.setWordWrap(True)
+        self.size_note.setStyleSheet("color:#c86000;")
+        self.size_note.hide()
+        col.addWidget(self.size_note)
+
+        self.towers_box = QGroupBox()
+        grid = QGridLayout(self.towers_box)
+        self.tower_rows = []
+        for k in range(TOWER_SLOTS):
+            num = QLabel(str(k + 1))
+            num.setStyleSheet(f"color:{TOWER_COLORS[k]};font-weight:bold;")
+            name = QLineEdit()
+            name.setMaxLength(40)
+            name.textEdited.connect(lambda t, k=k: self._tower_named(k, t))
+            count = QLabel("")
+            pick = QPushButton()
+            pick.setCheckable(True)
+            pick.clicked.connect(lambda on, k=k: self._pick(k if on else None))
+            clear = QPushButton("✕")
+            clear.setFixedWidth(30)
+            clear.clicked.connect(lambda _c=False, k=k: self._clear_tower(k))
+            for c_, w in enumerate((num, name, count, pick, clear)):
+                grid.addWidget(w, k, c_)
+            self.tower_rows.append((num, name, count, pick, clear))
+        grid.setColumnStretch(1, 1)
+        col.addWidget(self.towers_box)
+
+        self.timeline_box = QGroupBox()
+        tcol = QVBoxLayout(self.timeline_box)
+        self.timeline = QListWidget()
+        self.timeline.setMinimumHeight(150)
+        self.timeline.itemDoubleClicked.connect(lambda _i: self._edit())
+        self.timeline.currentRowChanged.connect(lambda _r: self._sync())
+        self.b_rec = QPushButton()
+        self.b_rec.setCheckable(True)
+        self.b_rec.clicked.connect(self._record)
+        self.b_undo = QPushButton()
+        self.b_undo.clicked.connect(self._undo)
+        self.rec_note = QLabel("")
+        self.rec_note.setStyleSheet("color:#da4453;font-weight:bold;")
+        self.b_add = QPushButton()
+        self.b_add.clicked.connect(self._add)
+        self.b_edit = QPushButton()
+        self.b_edit.clicked.connect(self._edit)
+        self.b_remove = QPushButton()
+        self.b_remove.clicked.connect(self._remove)
+        self.b_clear = QPushButton()
+        self.b_clear.clicked.connect(self._clear_actions)
+        tcol.addWidget(_hrow(self.b_rec, self.b_undo, self.rec_note))
+        tcol.addWidget(self.timeline, 1)
+        tcol.addWidget(_hrow(self.b_add, self.b_edit, self.b_remove,
+                             self.b_clear))
+        col.addWidget(self.timeline_box, 1)
+
+        self.lobby_group = QGroupBox()
+        lcol = QVBoxLayout(self.lobby_group)
+        self.lobby_hint = QLabel("")
+        self.lobby_hint.setWordWrap(True)
+        self.lobby_hint.setEnabled(False)
+        self.lobby_box = QVBoxLayout()
+        self.lobby_box.setContentsMargins(0, 0, 0, 0)
+        self.b_lobby = QPushButton()
+        self.b_lobby.clicked.connect(lambda: self._add_lobby(""))
+        self.lobby_macro = QComboBox()
+        self.lobby_macro.currentIndexChanged.connect(self._lobby_macro_set)
+        lform = QFormLayout()
+        self._form_row(lform, "Lobby macro:", self.lobby_macro)
+        lcol.addWidget(self.lobby_hint)
+        lcol.addLayout(self.lobby_box)
+        lcol.addWidget(self.b_lobby, 0, Qt.AlignLeft)
+        lcol.addLayout(lform)
+        col.addWidget(self.lobby_group)
+        return page
+
+    SCREEN_ROWS = (
+        ("start", "Match started:",
+         "Optional. Something that only shows once the match has begun, "
+         "like the wave counter. The clock of the strategy starts when it "
+         "shows up; without it, right after the lobby."),
+        ("placed", "Tower placed:",
+         "A piece of the panel that opens when a tower goes down (turn on "
+         "Show Tower Options in the game settings). With it, a tower that "
+         "did not go down, like when there is not enough cash yet, is tried "
+         "again."),
+        ("skip", "Skip wave:",
+         "Optional. Clicked whenever it shows up during the match."),
+        ("victory", "Victory:",
+         "Something that only shows when the match is won. Counts a win."),
+        ("defeat", "Defeat:",
+         "Something that only shows when the match is lost. Counts a "
+         "loss."),
+        ("reconnect", "Reconnect:",
+         "Optional. Clicked whenever it shows up, and the farm starts over "
+         "from the lobby."),
+        ("sell", "Sell button:",
+         "Optional. Clicked to sell, after clicking the tower. Without it, "
+         "the sell key of Settings is pressed."))
+    AFTER_TIP = ("The buttons clicked in order when the match ends, like the "
+                 "one that plays again or the one that goes back to the "
+                 "lobby. With no Victory and Defeat pictures, the first one "
+                 "is also how the end of the match is seen.")
+
+    def _screens_page(self):
+        page = QWidget()
+        col = QVBoxLayout(page)
+        self.screens_hint = QLabel("")
+        self.screens_hint.setWordWrap(True)
+        self.screens_hint.setEnabled(False)
+        col.addWidget(self.screens_hint)
+        form = QFormLayout()
+        self.screen_fields = {}
+        for key, text, tip in self.SCREEN_ROWS:
+            f = ImageField(self.c["screens"][key], self._grab, self.error)
+            f.changed.connect(lambda k=key: self._screen_set(k))
+            self.screen_fields[key] = f
+            self._form_row(form, text, f, tip)
+            if key == "defeat":
+                self.after_box = QVBoxLayout()
+                self.after_box.setContentsMargins(0, 0, 0, 0)
+                self.b_after = QPushButton()
+                self.b_after.clicked.connect(lambda: self._add_after(""))
+                aw = QWidget()
+                acol = QVBoxLayout(aw)
+                acol.setContentsMargins(0, 0, 0, 0)
+                acol.addLayout(self.after_box)
+                acol.addWidget(self.b_after, 0, Qt.AlignLeft)
+                self._form_row(form, "After the match:", aw, self.AFTER_TIP)
+        col.addLayout(form)
+        col.addStretch()
+        for path in self.c["screens"]["after"] or [""]:
+            self._add_after(path, save=False)
+        return page
+
+    def _spin(self, lo, hi, suffix, special=None, double=False):
+        w = QDoubleSpinBox() if double else QSpinBox()
+        if double:
+            w.setDecimals(1)
+            w.setSingleStep(0.5)
+        w.setRange(lo, hi)
+        w.setSuffix(suffix)
+        if special:
+            self._specials.append((w, special))
+        w.valueChanged.connect(lambda _v: self._collect())
+        return w
+
+    def _settings_page(self):
+        page = QWidget()
+        col = QVBoxLayout(page)
+        form = QFormLayout()
+        self.win = QLineEdit()
+        self.win.setMaxLength(100)
+        self.win.textEdited.connect(lambda _t: self._collect())
+        self._form_row(form, "Game window:", self.win,
+                       "The app name of the game window in the Dock, like "
+                       "Sober.")
+        self.link = QLineEdit()
+        self.link.setMaxLength(2000)
+        self.link.setPlaceholderText("https://www.roblox.com/games/"
+                                     "3260590327/…")
+        self.link.textEdited.connect(lambda _t: self._collect())
+        self._form_row(form, "Game link:", self.link,
+                       "A Roblox game page, a private server link "
+                       "(…?privateServerLinkCode=…) or a roblox:// link. It "
+                       "opens in the Dock with Join the game, and again "
+                       "when the game closes.")
+        self.link_note = QLabel("")
+        self.link_note.setWordWrap(True)
+        self.link_note.setStyleSheet("color:#c86000;font-size:11px;")
+        self.link_note.hide()
+        form.addRow(self.link_note)
+        self.lobby_wait = self._spin(1, 3600, " s")
+        self._form_row(form, "Wait for each lobby button:", self.lobby_wait)
+        self.start_wait = self._spin(1, 3600, " s")
+        self._form_row(form, "Wait for the match to start:",
+                       self.start_wait)
+        self.match_max = self._spin(1, 600, " min")
+        self._form_row(form, "Longest match:", self.match_max,
+                       "If the end of the match takes longer than this, "
+                       "the farm starts over.")
+        self.limit = self._spin(0, MAX_RUNS, "", special="never")
+        self._form_row(form, "Stop after:", self.limit)
+        self.speed = QComboBox()
+        for key, label in (("fast", "Fast"), ("balanced", "Balanced"),
+                           ("slow", "Slow")):
+            self.speed.addItem(_(label), key)
+        self.speed.currentIndexChanged.connect(lambda _i: self._collect())
+        self._form_row(form, "Action speed:", self.speed,
+                       "How long to wait between pressing, clicking and "
+                       "looking. Slow suits a slow computer or connection.")
+        self.place_for = self._spin(5, 3600, " s")
+        self._form_row(form, "Keep trying to place for:", self.place_for)
+        self.retry = self._spin(0.2, 60.0, " s", double=True)
+        self._form_row(form, "Try again every:", self.retry)
+        self.skip_until = self._spin(0, 600, " min", special="whole match")
+        self._form_row(form, "Skip waves until:", self.skip_until,
+                       "Minutes from the start of the match. After that the "
+                       "Skip wave button is left alone.")
+        col.addLayout(form)
+
+        self.camera = QCheckBox()
+        self.camera.toggled.connect(lambda _on: self._collect())
+        col.addWidget(self.camera)
+        cform = QFormLayout()
+        self.k_zoom = KeyCatcher(KEYS["O"], "O")
+        self.k_zoom.changed.connect(self._collect)
+        self.zoom_ms = self._spin(0, 10000, " ms")
+        self._form_row(cform, "Zoom out with:", _hrow(self.k_zoom,
+                                                      self.zoom_ms))
+        self.drag = self._spin(-3000, 3000, " px")
+        self._form_row(cform, "Then drag down:", self.drag,
+                       "With the right button, from the middle of the "
+                       "screen. A negative number drags up.")
+        col.addLayout(cform)
+
+        self.keys_box = QGroupBox()
+        kform = QFormLayout(self.keys_box)
+        self.k_top = KeyCatcher(KEYS["E"], "E")
+        self.k_bottom = KeyCatcher(KEYS["Z"], "Z")
+        self.k_sell = KeyCatcher(0, "")
+        self.b_sell_x = QPushButton("✕")
+        self.b_sell_x.setFixedWidth(30)
+        self.b_sell_x.clicked.connect(lambda: self.k_sell.set_key(0,
+                                                                  _("none")))
+        self.k_cancel = KeyCatcher(KEYS["Q"], "Q")
+        for w in (self.k_top, self.k_bottom, self.k_sell, self.k_cancel):
+            w.changed.connect(self._collect)
+        self._form_row(kform, "Upgrade, top path:", self.k_top)
+        self._form_row(kform, "Upgrade, bottom path:", self.k_bottom)
+        self._form_row(kform, "Sell:", _hrow(self.k_sell, self.b_sell_x,
+                                             stretch=False))
+        self._form_row(kform, "Cancel placing:", self.k_cancel)
+        col.addWidget(self.keys_box)
+
+        self.hot_box = QGroupBox()
+        hform = QFormLayout(self.hot_box)
+        self.h_start = KeyCatcher(KEYS["F4"], "F4")
+        self.h_stop = KeyCatcher(KEYS["F5"], "F5")
+        self.h_pause = KeyCatcher(KEYS["F6"], "F6")
+        for w in (self.h_start, self.h_stop, self.h_pause):
+            w.changed.connect(self._collect)
+        self._form_row(hform, "Start:", self.h_start)
+        self._form_row(hform, "Stop:", self.h_stop)
+        self._form_row(hform, "Pause or resume:", self.h_pause)
+        self.hot_note = QLabel("")
+        self.hot_note.setWordWrap(True)
+        self.hot_note.setEnabled(False)
+        hform.addRow(self.hot_note)
+        col.addWidget(self.hot_box)
+
+        self.hook_box = QGroupBox()
+        wform = QFormLayout(self.hook_box)
+        self.hook = QLineEdit()
+        self.hook.setMaxLength(500)
+        self.hook.textEdited.connect(lambda _t: self._collect())
+        self._form_row(wform, "Discord webhook:", self.hook)
+        self.report = QLineEdit()
+        self.report.setMaxLength(1000)
+        self.report.textEdited.connect(lambda _t: self._collect())
+        self._form_row(wform, "Report:", self.report,
+                       "{run} is the number of the match, {result} how it "
+                       "ended, {wins} and {losses} the counts, and {time} "
+                       "how long the farm has been running.")
+        self.shot = QCheckBox()
+        self.shot.toggled.connect(lambda _on: self._collect())
+        wform.addRow("", self.shot)
+        col.addWidget(self.hook_box)
+        col.addStretch()
+        return page
+
+    def _load_settings(self):
+        c = self.c
+        self._loading = True
+        self.win.setText(c["window"])
+        self.link.setText(c["link"])
+        for w, key in ((self.lobby_wait, "lobby_wait"),
+                       (self.start_wait, "start_wait"),
+                       (self.match_max, "match_max"), (self.limit, "limit"),
+                       (self.place_for, "place_for"), (self.retry, "retry"),
+                       (self.skip_until, "skip_until"),
+                       (self.zoom_ms, "zoom_ms"), (self.drag, "drag")):
+            w.setValue(c[key])
+        self.speed.setCurrentIndex(max(0, self.speed.findData(c["speed"])))
+        self.camera.setChecked(c["camera"])
+        for w, key in ((self.k_zoom, "zoom"), (self.k_top, "top"),
+                       (self.k_bottom, "bottom"), (self.k_sell, "sell"),
+                       (self.k_cancel, "cancel")):
+            code = c["keys"][key]
+            w.code, w.name = code, key_label(code) if code else _("none")
+            w._refresh()
+        for w, key in ((self.h_start, "start"), (self.h_stop, "stop"),
+                       (self.h_pause, "pause")):
+            code = c["hotkeys"][key]
+            w.code, w.name = code, key_label(code)
+            w._refresh()
+        self.hook.setText(c["hook"])
+        self.report.setText(_(TOWER_REPORT) if c["report"] == TOWER_REPORT
+                            else c["report"])
+        self.shot.setChecked(c["shot"])
+        self._loading = False
+
+    def _collect(self, *_a):
+        """Os campos dos ajustes para a configuração."""
+        if self._loading:
+            return
+        c = self.c
+        c["window"] = " ".join(self.win.text().split()) or "Sober"
+        c["link"] = self.link.text().strip()
+        for w, key in ((self.lobby_wait, "lobby_wait"),
+                       (self.start_wait, "start_wait"),
+                       (self.match_max, "match_max"), (self.limit, "limit"),
+                       (self.place_for, "place_for"),
+                       (self.skip_until, "skip_until"),
+                       (self.zoom_ms, "zoom_ms"), (self.drag, "drag")):
+            c[key] = int(w.value())
+        c["retry"] = round(self.retry.value(), 1)
+        c["speed"] = self.speed.currentData() or "balanced"
+        c["camera"] = self.camera.isChecked()
+        for w, key in ((self.k_zoom, "zoom"), (self.k_top, "top"),
+                       (self.k_bottom, "bottom"), (self.k_sell, "sell"),
+                       (self.k_cancel, "cancel")):
+            code = w.code if w.code and not is_button(w.code) else 0
+            c["keys"][key] = code or (0 if key == "sell"
+                                      else KEYS[TOWER_KEYS[key]])
+        for w, key in ((self.h_start, "start"), (self.h_stop, "stop"),
+                       (self.h_pause, "pause")):
+            code = w.code if w.code and not is_button(w.code) else 0
+            c["hotkeys"][key] = code or KEYS[TOWER_HOTKEYS[key]]
+        c["hook"] = self.hook.text().strip()
+        c["report"] = self.report.text() or _(TOWER_REPORT)
+        c["shot"] = self.shot.isChecked()
+        self.shot.setEnabled(bool(c["hook"]))
+        self._link_note()
+        self._hotkeys()
+        self._footer()
+        self._view_note()
+        self._sync()
+        self.changed.emit()
+
+    def _link_note(self):
+        link = self.c["link"]
+        self.link_note.setText("" if not link or tower_link(link) else _(
+            "This link would open the game outside the Dock. Use a Roblox "
+            "game page, a private server link "
+            "(…?privateServerLinkCode=…) or a roblox:// link."))
+        self.link_note.setVisible(bool(self.link_note.text()))
+
+    # -------------------------------------------------------- estratégia --
+    def _strategy(self):
+        sid = self.c["current"]
+        return next((s for s in self.c["strategies"] if s["id"] == sid),
+                    None)
+
+    def _fill_strategies(self):
+        self.strat.blockSignals(True)
+        self.strat.clear()
+        for s in self.c["strategies"]:
+            self.strat.addItem(s["name"], s["id"])
+        self.strat.setCurrentIndex(max(0, self.strat.findData(
+            self.c["current"])))
+        self.strat.blockSignals(False)
+        if self.c["strategies"]:
+            self.c["current"] = self.strat.currentData()
+        self._show_strategy()
+
+    def _strategy_changed(self, _i=0):
+        if self.rec is not None:
+            self._stop_rec()
+        self._pick(None)
+        self.c["current"] = self.strat.currentData() or ""
+        self._show_strategy()
+        self.changed.emit()
+
+    def _show_strategy(self):
+        s = self._strategy()
+        self._loading = True
+        on = s is not None
+        for w in (self.name, self.notes, self.towers_box, self.timeline_box,
+                  self.lobby_group, self.b_del, self.b_export):
+            w.setEnabled(on)
+        self.name.setText(s["name"] if on else "")
+        self.notes.setPlainText(s["notes"] if on else "")
+        self._loading = False
+        self._counts()
+        self._fill_timeline()
+        self._fill_lobby()
+        self._fill_lobby_macro()
+        self._size_note()
+        self._markers()
+        self._sync()
+
+    def _counts(self):
+        s = self._strategy()
+        for k, (_num_, name, count, pick, _x) in enumerate(self.tower_rows):
+            t = s["towers"][k] if s else {"name": "", "points": []}
+            if name.text() != t["name"]:
+                name.setText(t["name"])
+            name.setPlaceholderText(_("tower {n}", n=k + 1))
+            n = len(t["points"])
+            count.setText(_("{n} set ✓", n=n) if n else _("no spots"))
+            pick.setChecked(self.picking == k)
+
+    def _new(self):
+        if len(self.c["strategies"]) >= TOWER_MAX_STRATS:
+            self.error.setText(_("The list holds {n} strategies.",
+                                 n=TOWER_MAX_STRATS))
+            return
+        n = len(self.c["strategies"]) + 1
+        s = normalize_tower_strategy({"name": _("Strategy {n}", n=n)})
+        self.c["strategies"].append(s)
+        self.c["current"] = s["id"]
+        self._fill_strategies()
+        self.name.setFocus()
+        self.name.selectAll()
+        self.changed.emit()
+
+    def _delete(self):
+        s = self._strategy()
+        if s is None:
+            return
+        if QMessageBox.question(self, _("Delete strategy"), _(
+                "Delete {name}? Its towers, spots and timeline go with it.",
+                name=s["name"])) != QMessageBox.Yes:
+            return
+        self._pick(None)
+        if self.rec is not None:
+            self._stop_rec()
+        self.c["strategies"] = [x for x in self.c["strategies"]
+                                if x["id"] != s["id"]]
+        self.c["current"] = self.c["strategies"][0]["id"] \
+            if self.c["strategies"] else ""
+        self._fill_strategies()
+        self.changed.emit()
+
+    def _renamed(self, text):
+        s = self._strategy()
+        if s is None or self._loading:
+            return
+        s["name"] = " ".join(text.split())[:60] or _("Strategy")
+        i = self.strat.findData(s["id"])
+        if i >= 0:
+            self.strat.setItemText(i, s["name"])
+        self.changed.emit()
+
+    def _notes_changed(self):
+        s = self._strategy()
+        if s is None or self._loading:
+            return
+        s["notes"] = self.notes.toPlainText()[:2000]
+        self.changed.emit()
+
+    def _tower_named(self, k, text):
+        s = self._strategy()
+        if s is None:
+            return
+        s["towers"][k]["name"] = " ".join(text.split())[:40]
+        self._fill_timeline(keep=True)
+        self.changed.emit()
+
+    def _dock_size(self):
+        return tuple(self.dock.out_size or self.dock.size)
+
+    def _size_note(self):
+        s = self._strategy()
+        w, h = self._dock_size()
+        if s and s["size"] and tuple(s["size"]) != (w, h):
+            self.size_note.setText(_(
+                "This strategy was made with the Dock at {w}×{h}, and the "
+                "Dock is {W}×{H} now: the spots and pictures will miss. "
+                "Change the size on the Dock tab.", w=s["size"][0],
+                h=s["size"][1], W=w, H=h))
+            self.size_note.show()
+        else:
+            self.size_note.hide()
+
+    def _mark_size(self, s):
+        if s["size"] is None:
+            s["size"] = list(self._dock_size())
+
+    def _markers(self):
+        s = self._strategy()
+        marks = []
+        if s and self.show_spots.isChecked():
+            for k, t in enumerate(s["towers"]):
+                for j, (x, y) in enumerate(t["points"]):
+                    marks.append((x, y, f"{k + 1}.{j + 1}", TOWER_COLORS[k]))
+        self.view.markers = marks
+        self.view.update()
+
+    # ------------------------------------------------------ os lugares --
+    def _pick(self, k):
+        if k is not None:
+            why = ""
+            if self._strategy() is None:
+                why = _("Make a strategy first: New, at the top.")
+            elif not self.dock.alive():
+                why = _("Open the Dock first: the spots are picked on the "
+                        "game.")
+            elif self.rec is not None:
+                why = _("Stop recording first.")
+            if why:
+                self.error.setText(why)
+                k = None
+        self.picking = k
+        self.view.pick = k is not None
+        for i, row in enumerate(self.tower_rows):
+            row[3].setChecked(i == k)
+        if k is not None:
+            self.error.setText("")
+            self.view.setFocus()
+        self._view_note()
+        self.view.update()
+
+    def _picked(self, x, y, button):
+        s, k = self._strategy(), self.picking
+        if s is None or k is None:
+            return
+        if button == BTN["Right"]:
+            hit = tower_near(s, x, y, k)
+            if hit is None:
+                return
+            j = hit[1]
+            uses = tower_uses(s, k, j)
+            if uses and QMessageBox.question(self, _("Remove spot"), _(
+                    "{n} actions of the timeline use spot {spot} of {tower}, "
+                    "and they go with it. Remove it?", n=len(uses),
+                    spot=j + 1, tower=tower_name(s, k))) != QMessageBox.Yes:
+                return
+            tower_drop_point(s, k, j)
+        elif button == BTN["Left"]:
+            pts = s["towers"][k]["points"]
+            if len(pts) >= TOWER_MAX_POINTS:
+                self.error.setText(_("A tower holds {n} spots.",
+                                     n=TOWER_MAX_POINTS))
+                return
+            pts.append([int(x), int(y)])
+            self._mark_size(s)
+        else:
+            return
+        self._counts()
+        self._fill_timeline(keep=True)
+        self._markers()
+        self._size_note()
+        self.changed.emit()
+
+    def _clear_tower(self, k):
+        s = self._strategy()
+        if s is None or not s["towers"][k]["points"]:
+            return
+        uses = tower_uses(s, k)
+        text = _("Remove the {n} spots of {tower}?",
+                 n=len(s["towers"][k]["points"]), tower=tower_name(s, k))
+        if uses:
+            text += " " + _("{n} actions of the timeline use them and go "
+                            "too.", n=len(uses))
+        if QMessageBox.question(self, _("Remove spots"), text) \
+                != QMessageBox.Yes:
+            return
+        s["towers"][k]["points"] = []
+        s["actions"] = [a for a in s["actions"] if a.get("tower") != k]
+        self._counts()
+        self._fill_timeline()
+        self._markers()
+        self.changed.emit()
+
+    # ------------------------------------------------- a linha do tempo --
+    def _fill_timeline(self, select=None, keep=False):
+        s = self._strategy()
+        row = self.timeline.currentRow() if keep else select
+        self.timeline.clear()
+        for a in (s["actions"] if s else []):
+            self.timeline.addItem(f"{tower_time(a['t'])}   "
+                                  f"{tower_action_text(a, s)}")
+        if row is not None and self.timeline.count():
+            self.timeline.setCurrentRow(max(0, min(row,
+                                                   self.timeline.count() - 1)))
+        n = len(s["actions"]) if s else 0
+        self.timeline_box.setTitle(_("Timeline ({n})", n=n))
+        self._sync()
+
+    def _put(self, a, old=None):
+        """Põe a ação na linha do tempo, na ordem da hora."""
+        s = self._strategy()
+        if old is not None:
+            s["actions"].remove(old)
+        s["actions"].append(a)
+        s["actions"].sort(key=lambda x: x["t"])
+        self._fill_timeline(select=next(i for i, x in enumerate(s["actions"])
+                                        if x is a))
+        self.changed.emit()
+
+    def _add(self):
+        s = self._strategy()
+        if s is None:
+            return
+        if len(s["actions"]) >= TOWER_MAX_ACTIONS:
+            self.error.setText(_("A timeline holds {n} actions.",
+                                 n=TOWER_MAX_ACTIONS))
+            return
+        row = self.timeline.currentRow()
+        t = s["actions"][row]["t"] if 0 <= row < len(s["actions"]) else 0.0
+        dlg = TowerActionDialog(self, s, {"t": t, "do": "place", "tower": 0,
+                                          "point": 0}, self._grab)
+        if dlg.exec() == QDialog.Accepted and dlg.action():
+            self._put(dlg.action())
+
+    def _edit(self):
+        s = self._strategy()
+        row = self.timeline.currentRow()
+        if s is None or not 0 <= row < len(s["actions"]):
+            return
+        old = s["actions"][row]
+        dlg = TowerActionDialog(self, s, old, self._grab)
+        if dlg.exec() == QDialog.Accepted and dlg.action():
+            self._put(dlg.action(), old)
+
+    def _remove(self):
+        s = self._strategy()
+        row = self.timeline.currentRow()
+        if s is None or not 0 <= row < len(s["actions"]):
+            return
+        del s["actions"][row]
+        self._fill_timeline(select=row)
+        self.changed.emit()
+
+    def _clear_actions(self):
+        s = self._strategy()
+        if s is None or not s["actions"]:
+            return
+        if QMessageBox.question(self, _("Clear the timeline"), _(
+                "Remove the {n} actions of {name}? The towers and their "
+                "spots stay.", n=len(s["actions"]), name=s["name"])) \
+                != QMessageBox.Yes:
+            return
+        s["actions"] = []
+        self._fill_timeline()
+        self.changed.emit()
+
+    # ---------------------------------------------------------- gravar --
+    def _record(self, on):
+        if not on:
+            self._stop_rec()
+            return
+        s = self._strategy()
+        why = ""
+        if s is None:
+            why = _("Make a strategy first: New, at the top.")
+        elif not self.dock.alive():
+            why = _("Open the Dock first: you record by playing in it.")
+        elif self.running():
+            why = _("Stop the farm first.")
+        if why:
+            self.error.setText(why)
+            self.b_rec.setChecked(False)
+            return
+        self._pick(None)
+        if s["actions"]:
+            ans = self._ask_replace(len(s["actions"]))
+            if ans is None:
+                self.b_rec.setChecked(False)
+                return
+            if ans == "replace":
+                s["actions"] = []
+                self._fill_timeline()
+        self.error.setText("")
+        if self.c["camera"]:
+            self.rec_note.setText(_("Lining up the camera…"))
+            self._run_camera(self._begin_rec)
+        else:
+            self._begin_rec()
+
+    def _ask_replace(self, n):
+        """A linha do tempo já tem ações: "replace", "add" ou None."""
+        box = QMessageBox(QMessageBox.Question, _("Record"), _(
+            "The timeline already has {n} actions. Replace them with the new "
+            "recording, or add the new ones to them?", n=n),
+            QMessageBox.NoButton, self)
+        b_new = box.addButton(_("Replace them"), QMessageBox.DestructiveRole)
+        b_add = box.addButton(_("Add to them"), QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(b_add)
+        box.exec()
+        hit = box.clickedButton()
+        return "replace" if hit is b_new else "add" if hit is b_add else None
+
+    def _begin_rec(self):
+        s = self._strategy()
+        if s is None or not self.b_rec.isChecked() or not self.dock.alive():
+            self.b_rec.setChecked(False)
+            self.rec_note.setText("")
+            return
+        self._collect()
+        self._mark_size(s)
+        self.rec = TowerRecorder(s, self.c["keys"])
+        self._hotkeys()
+        self.view.setFocus()
+        self._view_note()
+        self._sync()
+
+    def _stop_rec(self):
+        rec, self.rec = self.rec, None
+        self.b_rec.setChecked(False)
+        self.rec_note.setText("")
+        if rec is not None:
+            rec.s["actions"].sort(key=lambda a: a["t"])
+            self._fill_timeline()
+            self._counts()
+            self._markers()
+            self.changed.emit()
+        self._hotkeys()
+        self._view_note()
+        self._sync()
+
+    def _undo(self):
+        if self.rec is None or self.rec.undo() is None:
+            return
+        self._fill_timeline(select=self.timeline.count() - 2)
+        self._counts()
+        self._markers()
+        self.changed.emit()
+
+    def _acted(self, kind, code, x, y):
+        if self.rec is None:
+            return
+        if kind == "hotkey":
+            if code == KEYS["F10"]:
+                self._undo()
+            return
+        act = self.rec.key(code) if kind == "key" \
+            else self.rec.click(x, y, code)
+        if act is not None:
+            self._fill_timeline(select=len(self.rec.s["actions"]) - 1)
+            self._counts()
+            self._markers()
+            self.changed.emit()
+        self._sync()
+
+    # ---------------------------------------------------------- telas --
+    def _grab(self):
+        frames, err = grab_frames(0, None, self.dock)
+        if not frames:
+            self.error.setText(err)
+        return frames
+
+    def _screen_set(self, key):
+        self.c["screens"][key] = self.screen_fields[key].path
+        self.changed.emit()
+
+    def _add_after(self, path, save=True):
+        if len(self.after_fields) >= TOWER_MAX_AFTER:
+            return
+        box = []
+        f = ImageField(path or "", self._grab, self.error,
+                       remove=lambda: self._del_after(box[0]))
+        box.append(f)
+        f.changed.connect(self._after_set)
+        self.after_fields.append(f)
+        self.after_box.addWidget(f)
+        self.b_after.setEnabled(len(self.after_fields) < TOWER_MAX_AFTER)
+        if save:
+            self._after_set()
+
+    def _del_after(self, f):
+        if f in self.after_fields:
+            self.after_fields.remove(f)
+            self.after_box.removeWidget(f)
+            f.deleteLater()
+        self.b_after.setEnabled(True)
+        self._after_set()
+
+    def _after_set(self):
+        self.c["screens"]["after"] = [f.path for f in self.after_fields
+                                      if f.path][:TOWER_MAX_AFTER]
+        self.changed.emit()
+
+    def _fill_lobby(self):
+        for f in self.lobby_fields:
+            self.lobby_box.removeWidget(f)
+            f.deleteLater()
+        self.lobby_fields = []
+        s = self._strategy()
+        for path in (s["lobby"] if s else []):
+            self._add_lobby(path, save=False)
+        self.b_lobby.setEnabled(len(self.lobby_fields) < TOWER_MAX_LOBBY)
+
+    def _add_lobby(self, path, save=True):
+        if len(self.lobby_fields) >= TOWER_MAX_LOBBY:
+            return
+        box = []
+        f = ImageField(path or "", self._grab, self.error,
+                       remove=lambda: self._del_lobby(box[0]))
+        box.append(f)
+        f.changed.connect(self._lobby_set)
+        self.lobby_fields.append(f)
+        self.lobby_box.addWidget(f)
+        self.b_lobby.setEnabled(len(self.lobby_fields) < TOWER_MAX_LOBBY)
+        if save:
+            self._lobby_set()
+
+    def _del_lobby(self, f):
+        if f in self.lobby_fields:
+            self.lobby_fields.remove(f)
+            self.lobby_box.removeWidget(f)
+            f.deleteLater()
+        self.b_lobby.setEnabled(True)
+        self._lobby_set()
+
+    def _lobby_set(self):
+        s = self._strategy()
+        if s is None:
+            return
+        s["lobby"] = [f.path for f in self.lobby_fields
+                      if f.path][:TOWER_MAX_LOBBY]
+        self.changed.emit()
+
+    def _fill_lobby_macro(self):
+        s = self._strategy()
+        want = s["lobby_macro"] if s else ""
+        self.lobby_macro.blockSignals(True)
+        self.lobby_macro.clear()
+        self.lobby_macro.addItem(_("None"), "")
+        for m in self.macros():
+            if m.get("steps"):
+                self.lobby_macro.addItem(f"{m['name'] or hotkey_label(m)}  "
+                                         f"({len(m['steps'])})", m["id"])
+        self.lobby_macro.setCurrentIndex(max(0, self.lobby_macro.findData(
+            want)))
+        self.lobby_macro.blockSignals(False)
+
+    def _lobby_macro_set(self, _i=0):
+        s = self._strategy()
+        if s is None:
+            return
+        s["lobby_macro"] = self.lobby_macro.currentData() or ""
+        self.changed.emit()
+
+    def showEvent(self, e):
+        self._fill_lobby_macro()
+        super().showEvent(e)
+
+    # ------------------------------------------------------ arquivos --
+    def _export(self):
+        s = self._strategy()
+        if s is None:
+            return
+        name = re.sub(r"[^\w.-]+", "-", s["name"]).strip(".-") or "strategy"
+        path, _f = QFileDialog.getSaveFileName(
+            self, _("Export strategy"),
+            os.path.join(os.path.expanduser("~"), name + MACRO_FILE_EXT),
+            _("WayClick macros") + f" (*{MACRO_FILE_EXT})")
+        if not path:
+            return
+        if not path.endswith(MACRO_FILE_EXT):
+            path += MACRO_FILE_EXT
+        data, missing = export_tower(s, self.c["screens"])
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, path)
+        except OSError as e:
+            self.error.setText(_("Could not save {path}.", path=path) + " "
+                               + str(e.strerror or e))
+            return
+        text = _("Saved {file}.", file=os.path.basename(path))
+        if missing:
+            text += " " + _("{n} pictures could not be read and are not in "
+                            "it.", n=len(missing))
+        self._log_line(text)
+        self.error.setText("")
+
+    def _import(self):
+        path, _f = QFileDialog.getOpenFileName(
+            self, _("Import strategy"), os.path.expanduser("~"),
+            _("WayClick macros") + f" (*{MACRO_FILE_EXT} *.json);;"
+            + _("All files") + " (*)")
+        if path:
+            self.import_path(path)
+
+    def import_path(self, path):
+        if len(self.c["strategies"]) >= TOWER_MAX_STRATS:
+            self.error.setText(_("The list holds {n} strategies.",
+                                 n=TOWER_MAX_STRATS))
+            return None
+        data = None
+        try:
+            data = read_macro_file(path)
+            s, fill, notes = import_tower(data, self.c["screens"])
+        except OSError as e:
+            self.error.setText(_("Could not read {file}: {err}",
+                                 file=os.path.basename(path),
+                                 err=e.strerror or e))
+            return None
+        except ValueError:
+            if isinstance(data, dict) and isinstance(data.get("macros"),
+                                                     list):
+                self.error.setText(_("{file} holds macros, not a strategy: "
+                                     "import it on the Hotkeys tab.",
+                                     file=os.path.basename(path)))
+            else:
+                self.error.setText(_("{file} is not a Tower Defense "
+                                     "strategy file of WayClick.",
+                                     file=os.path.basename(path)))
+            return None
+        self.c["strategies"].append(s)
+        self.c["current"] = s["id"]
+        for key, val in fill.items():
+            self.c["screens"][key] = val
+        self._fill_screens()
+        self._fill_strategies()
+        self.error.setText("")
+        self._log_line(" ".join([_("Imported {name}.", name=s["name"])]
+                                + notes))
+        self.changed.emit()
+        return s
+
+    def _fill_screens(self):
+        sc = self.c["screens"]
+        for key, f in self.screen_fields.items():
+            if f.path != sc[key]:
+                f.blockSignals(True)
+                f.set_path(sc[key])
+                f.blockSignals(False)
+        for f in self.after_fields:
+            self.after_box.removeWidget(f)
+            f.deleteLater()
+        self.after_fields = []
+        for path in sc["after"] or [""]:
+            self._add_after(path, save=False)
+
+    # ------------------------------------------------------------ farm --
+    def running(self):
+        r = self.runner
+        return r is not None and r.is_alive()
+
+    def _plan(self):
+        self._collect()
+        plan = json.loads(json.dumps(self.c))
+        s = self._strategy()
+        plan["strategy"] = json.loads(json.dumps(s)) if s else None
+        mid = s["lobby_macro"] if s else ""
+        m = next((m for m in self.macros() if m["id"] == mid), None) \
+            if mid else None
+        plan["lobby_steps"] = [dict(st) for st in m["steps"]] if m else []
+        return plan
+
+    def start(self):
+        if self.running() or self.cam is not None:
+            return
+        if self.rec is not None:
+            self._stop_rec()
+        self._pick(None)
+        s, sc = self._strategy(), self.c["screens"]
+        why = ""
+        if s is None:
+            why = _("Make a strategy first: New, at the top of the Strategy "
+                    "tab.")
+        elif not (sc["victory"] or sc["defeat"] or sc["after"]):
+            why = _("Capture how a match ends on the Screens tab: Victory, "
+                    "Defeat or a button After the match.")
+        elif self.c["link"] and not tower_link(self.c["link"]):
+            why = self.link_note.text()
+        if why:
+            self.error.setText(why)
+            return
+        self.error.setText("")
+        if not self.dock.alive() and not self.dock.start(launch=False):
+            self.error.setText(self.dock.error or _("The Dock did not "
+                                                    "open."))
+            return
+        self._swap_env()
+        self.runner = TowerRunner(self._plan(), self.dock, self.env,
+                                  on_done=self._done.emit)
+        self.began = time.monotonic()
+        for k in ("matches", "wins", "losses"):
+            self.stats[k].setText("0")
+        self.runner.start()
+        self._sync()
+        self.running_changed.emit()
+
+    def stop(self):
+        for r in (self.runner, self.cam):
+            if r is not None:
+                r.stop()
+        if self.rec is not None:
+            self._stop_rec()
+
+    def pause(self):
+        r = self.runner
+        if r is None or not r.is_alive():
+            return
+        r.paused = not r.paused
+        self._sync()
+
+    def _swap_env(self):
+        self._drain()
+        self.env = TowerEnv(self.dock)
+
+    def _finished(self, r):
+        self._drain()
+        if r is self.runner:
+            self._show_stats(r)
+            self.runner = None
+            self.phase.setText(_("Stopped"))
+            self._log_line(_("Farm stopped."))
+            self._sync()
+            self.running_changed.emit()
+
+    def _run_camera(self, then=None):
+        if self.cam is not None or not self.dock.alive():
+            return False
+        self._swap_env()
+        self._cam_then = then
+        self.cam = TowerRunner(self._plan(), self.dock, self.env,
+                               on_done=self._cam_done.emit, camera_only=True)
+        self.cam.start()
+        self._sync()
+        return True
+
+    def _camera_now(self):
+        if self.running():
+            return
+        if not self.dock.alive():
+            self.error.setText(_("Open the Dock first."))
+            return
+        self._run_camera()
+
+    def _cam_finished(self, r):
+        self._drain()
+        if r is not self.cam:
+            return
+        self.cam = None
+        then, self._cam_then = self._cam_then, None
+        if then:
+            then()
+        self._sync()
+
+    def _drain(self):
+        env = self.env
+        if env is None:
+            return
+        for t, warn, text in env.take():
+            self._log_line(text, warn, t)
+
+    def _log_line(self, text, warn=False, t=None):
+        stamp = time.strftime("%H:%M:%S", time.localtime(t or time.time()))
+        self.log.appendPlainText(f"{stamp}  " + ("⚠ " if warn else "")
+                                 + text)
+
+    def _show_stats(self, r):
+        for k in ("matches", "wins", "losses"):
+            self.stats[k].setText(str(r.counters[k]))
+        if self.began is not None:
+            self.stats["time"].setText(clock_text(time.monotonic()
+                                                  - self.began))
+
+    def _tick(self):
+        self._drain()
+        r = self.runner
+        if r is not None and r.is_alive():
+            self.phase.setText(r.phase or _("Running…"))
+            self._show_stats(r)
+            want = _("Resume") if r.paused else _("Pause")
+            if self.b_pause.text() != want:
+                self.b_pause.setText(want)
+        if self.rec is not None:
+            self.rec_note.setText(_("● Recording {t}",
+                                    t=tower_time(self.rec.now())))
+        self._sync_view()
+
+    def _sync_view(self):
+        win = self.window()
+        want = self.isVisible() and self.dock.alive() \
+            and not (win.windowState() & Qt.WindowMinimized)
+        if want and not self.view.running():
+            self.view.start()
+        elif not want and self.view.running():
+            self.view.stop()
+        # janela do WayClick atrás de outra: menos capturas
+        self.view.fps = DockView.FPS if win.isActiveWindow() else 5
+
+    # ------------------------------------------------------------ Doca --
+    def _dock_changed(self):
+        if not self.dock.alive():
+            self.stop()
+            if self.picking is not None:
+                self._pick(None)
+        self._hotkeys()
+        self._size_note()
+        self._sync_view()
+        self._view_note()
+        self._sync()
+        self.view.update()
+
+    def _dock_toggle(self):
+        if self.dock.state == "starting":
+            return
+        if self.dock.alive():
+            if self.running() and QMessageBox.question(
+                    self, _("Close the Dock"),
+                    _("The farm is running. Close the Dock, and the game "
+                      "with it?")) != QMessageBox.Yes:
+                return
+            self.stop()
+            self.dock.stop()
+            return
+        if not self.dock.start(launch=False):
+            self.error.setText(self.dock.error or _("The Dock did not "
+                                                    "open."))
+            return
+        if tower_link(self.c["link"]):
+            self._join()
+        else:
+            self.dock.launch()
+
+    def _join(self):
+        link = tower_link(self.c["link"])
+        if not link:
+            self.error.setText(self.link_note.text() or _(
+                "Put the game link in Settings: a Roblox game page or a "
+                "private server link."))
+            return
+        if not self.dock.alive() and not self.dock.start(launch=False):
+            self.error.setText(self.dock.error or _("The Dock did not "
+                                                    "open."))
+            return
+        self.error.setText("")
+        self._log_line(_("Opening the game in the Dock…"))
+        self.dock.open(link, report=lambda t: self._log_line(
+            t[:1].upper() + t[1:], True))
+
+    def _dock_in(self):
+        if self.dock.hide() is None and self.dock.alive():
+            self._log_line(_("KWin did not find the Dock window."), True)
+        self.view.setFocus()
+
+    def _dock_out(self):
+        if self.dock.show() is None and self.dock.alive():
+            self._log_line(_("KWin did not find the Dock window."), True)
+
+    def set_claims(self, claims):
+        """(código) -> bool: a tecla já é de outro (um macro ligado, o
+        atalho de armar). Aí o aperto é dele, não do farm."""
+        self.claims = claims
+        for w in self.watchers.values():
+            w.shadow = claims
+
+    def _hotkeys(self):
+        """Os atalhos globais do farm, enquanto a Doca está aberta."""
+        codes = self.c["hotkeys"]
+        if not self.dock.alive():
+            for w in self.watchers.values():
+                w.stop()
+            self.watchers = {}
+        else:
+            for name, slot in (("start", self.start), ("stop", self.stop),
+                               ("pause", self.pause)):
+                w = self.watchers.get(name)
+                if w is None:
+                    w = HotkeyWatcher(codes[name])
+                    w.shadow = self.claims
+                    w.pressed.connect(slot)
+                    w.start()
+                    self.watchers[name] = w
+                elif w.keycode != codes[name]:
+                    w.set_key(codes[name])
+        skip = set(codes.values())
+        if self.rec is not None:
+            skip.add(KEYS["F10"])
+        self.view.skip_keys = skip
+
+    # ------------------------------------------------------- aparência --
+    def _sync(self):
+        if not hasattr(self, "b_clear"):
+            return
+        running, on = self.running(), self.dock.alive()
+        s = self._strategy()
+        busy = running or self.cam is not None
+        rec = self.rec is not None
+        self.b_start.setEnabled(not busy and not rec and s is not None)
+        self.b_stop.setEnabled(busy)
+        self.b_pause.setEnabled(running)
+        if not running:
+            self.b_pause.setText(_("Pause"))
+        self.b_dock.setText(_("Close the Dock") if on else _("Open the Dock"))
+        self.b_dock.setEnabled(self.dock.state != "starting")
+        self.b_in.setEnabled(on)
+        self.b_out.setEnabled(on)
+        self.b_join.setEnabled(bool(tower_link(self.c["link"])))
+        self.b_cam.setEnabled(on and not busy and not rec)
+        self.b_rec.setEnabled(s is not None and not running
+                              and (on or rec))
+        self.b_undo.setEnabled(rec and bool(self.rec.undos))
+        row = self.timeline.currentRow()
+        has = s is not None and 0 <= row < len(s["actions"])
+        self.b_edit.setEnabled(has and not rec)
+        self.b_remove.setEnabled(has and not rec)
+        self.b_add.setEnabled(s is not None and not rec)
+        self.b_clear.setEnabled(bool(s and s["actions"]) and not rec)
+        for _n, _name, _c, pick, clear in self.tower_rows:
+            pick.setEnabled(s is not None and on and not running and not rec)
+            clear.setEnabled(s is not None and not running and not rec)
+        self.strat.setEnabled(not running and not rec)
+        self.b_new.setEnabled(not running and not rec)
+        self.b_import.setEnabled(not running and not rec)
+
+    def _footer(self):
+        h = self.c["hotkeys"]
+        self.footer.setText(_(
+            "{start} starts · {stop} stops · {pause} pauses or resumes, in "
+            "any window while the Dock is open",
+            start=key_label(h["start"]), stop=key_label(h["stop"]),
+            pause=key_label(h["pause"])))
+        self.b_start.setText(_("Start ({key})", key=key_label(h["start"])))
+        self.b_stop.setText(_("Stop ({key})", key=key_label(h["stop"])))
+
+    def _view_note(self):
+        if not hasattr(self, "view_note"):
+            return
+        k = self.c["keys"]
+        if not self.dock.alive():
+            text = _("Open the Dock on the left: it opens with the game link "
+                     "of Settings, and the game shows up here.")
+        elif self.picking is not None:
+            text = _("Picking the spots of {tower}: click where it goes, "
+                     "right click a spot to remove it, Esc ends.",
+                     tower=tower_name(self._strategy(), self.picking))
+        elif self.rec is not None:
+            text = _("Recording: 1 to 5 picks a tower and a click places it. "
+                     "Click a tower, then {top} or {bottom} upgrades it{sell}. "
+                     "F10 undoes.", top=key_label(k["top"]),
+                     bottom=key_label(k["bottom"]),
+                     sell=(_(", {key} sells it", key=key_label(k["sell"]))
+                           if k["sell"] else ""))
+        else:
+            text = _("The game of the Dock: mouse, wheel and keys over it go "
+                     "to the game.")
+        self.view_note.setText(text)
+        self.view.empty_text = _("The Dock is closed.") \
+            if not self.dock.alive() else _("Waiting for the picture of the "
+                                            "Dock…")
+
+    def retranslate(self):
+        for lbl, src in self._labels:
+            lbl.setText(_(src))
+        for w, tip in self._tips:
+            w.setToolTip(_(tip))
+        for w, special in self._specials:
+            w.setSpecialValueText(_(special))
+        self.limit.setSuffix(" " + _("matches"))
+        for b, src in ((self.b_new, "New"), (self.b_del, "Delete"),
+                       (self.b_export, "Export…"), (self.b_import, "Import…"),
+                       (self.b_rec, "● Record"), (self.b_undo, "Undo (F10)"),
+                       (self.b_add, "Add…"), (self.b_edit, "Edit…"),
+                       (self.b_remove, "Remove"), (self.b_clear, "Clear"),
+                       (self.b_lobby, "+ Add a lobby button"),
+                       (self.b_after, "+ Add a button"),
+                       (self.b_in, "Dock the game"), (self.b_out, "Undock"),
+                       (self.b_join, "Join the game"),
+                       (self.b_log, "Clear the log"),
+                       (self.b_cam, "Line up the camera")):
+            b.setText(_(src))
+        for _n, _name, _c, pick, clear in self.tower_rows:
+            pick.setText(_("Pick"))
+            pick.setToolTip(_("Pick the spots of this tower on the game"))
+            clear.setToolTip(_("Remove the spots of this tower"))
+        self.b_in.setToolTip(_("Minimize the Dock window: the game keeps "
+                               "playing here"))
+        self.b_out.setToolTip(_("Bring the Dock window to the front"))
+        self.b_join.setToolTip(_("Open the game link of Settings in the "
+                                 "Dock"))
+        self.b_cam.setToolTip(_("Zoom out and drag the camera down, as at "
+                                "the start of each match"))
+        self.b_sell_x.setToolTip(_("No sell key"))
+        self.show_spots.setText(_("Show the spots"))
+        self.towers_box.setTitle(_("Towers"))
+        self.lobby_group.setTitle(_("Lobby"))
+        self.keys_box.setTitle(_("Game keys"))
+        self.hot_box.setTitle(_("Hotkeys"))
+        self.hook_box.setTitle(_("Report"))
+        self.camera.setText(_("Line up the camera when a match starts"))
+        self.camera.setToolTip(_(
+            "The spots are places on the screen, so the camera has to be "
+            "the same in every match: zoomed all the way out and looking "
+            "down. Recording lines it up too."))
+        self.shot.setText(_("Attach a screenshot"))
+        self.hook.setPlaceholderText(_("optional") + ", "
+                                     "https://discord.com/api/webhooks/…")
+        self.notes.setPlaceholderText(_("Map, mode, the guide it follows…"))
+        self.lobby_hint.setText(_(
+            "The buttons clicked in order to get into a match. The lobby "
+            "macro, if any, plays before them, like walking into an "
+            "elevator."))
+        self.screens_hint.setText(_(
+            "Pictures of the game, captured from the Dock while it shows "
+            "them. The farm looks for them on the screen, nothing reads the "
+            "memory of the game. In the settings of the game, turn off "
+            "Camera Shake, Low Quality Rings and the Switch Hotbar key (Q "
+            "also cancels placing), turn on Show Tower Options, and keep the "
+            "UI Scale as it was when you captured them."))
+        self.hot_note.setText(_(
+            "They work in any window while the Dock is open. A hotkey macro "
+            "or the WayClick hotkey on the same key takes it first."))
+        self.side.setTabText(0, _("Strategy"))
+        self.side.setTabText(1, _("Screens"))
+        self.side.setTabText(2, _("Settings"))
+        speed = self.speed.currentIndex()
+        for i, src in enumerate(("Fast", "Balanced", "Slow")):
+            self.speed.setItemText(i, _(src))
+        self.speed.setCurrentIndex(speed)
+        if self.k_sell.code == 0:
+            self.k_sell.name = _("none")
+            self.k_sell._refresh()
+        for f in (list(self.screen_fields.values()) + self.after_fields
+                  + self.lobby_fields):
+            f.retranslate()
+        if not self.running():
+            self.phase.setText(_("Stopped"))
+        self._counts()
+        self._fill_timeline(keep=True)
+        self._fill_lobby_macro()
+        self._footer()
+        self._view_note()
+        self._sync()
+
+    def state(self):
+        # cada campo já grava em self.c quando muda
+        return json.loads(json.dumps(self.c))
+
+    def shutdown(self):
+        self._timer.stop()
+        for r in (self.runner, self.cam):
+            if r is not None:
+                r.stop()
+        for r in (self.runner, self.cam):
+            if r is not None:
+                r.join(timeout=1.0)
+        self.view.stop()
+        for w in self.watchers.values():
+            w.stop()
+        self.watchers = {}
 
 
 # ------------------------------------------------------------------ UI ------
@@ -10433,6 +13921,22 @@ class App(QWidget):
         self.dock_hint.setEnabled(False)
         self._hints.append((self.dock_hint, DOCK_TAB_HINT))
 
+        # --- Tower Defense: o jogo da Doca dentro da janela, e o farm ---
+        # numa QScrollArea: o QTabWidget pede o mínimo da maior aba, e sem
+        # ela as outras abas não deixariam a janela voltar a 460 px
+        self.tower = TowerTab(cfg.get("tower"), self.dock,
+                              macros=lambda: self.macros)
+        self.tower_scroll = QScrollArea()
+        self.tower_scroll.setWidgetResizable(True)
+        self.tower_scroll.setFrameShape(QFrame.NoFrame)
+        self.tower_scroll.setWidget(self.tower)
+        self._small_size = None          # o tamanho de antes da aba crescer
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(2000)
+        self._save_timer.timeout.connect(self._save_cfg)
+        self.tower.changed.connect(self._save_timer.start)
+
         # Abas em vez de tudo empilhado: com todos os grupos numa tela só a
         # janela passava de 900 px de altura e não cabia num 1366x768.
         self.tabs = QTabWidget()
@@ -10452,9 +13956,12 @@ class App(QWidget):
         self.tabs.addTab(self._page(None, dock_form, None,
                                     extra=[self.dock_state, self.dock_note,
                                            self.dock_hint]), "")
+        self.tabs.addTab(self.tower_scroll, "")
         self._tab_names = ["Click", "Keyboard", "Hotkeys", "Window",
-                           "Trigger", "Dock"]
+                           "Trigger", "Dock", "Tower Defense"]
         self._sync_tabs()
+        self.tower.running_changed.connect(self._sync_tabs)
+        self.tabs.currentChanged.connect(self._tab_changed)
         for w_ in (self.click_box, self.key_box, self.target_box,
                    self.macro_box):
             w_.toggled.connect(self._sync_tabs)
@@ -10502,6 +14009,8 @@ class App(QWidget):
         # macros com atalho: vivem independentes do Start
         self.engine = MacroEngine(self._macro_outputs, hub=self.watcher.hub)
         self.watcher.shadow = self.engine.claims
+        self.tower.set_claims(lambda code: self.engine.claims(code)
+                              or code == self.hk.code)
         self.engine.changed.connect(self._macros_ran)
         self.engine.toggled.connect(self._macro_toggled)
         self.engine.problem.connect(self._macro_problem)
@@ -10641,6 +14150,40 @@ class App(QWidget):
         self.tab_pages.append(page)
         return page
 
+    def _tab_changed(self, _i=0):
+        """A aba Tower Defense precisa de espaço para o jogo: a janela cresce
+        ao entrar nela e volta ao tamanho de antes ao sair."""
+        tds = self.tabs.currentWidget() is self.tower_scroll
+        big = self.windowState() & (Qt.WindowMaximized | Qt.WindowFullScreen)
+        if tds and self._small_size is None and not big:
+            want_w, want_h = TOWER_WINDOW
+            scr = self.screen()
+            if scr is not None:
+                g = scr.availableGeometry()
+                want_w = min(want_w, g.width() - 40)
+                want_h = min(want_h, g.height() - 60)
+            if self.width() < want_w or self.height() < want_h:
+                self._small_size = self.size()
+                self.resize(max(self.width(), want_w),
+                            max(self.height(), want_h))
+        elif not tds and self._small_size is not None:
+            size, self._small_size = self._small_size, None
+            if not big:
+                self.resize(size)
+        self._bottom()
+
+    def _bottom(self):
+        """Na aba Tower Defense, o Start de baixo (o do autoclicker) sai de
+        cena enquanto está parado: ali o Start é o do farm."""
+        if not hasattr(self, "tower_scroll"):
+            return
+        hide = (self.tabs.currentWidget() is self.tower_scroll
+                and not self.running and not getattr(self, "_state", ""))
+        self.status.setVisible(not hide)
+        self.btn.setVisible(not hide)
+        w = getattr(self, "watcher", None)
+        self.warn.setVisible(not hide or (w is not None and not w.ok))
+
     def _sync_tabs(self):
         """Marca a aba cuja engine está ligada, para saber sem abrir."""
         # a aba do gatilho também marca: um modo que não é "liga e desliga"
@@ -10650,7 +14193,8 @@ class App(QWidget):
               self.macro_box.isChecked() and any(
                   m["enabled"] for m in getattr(self, "macros", [])),
               self.target_box.isChecked(), self.mode_key() != "toggle",
-              getattr(self, "dock", None) is not None and self.dock.alive()]
+              getattr(self, "dock", None) is not None and self.dock.alive(),
+              hasattr(self, "tower") and self.tower.running()]
         for i, name in enumerate(self._tab_names):
             mark = "● " if on[i] else ""
             self.tabs.setTabText(i, mark + _(name))
@@ -10886,6 +14430,7 @@ class App(QWidget):
             lbl.setText(_(src))
         self._sync_tabs()
         self._show_dock()
+        self.tower.retranslate()
         self._update_win_warn()
         self.sound.setText(_("Sound feedback on hotkey"))
         self.autostart.setText(_("Start with system"))
@@ -11142,6 +14687,7 @@ class App(QWidget):
         self.status.setStyleSheet(
             f"font-size:17px;font-weight:bold;color:{color};padding:10px;")
         self._sync_tray()
+        self._bottom()
 
     # ------------------------------------------------------------ mouses --
     def refresh_mice(self, keep=False):
@@ -12082,6 +15628,7 @@ class App(QWidget):
 
     def import_macro_path(self, path, ask=True):
         """Mostra o que o arquivo traz e acrescenta os macros."""
+        data = None
         try:
             data = read_macro_file(path)
             macros, notes = import_macros(data, dry=True)
@@ -12092,6 +15639,16 @@ class App(QWidget):
                                   err=e.strerror or e))
             return 0
         except ValueError:
+            if isinstance(data, dict) and data.get("kind") == TOWER_FILE_KIND:
+                # uma estratégia de Tower Defense: o lugar dela é a outra aba
+                if not ask or QMessageBox.question(
+                        self, _("Import macros"),
+                        _("{file} holds a Tower Defense strategy, not "
+                          "macros. Import it on the Tower Defense tab?",
+                          file=os.path.basename(path))) == QMessageBox.Yes:
+                    self.tabs.setCurrentWidget(self.tower_scroll)
+                    self.tower.import_path(path)
+                return 0
             QMessageBox.warning(self, _("Import macros"),
                                 _("{file} is not a WayClick macro file.",
                                   file=os.path.basename(path)))
@@ -12140,6 +15697,63 @@ class App(QWidget):
     # Limpeza via aboutToQuit e não closeEvent: sobrescrever closeEvent faz o
     # shiboken embrulhar o QCloseEvent, o que segfaulta no PySide6 + Python
     # 3.15rc do Fedora 45 quando a janela é fechada pelo botão do compositor.
+    def _cfg_state(self):
+        return {"interval_ms": self.interval.value(),
+                "button": self.btn_sel.currentData(),
+                "delay": self.delay.value(),
+                "duration": self.duration.value(),
+                "trigger_code": self.trigger.code,
+                "trigger_name": self.trigger.name,
+                "hotkey": self.hk.name,
+                "hotkey_code": self.hk.code,
+                "mode": self.mode_key(),
+                "sound": self.sound.isChecked(),
+                "mouse_name": self.selected_mouse()[1],
+                "click_enabled": self.click_box.isChecked(),
+                "key_enabled": self.key_box.isChecked(),
+                "keys": [r.spec() for r in self.key_rows],
+                # a primeira tecla também nos campos antigos: uma
+                # versão anterior ainda lê a config sem se perder
+                "key": self.key_rows[0].catcher.name,
+                "key_code": self.key_rows[0].catcher.code,
+                "key_interval_ms": self.key_rows[0].interval.value(),
+                "key_mode": self.key_rows[0].mode.currentData(),
+                "trigger_scope": {n: b.isChecked() for n, b
+                                  in self.trig_boxes.items()},
+                "afk_seconds": self.afk_secs.value(),
+                "target_key": self.win_key.name,
+                "target_key_code": self.win_key.code,
+                "target_seconds": self.win_secs.value(),
+                "hotkey_block": self.hk_block.isChecked(),
+                "macros": self.macros,
+                "macros_enabled": self.macro_box.isChecked(),
+                "dock_size": "x".join(
+                    map(str, self._dock_size_value())),
+                "dock_command": self.dock_cmd.text().strip(),
+                "update_check": self.update_auto,
+                "update_tag": self._update_tag,
+                "update_url": self._update_url,
+                "update_last": self._update_last,
+                "theme": self.theme,
+                "tray_style": self.tray_style,
+                "tray_color": self.tray_color,
+                "language": LANG,
+                "tower": self.tower.state()}
+
+    def _save_cfg(self):
+        """A configuração no disco, de uma vez: um arquivo novo que troca de
+        lugar com o velho, então faltar luz no meio não deixa um pela
+        metade. Também logo depois de mexer na aba Tower Defense, porque uma
+        estratégia gravada jogando não se refaz fácil."""
+        try:
+            data = self._cfg_state()
+            tmp = CFG + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, CFG)
+        except Exception:                          # noqa: BLE001
+            pass
+
     def cleanup(self):
         if getattr(self, "_cleaned", False):
             return
@@ -12151,6 +15765,8 @@ class App(QWidget):
         self.target_timer.stop()
         if self.bridge or _KWIN:
             (self.bridge or _KWIN).cleanup()
+        self._save_timer.stop()
+        self.tower.shutdown()
         self.engine.stop_dock()
         self.dock.stop()
         self.engine.close()
@@ -12171,50 +15787,7 @@ class App(QWidget):
             self.pointer = None
         if self.engine.screen is not None:
             self.engine.screen.stop()
-        try:
-            with open(CFG, "w") as fh:
-                json.dump({"interval_ms": self.interval.value(),
-                           "button": self.btn_sel.currentData(),
-                           "delay": self.delay.value(),
-                           "duration": self.duration.value(),
-                           "trigger_code": self.trigger.code,
-                           "trigger_name": self.trigger.name,
-                           "hotkey": self.hk.name,
-                           "hotkey_code": self.hk.code,
-                           "mode": self.mode_key(),
-                           "sound": self.sound.isChecked(),
-                           "mouse_name": self.selected_mouse()[1],
-                           "click_enabled": self.click_box.isChecked(),
-                           "key_enabled": self.key_box.isChecked(),
-                           "keys": [r.spec() for r in self.key_rows],
-                           # a primeira tecla também nos campos antigos: uma
-                           # versão anterior ainda lê a config sem se perder
-                           "key": self.key_rows[0].catcher.name,
-                           "key_code": self.key_rows[0].catcher.code,
-                           "key_interval_ms": self.key_rows[0].interval.value(),
-                           "key_mode": self.key_rows[0].mode.currentData(),
-                           "trigger_scope": {n: b.isChecked() for n, b
-                                             in self.trig_boxes.items()},
-                           "afk_seconds": self.afk_secs.value(),
-                           "target_key": self.win_key.name,
-                           "target_key_code": self.win_key.code,
-                           "target_seconds": self.win_secs.value(),
-                           "hotkey_block": self.hk_block.isChecked(),
-                           "macros": self.macros,
-                           "macros_enabled": self.macro_box.isChecked(),
-                           "dock_size": "x".join(
-                               map(str, self._dock_size_value())),
-                           "dock_command": self.dock_cmd.text().strip(),
-                           "update_check": self.update_auto,
-                           "update_tag": self._update_tag,
-                           "update_url": self._update_url,
-                           "update_last": self._update_last,
-                           "theme": self.theme,
-                           "tray_style": self.tray_style,
-                           "tray_color": self.tray_color,
-                           "language": LANG}, fh)
-        except Exception:
-            pass
+        self._save_cfg()
         # por último: o resto da limpeza ainda repinta o estado, e repintar
         # uma bandeja já removida estouraria
         if self.tray:

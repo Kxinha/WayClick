@@ -597,7 +597,10 @@ dock.state = "off"
 w = a.App()
 w.sound.setChecked(False)
 names = [w.tabs.tabText(i) for i in range(w.tabs.count())]
-check("the window has a Dock tab", names[-1] == "Dock", str(names))
+DOCK_TAB = names.index("Dock") if "Dock" in names else -1
+check("the window has a Dock tab, before Tower Defense",
+      DOCK_TAB >= 0 and names[DOCK_TAB + 1:] == ["Tower Defense"],
+      str(names))
 check("the engine plays Dock macros in it", w.engine.dock is dock)
 check("size and game come from the settings",
       w.dock_size.currentText() == "1600 × 900"
@@ -622,7 +625,7 @@ dock.changed.emit()
 check("open, it shows its size and marks the tab",
       w.dock_state.text() == "Open, 1280×720. No game is running in it."
       and w.dock_open.text() == "Close the Dock" and w.dock_show.isEnabled()
-      and w.tabs.tabText(w.tabs.count() - 1) == "● Dock",
+      and w.tabs.tabText(DOCK_TAB) == "● Dock",
       w.dock_state.text())
 w.macros = [a.normalize_macro({"steps": [{"op": "tap", "code": K["A"]}],
                                "dock": True, "code": K["F7"]})]
@@ -642,7 +645,7 @@ check("Close the Dock closes it and stops its macros",
 a.LANG = "pt_BR"
 w.retranslate()
 check("and the tab is translated",
-      w.tabs.tabText(w.tabs.count() - 1) == "Doca"
+      w.tabs.tabText(DOCK_TAB) == "Doca"
       and w.dock_open.text() == "Abrir a Doca"
       and w.dock_hint.text().startswith("O jogo abre numa janela"))
 a.LANG = "en_US"

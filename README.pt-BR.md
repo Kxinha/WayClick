@@ -41,6 +41,11 @@ compositor e sem nada rodando como root.
   macros marcados com *Jogar na Doca* apertam teclas, clicam e olham a tela
   só lá dentro, então seu mouse e seu teclado ficam livres e a Doca pode
   ficar atrás de outras janelas ou minimizada
+- **A aba Tower Defense** mostra o jogo da Doca dentro do WayClick e farma
+  um jogo de tower defense de lá, com cinco torres e os lugares delas, uma
+  linha do tempo que você grava jogando, o lobby, imagens do fim da partida,
+  Iniciar F4, Parar F5 e Pausar F6, um registro e as contagens. Ele só olha
+  a tela e aperta teclas, nunca lê a memória do jogo
 - **Mandar tecla para uma janela** — escolha uma janela aberta e alimente ela
   com uma tecla; em alvo X11 chega sem mexer no foco, mesmo minimizada
 - **Anti-AFK** — mexe o ponteiro e devolve, com deriva zero
@@ -474,6 +479,122 @@ de abrir ele na Doca; a aba Doca avisa quando encontra um. A Doca precisa de
 uma sessão Wayland do Plasma (`kwin_wayland`) e do `dbus-daemon`, que vêm
 com o Plasma.
 
+### A aba Tower Defense
+
+Os macros de tower defense do Windows mostram o jogo dentro da janela deles
+e farmam de lá. A aba **Tower Defense** faz o mesmo com a Doca: o jogo da
+Doca aparece no meio da aba umas 20 vezes por segundo, e mouse, roda e
+teclas em cima dele vão para o jogo, então dá para jogar pela aba também. O
+farm só olha a tela da Doca e aperta teclas e clica nela. Ele nunca lê nem
+mexe na memória do jogo.
+
+| Parte | O que tem |
+|---|---|
+| Esquerda | **Iniciar (F4)**, **Parar (F5)** e **Pausar (F6)**, o que o farm está fazendo, há quanto tempo ele roda, partidas, vitórias e derrotas, **Abrir a Doca**, **Encaixar o jogo** (minimiza a janela da Doca enquanto o jogo continua rodando na aba) e **Desencaixar**, **Entrar no jogo** (abre o link do jogo na Doca) e o registro |
+| Meio | O jogo. **Alinhar a câmera** afasta e arrasta para baixo como no começo de cada partida, e **Mostrar os lugares** marca onde cada torre vai |
+| Direita | As abas **Estratégia**, **Telas** e **Configurações** |
+
+Nesta aba a janela do WayClick cresce para 1600×900 (menos numa tela menor)
+e volta ao tamanho dela quando você sai da aba. A visão para enquanto a aba
+está escondida e cai para 5 quadros por segundo enquanto o WayClick está
+atrás de outra janela.
+
+**Estratégia.** Uma estratégia tem nome, observações, cinco torres com os
+lugares onde cada uma vai, uma linha do tempo e o lobby.
+
+- **Marcar** numa torre, e depois clique no jogo onde ela vai. O clique
+  direito tira um lugar e o Esc termina.
+- **● Gravar** alinha a câmera e depois anota o que você joga na visão. 1 a
+  5 pega uma torre e um clique coloca ela (a até 8 px de um lugar que a
+  torre já tem, é esse lugar), clicar numa torre e depois E ou Z melhora
+  ela no caminho de cima ou no de baixo, Q larga a torre da mão, e F10
+  desfaz a última ação. Os tempos contam de quando a gravação começa, então
+  comece ela quando a partida começar.
+- **Adicionar…**, **Editar…** e **Remover** mudam a linha do tempo à mão,
+  com colocar, melhorar em qualquer caminho, vender, apertar uma tecla,
+  clicar numa imagem e esperar uma imagem.
+- **Lobby** guarda os botões clicados em ordem para entrar numa partida, e
+  um macro do lobby (um da aba Atalhos) que toca antes deles, como andar
+  até um elevador.
+- **Exportar…** e **Importar…** compartilham uma estratégia num arquivo
+  `.wayclick` só, com as imagens. Um arquivo de estratégia dado à
+  importação da aba Atalhos é oferecido a esta aba, e um arquivo de macros
+  dado aqui aponta para a aba Atalhos.
+- Uma estratégia guarda o tamanho da Doca em que foi feita, e a aba avisa
+  quando a Doca está em outro tamanho, já que os lugares são posições na
+  tela.
+
+**Telas.** Imagens do jogo, capturadas da Doca com **Capturar…** enquanto
+ela mostra.
+
+| Imagem | O que o farm faz com ela |
+|---|---|
+| Partida começou | Opcional. O relógio da estratégia começa quando ela aparece, e sem ela logo depois do lobby |
+| Torre colocada | Um pedaço do painel que abre quando uma torre é colocada. Com ela, uma torre que não foi colocada, como quando ainda falta dinheiro, é tentada de novo |
+| Pular onda | Opcional. Clicada sempre que aparece durante a partida |
+| Vitória, Derrota | Algo que só aparece quando a partida é ganha, ou perdida. Conta uma vitória ou uma derrota |
+| Reconectar | Opcional. Clicada sempre que aparece, e o farm recomeça do lobby |
+| Botão de vender | Opcional. Clicado para vender depois de clicar na torre. Sem ele, a tecla de vender das Configurações é apertada |
+| Depois da partida | Os botões clicados em ordem quando a partida acaba, como o de jogar de novo. Sem as imagens de Vitória e Derrota, o primeiro também é como o fim da partida é visto |
+
+Nas configurações do jogo desligue Camera Shake e Low Quality Rings, ligue
+Show Tower Options (o painel de onde vem a imagem de Torre colocada), deixe
+Cancel Placement no Q e a tecla de Switch Hotbar fora do Q, e mantenha o UI
+Scale como estava quando você capturou as imagens.
+
+**Configurações.**
+
+| Ajuste | O que faz |
+|---|---|
+| Janela do jogo | O nome do app da janela do jogo na Doca, `Sober` por padrão |
+| Link do jogo | Abre o jogo na Doca com **Entrar no jogo**, e de novo quando o jogo fecha. A página de um jogo do Roblox vira `roblox://placeId=ID` e o link de um servidor privado (`…?privateServerLinkCode=…`) vira `roblox://placeId=ID&linkCode=CÓDIGO`, as duas formas da [página do Roblox sobre deep links](https://create.roblox.com/docs/production/promotion/deeplinks); um link `roblox://` fica como veio |
+| Esperas, Partida mais longa, Parar após | Quanto esperar cada botão do lobby e a partida começar, quanto uma partida pode durar antes de o farm seguir em frente, e quantas partidas jogar (nunca para, por padrão) |
+| Velocidade das ações | Rápida, Equilibrada ou Lenta, as pausas entre apertar, clicar e olhar |
+| Tentar colocar por até, Tentar de novo a cada | Por quanto tempo uma torre que não foi colocada é tentada de novo, e de quanto em quanto tempo |
+| Pular ondas até | Minutos desde o começo da partida depois dos quais o Pular onda fica de lado (a partida toda, por padrão) |
+| Câmera | **Alinhar a câmera quando a partida começa** segura a tecla de afastar (O) por um tempo e depois arrasta para baixo com o botão direito, do meio da tela |
+| Teclas do jogo | Melhorar no caminho de cima (E) e no de baixo (Z), vender (nenhuma), cancelar a colocação (Q) |
+| Atalhos | Iniciar F4, Parar F5 e Pausar F6, em qualquer janela enquanto a Doca está aberta. Um macro com atalho ou o atalho do WayClick na mesma tecla vem primeiro |
+| Relatório | Um webhook do Discord que recebe uma linha depois de cada partida, com print da tela se quiser, preenchida com `{run}`, `{result}`, `{wins}`, `{losses}` e `{time}` |
+
+Links de compartilhar (`roblox.com/share?code=…`) são recusados. A
+[página do Roblox sobre links de compartilhar](https://create.roblox.com/docs/production/promotion/share-links)
+não dá a eles uma forma `roblox://`, então eles abririam no navegador, fora
+da Doca. Use a página do jogo ou um link com `privateServerLinkCode`, ou
+abra o servidor à mão na Doca antes de apertar Iniciar.
+
+**Como um farm anda.**
+
+1. A janela do jogo precisa estar aberta na Doca. Quando não está, o farm
+   abre o link do jogo na Doca e espera até 2 minutos por ela.
+2. Ele toca o macro do lobby, se houver, e clica os botões do lobby em
+   ordem. Quando o primeiro não aparece, já tem uma partida rolando.
+3. Ele espera a imagem de Partida começou, começa o relógio da estratégia e
+   alinha a câmera.
+4. Cada ação roda na hora dela. Colocar aperta a tecla da torre, clica no
+   lugar dela e espera a imagem de Torre colocada. Quando ela não aparece, o
+   Q cancela e a torre é tentada de novo, e o Pular onda continua sendo
+   clicado enquanto isso. Melhorar clica na torre e aperta E ou Z.
+5. Vitória, Derrota ou o primeiro botão de Depois da partida terminam a
+   partida. O farm conta, manda o relatório, clica os botões de Depois da
+   partida e recomeça, até o número de partidas que você escolheu.
+6. Quando a janela do jogo fecha ou o botão Reconectar aparece, a rodada
+   recomeça, e o jogo abre de novo pelo link. Cinco rodadas seguidas sem
+   partida param o farm, já que as imagens provavelmente não batem com o
+   jogo.
+
+Pausar solta tudo e para o relógio da partida junto, então a estratégia
+continua de onde estava.
+
+Isso foi medido contra um tower defense de mentira num KWin aninhado
+(`tests/t_tower_kwin.py`): duas partidas, com o jogo caindo na segunda e
+abrindo de novo pelo link `roblox://`, e a visão a 20 quadros por segundo,
+cada captura de uma Doca de 960×540 levando 2,9 ms, uns 7% de um núcleo
+para o WayClick e 4% para o KWin da Doca. Ainda não foi testado no Tower
+Defense Simulator de verdade, e nenhuma estratégia pronta vem com o
+WayClick. Confira as regras do jogo antes, já que muitos jogos online banem
+farm automático.
+
 ### Acionamento
 
 **Modo**
@@ -710,6 +831,19 @@ KWin nesse D-Bus. Um script pequeno no KWin do desktop acha a janela da Doca
 pelo processo dela para manter o tamanho, trazer para a frente e fechar.
 Medido no KWin aninhado do `tests/t_dock_kwin.py`, a Doca abre em uns 0,2 s.
 
+**A aba Tower Defense.** A visão é um widget que pede ao KWin da Doca a
+mesma captura do ScreenShot2 até 20 vezes por segundo, de uma thread
+própria, e desenha ela escalada na aba, mantendo o formato. Apertar, soltar,
+mover, a roda ou uma tecla em cima dela vira o pedido certo do
+`org_kde_kwin_fake_input` no socket da Doca, no ponto da Doca embaixo do
+ponteiro, e com o botão direito ou o do meio segurado o movimento vai
+relativo, já que um jogo pode travar o ponteiro enquanto gira a câmera. As
+teclas que o farm usa como atalho não são mandadas. O farm é um executor de
+macro da Doca só dele, com o relógio da partida, vigias do fim da partida, da
+janela fechada, do reconectar e do pular onda, e esperas em fatias de um
+quarto de segundo, para Pausar e Parar valerem na hora. Nada nele lê a
+memória do jogo nem a do Sober.
+
 ## Problemas comuns
 
 **"Atalho global DESLIGADO"** — você não está no grupo `input`, ou a sessão
@@ -780,9 +914,11 @@ sg input -c "python3 tests/t_abs_pointer_libinput.py"  # o ponteiro absoluto com
 sg input -c "python3 tests/t_farm_macros.py"        # vigias, janelas, contadores, o gravador, um farm inteiro num jogo falso
 sg input -c "python3 tests/t_farm_ui.py"            # editores, gravador, assistente de farm, arquivos .wayclick
 python3 tests/t_dock_ui.py                          # a aba Doca, macros da Doca, editores e links numa Doca falsa
+python3 tests/t_tower_ui.py                         # a aba Tower Defense: estratégias, gravador, arquivos e um farm inteiro num jogo falso
 python3 tests/t_farm_kwin.py                        # passos de janela e o cursor contra um KWin de verdade, aninhado
 python3 tests/t_dock_kwin.py                        # a Doca num KWin de verdade, aninhado: teclas, cliques, roda, tela, janelas, tamanho, links, fechar
 python3 tests/t_dock_hidden.py                      # um jogo continua desenhando na Doca atrás de outras janelas e minimizada
+python3 tests/t_tower_kwin.py                       # o farm e a visão da aba Tower Defense num jogo falso na Doca de verdade
 python3 tests/t_sober_dock.py                       # o Sober abrindo na Doca, com o botão Close achado e clicado
 python3 tests/t_screen_portal.py                    # o portal de verdade, dentro do bubblewrap
 python3 tests/bench_find_image.py                   # busca de imagem, acha ou não e com que rapidez
@@ -814,7 +950,7 @@ baixado uma vez, `pasta`, `bwrap`, `kwin_wayland`, `wl-clipboard` e
 `kscreen-doctor`, e pula quando falta algum (`WCTEST_PASTA=/caminho/do/pasta`
 usa um que não esteja instalado).
 
-O `t_dock_kwin.py`, o `t_dock_hidden.py` e o `t_sober_dock.py` abrem a Doca
+O `t_dock_kwin.py`, o `t_dock_hidden.py`, o `t_tower_kwin.py` e o `t_sober_dock.py` abrem a Doca
 dentro da mesma caixa, então a janela dela cai no KWin aninhado e nada chega
 ao seu desktop. O `t_sober_dock.py` deixa a Doca abrir o Sober com o comando
 dela. A caixa não tem rede, então esse Sober nunca encontra o seu pela porta
