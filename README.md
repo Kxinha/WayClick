@@ -45,6 +45,9 @@ running as root.
   timeline you record by playing, the lobby, pictures of the end of a match,
   Start F4, Stop F5 and Pause F6, a log and the counts. It only looks at the
   screen and presses keys, never reading the memory of the game
+- **Sober accounts** open more copies of Sober next to your usual one, each
+  with its own Roblox sign-in, settings and network, so a second account
+  plays at the same time as the first, on the desktop or in the Dock
 - **Send key to a window** — pick an open window and feed it a key; for X11
   targets it arrives with no focus change, even minimized
 - **Anti-AFK** — nudges the pointer and puts it back, with zero drift
@@ -65,6 +68,7 @@ running as root.
 | Qt bindings | PySide6 (`QtMultimedia` optional — only for the beeps) |
 | Permissions | your user in the `input` group, and `/dev/uinput` writable by it |
 | Screen steps (optional) | numpy, PyGObject and GStreamer with its PipeWire plugin, plus the desktop portal (`xdg-desktop-portal-kde` on Plasma) |
+| Sober accounts (optional) | Sober from Flathub, `pasta` from the `passt` package, util-linux 2.38 or newer, and user namespaces turned on for users |
 
 ## Install
 
@@ -166,13 +170,25 @@ wayclick --import script.ahk --dry-run   # what an AutoHotkey script becomes
 wayclick --version
 ```
 
-Six tabs. **Hotkeys** holds the AutoHotkey style macros, which run on their
+The pages sit in a sidebar on the left, in two groups, as in System
+Settings. **Automation** has **Click**, **Keyboard**, **Hotkeys**, **Window**
+and **Trigger**, and **Games** has **Dock**, **Tower Defense** and **Sober
+accounts**. **Hotkeys** holds the AutoHotkey style macros, which run on their
 own hotkeys and do not need Start. **Click**, **Keyboard** and **Window** are
-the three things Start can run. Each has an *enable* box, and the tab shows a
-dot when it is on, so you can see what is armed without opening it. Enable any combination. **Trigger** is
-how it all starts and stops, plus Anti-AFK, which runs on its own outside
-Start/Stop. **Dock** opens the game in [the Dock](#the-dock). Status and the Start button stay visible below the tabs, and the
-window is small enough for a 1366×768 screen.
+the three things Start can run. Each has an *enable* box, and its name in the
+sidebar shows a dot when it is on, so you can see what is armed without
+opening it. Enable any combination. **Trigger** is how it all starts and
+stops, plus Anti-AFK, which runs on its own outside Start/Stop. **Dock** opens
+the game in [the Dock](#the-dock), and **Sober accounts** opens
+[a second Sober](#sober-accounts).
+
+The search box above the pages (Ctrl+F) finds a page by its name or by any
+text in it, and Ctrl+Tab or Ctrl+PgDown goes to the next page (Ctrl+Shift+Tab
+or Ctrl+PgUp back). In a window too narrow for the names the sidebar shows
+only the icons, with each name in its tooltip and the dot on the icon, and
+the search becomes a button. Status and the Start button stay visible below
+the pages, and the window opens at 660×548 (709 wide in Portuguese), small
+enough for a 1366×768 screen.
 
 The menu bar has the rest: **File** starts, stops, hides to tray and quits;
 **Settings** holds **Theme** and **Language** (English, Português BR) plus the
@@ -466,8 +482,13 @@ on screen…** then work on the Dock too. Closing the Dock window, or **Close
 the Dock**, closes the game and stops its macros, and a Dock macro started
 while the Dock is closed says so and does not run.
 
-Sober opens one copy at a time, so close the Sober you have open before you
-start it in the Dock; the Dock tab tells you when it finds one. The Dock
+**Account** picks which Sober the Dock opens, your usual one or one of the
+[Sober accounts](#sober-accounts), and other games ignore it. Your usual
+Sober opens one copy at a time, so close it before you start it in the Dock,
+or pick an account. The Dock page tells you when the Sober it would open is
+already open somewhere. Sober takes a `roblox://` link only when it opens, so
+a link of a Dock macro is not opened while an account is open in the Dock,
+and the Dock says so. The Dock
 needs a Plasma Wayland session (`kwin_wayland`) and `dbus-daemon`, which come
 with Plasma.
 
@@ -585,6 +606,60 @@ WayClick and 4% for the KWin of the Dock. It has not been tried against
 Tower Defense Simulator itself yet, and no ready strategies come with
 WayClick. Check the rules of the game first, since many online games ban
 automated farming.
+
+### Sober accounts
+
+Sober opens one copy at a time. A second one finds the first through a fixed
+port on 127.0.0.1 and does not open, so on Linux two Roblox accounts could
+not play at once the way they can on Windows. The **Sober accounts** page
+gives each account a Sober of its own, with its own Roblox sign-in, settings
+and network, so it opens next to your usual Sober and both play at the same
+time.
+
+Press **Add account…**, name it, and press **Open** (or double click it). The
+first time, Sober sets itself up in the new account and downloads Roblox
+again, and you sign in to Roblox there. After that it opens straight into
+Roblox. **Close** closes that account only, **Rename…** renames it, and
+**Remove…** deletes its Sober data on this computer (the Roblox sign-in, the
+settings and the downloads), while the Roblox account itself stays as it is.
+There can be up to four accounts. An account that was open before WayClick
+started shows as open, and quitting WayClick leaves the open accounts
+running. On the Dock page, **Account** opens one of them in the Dock.
+
+How it works. Each account runs Sober in a network of its own, made by
+`pasta`, where the 127.0.0.1 port of your usual Sober does not exist, and no
+port is forwarded in or out. In there the account folder
+(`~/.local/share/wayclick/sober-accounts/<id>/app`) is mounted over
+`~/.var/app/org.vinegarhq.Sober` for that copy only, and `unshare` gives
+Sober back your own user before `flatpak run` starts it as usual. Your usual
+Sober, its folder and its scope are never touched. A lock in the account
+folder tells whether it is open, and the network written down at start is how
+WayClick finds that copy in `flatpak ps` to close it, never the one in the
+network of your computer.
+
+This was measured with the real Sober in a nested KWin
+(`tests/t_sober_accounts_kwin.py`). Two accounts reached Roblox a few seconds
+apart and stayed open side by side, each in a network of its own, with Sober
+writing only into the account folder. Closing one left the other open, an
+empty account opened at the first screen of Sober, and the Sober of the
+computer running the test was not touched.
+
+Limits
+
+- every copy is the same app with the same window title, so a *Window* step
+  that looks for Sober matches any of them;
+- each open account uses as much memory as one more Roblox;
+- Sober takes a `roblox://` link only when it opens, so a link for an account
+  that is already open is not opened (measured, a second Sober in the same
+  account stops at "An instance of Sober is already running");
+- it needs `pasta` and util-linux 2.38 or newer, and a later Sober may add
+  checks that this does not get past.
+
+Roblox staff have called running more than one client an exploit while
+saying it is not banned today, though that may change
+([DevForum, July 2025](https://devforum.roblox.com/t/is-fishstrap-bloxstrap-no-longer-allowed-on-the-platform/3829253/13)),
+and Sober does not support it ([Sober FAQ](https://vinegarhq.org/Sober/FAQ/index.html)).
+Use it at your own risk.
 
 ### Trigger
 
@@ -909,6 +984,9 @@ python3 tests/t_sober_dock.py                       # Sober opening in the Dock,
 python3 tests/t_screen_portal.py                    # the real portal, inside bubblewrap
 python3 tests/bench_find_image.py                   # image search, found or not and how fast
 python3 tests/t_sober_kwin.py                       # all of it against Roblox (Sober), in a nested KWin
+python3 tests/t_sidenav.py                          # the sidebar: groups, dots, search, keys, icons only when narrow
+python3 tests/t_sober_accounts.py                   # Sober accounts on a fake Sober: lock, pasta, closing only its copy, the page, the Dock
+python3 tests/t_sober_accounts_kwin.py              # two accounts with the real Sober at once, in a nested KWin
 ```
 
 `t_screen_portal.py` runs the real `xdg-desktop-portal` inside `bwrap` with
@@ -945,6 +1023,17 @@ version string are copied, as above), and it stops at its own "Failed to
 fetch remote manifest" screen. A Dock macro then finds the Close button of
 that screen by its picture and clicks it, and Sober closes. Roblox itself
 needs the network, so that part stays with `t_sober_kwin.py`.
+
+`t_sober_accounts.py` runs the real `flock`, `pasta` and `unshare` around a
+fake Sober that holds the 127.0.0.1 port in each network, with fake
+`flatpak`, `systemctl` and `systemd-run` first in its PATH. It refuses to
+start in the network of your computer, so it never meets your Sober.
+`t_sober_accounts_kwin.py` opens three accounts with the real Sober in the
+nested KWin, each through `pasta` with internet and no sign-in (the Roblox
+APKs and the version string are copied from yours, as above), at the lowest
+CPU priority, and checks before closing anything that it belongs to the
+test. Without `pasta` the first skips the parts that open a
+Sober, and the second skips.
 `t_dock_hidden.py` needs `es2gears_wayland` (mesa-demos) and skips without
 it.
 
@@ -991,7 +1080,8 @@ when the process exits. Pictures for image steps are kept in
 `~/.config/wayclick/screen-token`. The screen is only shared while a macro
 needs it, and frames never leave the machine unless a step posts a screenshot
 to the webhook you gave it. Pictures from imported `.wayclick` files go to the
-same pictures folder.
+same pictures folder. Sober accounts live in
+`~/.local/share/wayclick/sober-accounts`, one folder each.
 
 Use it where automation is allowed. Plenty of online games ban input automation.
 
@@ -1011,8 +1101,8 @@ them to the release — see [`.github/workflows/release.yml`](.github/workflows/
 ## Uninstall
 
 ```bash
-bash uninstall.sh            # keeps your settings and the udev rule
-bash uninstall.sh --purge    # removes those too
+bash uninstall.sh            # keeps your settings, the udev rule and your Sober accounts
+bash uninstall.sh --purge    # removes those too, except a Sober account that is open
 ```
 
 For a packaged install use your package manager instead (`dnf remove wayclick`,

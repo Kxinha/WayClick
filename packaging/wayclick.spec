@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.10.0
+Version:        1.11.0
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -24,6 +24,7 @@ Recommends:     python3-numpy
 Recommends:     python3-gobject
 Recommends:     pipewire-gstreamer
 Recommends:     gstreamer1-plugins-base
+Suggests:       passt
 
 %description
 An autoclicker that works on Wayland. It creates a virtual mouse in the kernel
@@ -76,6 +77,17 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Tue Nov 24 2026 gabrielmf1998 <noreply@github.com> - 1.11.0-1
+- Sober accounts: more copies of Sober next to the usual one, each with
+  its own Roblox sign-in, settings and a network of its own through pasta,
+  so two accounts play at the same time, on the desktop or in the Dock
+- The Dock picks which Sober it opens, the usual one or an account, and
+  says so when a link cannot reach an account that is already open
+- A sidebar in groups replaces the tabs, with search (Ctrl+F), Ctrl+Tab
+  and Ctrl+PgDown, and only icons when the window is narrow
+- uninstall.sh keeps the Sober accounts unless --purge, and never removes
+  one that is open
+
 * Sat Nov 21 2026 gabrielmf1998 <noreply@github.com> - 1.10.0-1
 - The Tower Defense tab shows the game of the Dock inside WayClick about
   20 times a second, and mouse, wheel and keys over it go to the game

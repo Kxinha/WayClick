@@ -34,6 +34,7 @@ Depends: python3 (>= 3.9), python3-pyside6.qtwidgets
 Recommends: python3-pyside6.qtmultimedia, python3-numpy, python3-gi,
  gir1.2-gstreamer-1.0, gir1.2-gst-plugins-base-1.0, gstreamer1.0-pipewire,
  gstreamer1.0-plugins-base
+Suggests: passt
 Maintainer: gabrielmf1998 <noreply@github.com>
 Installed-Size: $SIZE
 Homepage: https://github.com/gabrielmf1998/WayClick

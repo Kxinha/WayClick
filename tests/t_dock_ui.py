@@ -598,8 +598,9 @@ w = a.App()
 w.sound.setChecked(False)
 names = [w.tabs.tabText(i) for i in range(w.tabs.count())]
 DOCK_TAB = names.index("Dock") if "Dock" in names else -1
-check("the window has a Dock tab, before Tower Defense",
-      DOCK_TAB >= 0 and names[DOCK_TAB + 1:] == ["Tower Defense"],
+check("the window has a Dock page, before Tower Defense and the Sober "
+      "accounts", DOCK_TAB >= 0
+      and names[DOCK_TAB + 1:] == ["Tower Defense", "Sober accounts"],
       str(names))
 check("the engine plays Dock macros in it", w.engine.dock is dock)
 check("size and game come from the settings",

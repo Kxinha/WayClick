@@ -3,28 +3,31 @@
 import base64, binascii, ctypes, fcntl, glob, grp, json, math, os, pwd
 import random, re, select
 import shlex, shutil, socket, struct
-import signal, subprocess, sys, tempfile, threading, time, urllib.request
-import wave
+import signal, subprocess, sys, tempfile, threading, time, unicodedata
+import urllib.request, wave
 
 try:
-    from PySide6.QtCore import (Qt, QEvent, QObject, QPointF, QRectF, QTimer,
-                                QUrl, Signal, Slot)
+    from PySide6.QtCore import (Qt, QEvent, QObject, QPointF, QRectF, QSize,
+                                QTimer, QUrl, Signal, Slot)
     from PySide6.QtGui import (QAction, QBrush, QColor, QDesktopServices, QIcon,
                                QImage, QLinearGradient,
-                               QKeySequence, QPainter, QPainterPath, QPen,
-                               QPixmap,
+                               QKeySequence, QPainter, QPainterPath, QPalette,
+                               QPen, QPixmap,
                                QShortcut)
-    from PySide6.QtWidgets import (QAbstractItemView, QApplication,
+    from PySide6.QtWidgets import (QAbstractButton, QAbstractItemView,
+                                   QApplication,
                                    QCheckBox, QComboBox, QDialog,
                                    QDialogButtonBox, QFileDialog,
                                    QFormLayout, QDoubleSpinBox, QGridLayout,
                                    QGroupBox,
-                                   QHBoxLayout, QLabel, QLineEdit,
+                                   QHBoxLayout, QInputDialog, QLabel,
+                                   QLineEdit,
                                    QListWidget, QListWidgetItem, QMenu,
                                    QMenuBar, QMessageBox, QPlainTextEdit,
                                    QPushButton, QScrollArea, QSizePolicy,
                                    QSpinBox,
-                                   QSystemTrayIcon, QVBoxLayout, QWidget,
+                                   QStackedWidget, QSystemTrayIcon,
+                                   QToolButton, QVBoxLayout, QWidget,
                                    QFrame, QListView, QTabWidget)
 except ImportError:
     sys.exit("PySide6 is required.\n"
@@ -34,7 +37,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -6011,8 +6014,10 @@ callDBus("%(svc)s", "%(path)s", "%(iface)s", "answer",
 """
 
 
+SOBER_APP = "org.vinegarhq.Sober"
 SOBER_TWICE = ("Sober is already open outside the Dock, and it opens one "
-               "copy at a time. Close it, then press Start the game.")
+               "copy at a time. Close it, or pick one of your Sober accounts "
+               "in Account, then press Start the game.")
 
 
 class DockError(Exception):
@@ -6554,6 +6559,8 @@ class Dock(QObject):
         self._poll.setInterval(1000)
         self._poll.timeout.connect(self._check)
         self._game_alive = False
+        self.account = None              # SoberAccount: o Sober daqui é dela
+        self._accounts = {}              # id da conta -> Popen que abriu aqui
 
     # ---------------------------------------------------------- lugares --
     @staticmethod
@@ -6776,25 +6783,42 @@ class Dock(QObject):
         e["XDG_SESSION_TYPE"] = "wayland"
         return e
 
-    def _run(self, argv):
-        out = self._log if self._log is not None else subprocess.DEVNULL
-        p = subprocess.Popen(argv, env=self.game_env(),
-                             stdin=subprocess.DEVNULL, stdout=out,
-                             stderr=subprocess.STDOUT, start_new_session=True)
+    def _run(self, argv, account=None):
+        if account is not None:
+            # a conta abre direto (sem escopo próprio): o Sober dela, como
+            # qualquer jogo da Doca, fecha junto com a Doca
+            p = account.launch(argv, env=self.game_env(), prefix=[])
+            self._accounts[account.id] = p
+        else:
+            out = self._log if self._log is not None else subprocess.DEVNULL
+            p = subprocess.Popen(argv, env=self.game_env(),
+                                 stdin=subprocess.DEVNULL, stdout=out,
+                                 stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+            threading.Thread(target=p.wait, daemon=True,
+                             name="wayclick-dock-game").start()
         self.games.append(p)
-        threading.Thread(target=p.wait, daemon=True,
-                         name="wayclick-dock-game").start()
         return p
 
-    SOBER = "org.vinegarhq.Sober"
+    SOBER = SOBER_APP
+
+    def is_sober(self, argv):
+        return any(self.SOBER in a for a in argv)
+
+    def account_here(self, account):
+        """A conta está aberta e foi a Doca que abriu."""
+        p = self._accounts.get(account.id)
+        return p is not None and p.poll() is None and account.running()
 
     def sober_outside(self, argv):
-        """O comando abre o Sober e já há um Sober aberto fora da Doca. Ele
-        roda uma cópia só (segura uma porta fixa do 127.0.0.1), então o da
-        Doca não chegaria a abrir. O que a Doca abriu não conta."""
-        if not any(self.SOBER in a for a in argv):
+        """O comando abre o Sober e já há um Sober aberto fora da Doca, na
+        mesma rede. Ele roda uma cópia só por rede (segura uma porta fixa do
+        127.0.0.1), então o da Doca não chegaria a abrir. O que a Doca abriu
+        não conta, nem o de uma conta do Sober, que tem a rede dela."""
+        if not self.is_sober(argv):
             return False
         mine = {p.pid for p in self.games if p.poll() is None}
+        here = netns_of()
         for line in self._flatpak_ps().splitlines():
             parts = line.split()
             if len(parts) < 2 or parts[1] != self.SOBER:
@@ -6804,8 +6828,12 @@ class Dock(QObject):
             except ValueError:
                 continue
             # o flatpak run vira o bwrap (mesmo pid) ou é o pai dele
-            if pid not in mine and _ppid(pid) not in mine:
-                return True
+            if pid in mine or _ppid(pid) in mine:
+                continue
+            there = netns_of(pid)
+            if here and there and there != here:
+                continue
+            return True
         return False
 
     @staticmethod
@@ -6825,13 +6853,22 @@ class Dock(QObject):
             argv = []
         if not argv or not self.alive():
             return False
-        if self.sober_outside(argv):
+        acc = self.account if self.is_sober(argv) else None
+        if acc is not None and acc.running():
+            self.note = _(SOBER_ACCOUNT_HERE if self.account_here(acc)
+                          else SOBER_TWICE_ACCOUNT, name=acc.name)
+            self.changed.emit()
+            return False
+        if acc is None and self.sober_outside(argv):
             self.note = _(SOBER_TWICE)
             self.changed.emit()
             return False
         self.note = ""
         try:
-            self._run(argv)
+            if acc is not None:
+                self._run(argv, account=acc)
+            else:
+                self._run(argv)
         except OSError as e:
             self.note = _("The game did not open: {err}", err=e)
             self.changed.emit()
@@ -6867,12 +6904,25 @@ class Dock(QObject):
             if report:
                 report(_("nothing on this computer opens {url}.", url=url))
             return
-        if self.sober_outside(argv):
+        acc = self.account if self.is_sober(argv) else None
+        if acc is not None and acc.running():
+            # o Sober só recebe um link ao abrir: um segundo na mesma conta
+            # para em "An instance of Sober is already running" (medido em
+            # tests/t_sober_accounts_kwin.py), então nada abre aqui
+            if report:
+                report(_(SOBER_ACCOUNT_LINK, name=acc.name, url=url)
+                       if self.account_here(acc)
+                       else _(SOBER_TWICE_ACCOUNT, name=acc.name))
+            return
+        if acc is None and self.sober_outside(argv):
             if report:
                 report(_(SOBER_TWICE))
             return
         try:
-            self._run(argv)
+            if acc is not None:
+                self._run(argv, account=acc)
+            else:
+                self._run(argv)
         except OSError as e:
             if report:
                 report(_("{url} did not open: {err}", url=url, err=e))
@@ -7004,6 +7054,413 @@ class Dock(QObject):
                     os.remove(os.path.join(self.folder(), name))
                 except OSError:
                     pass
+
+
+# ------------------------------------------------- as contas do Sober ----
+# O Sober roda uma cópia por vez: ele segura a porta 54587 do 127.0.0.1, e o
+# segundo, na mesma rede, para em "There's a frozen instance of this app
+# running in the background". Cada conta daqui é um Sober com a rede própria
+# (o pasta, do passt, monta uma rede só dele, com saída para a internet e sem
+# enxergar o 127.0.0.1 do computador) e a pasta própria (a da conta, montada
+# por cima de ~/.var/app/org.vinegarhq.Sober só para ele, então o login, as
+# configurações e os downloads são dela). O Sober de sempre e os arquivos
+# dele ficam como estão; o binário do Sober não muda.
+SOBER_ACCOUNTS_MAX = 4
+SOBER_DNS = "169.254.1.1"     # o pasta atende o DNS aqui, dentro da rede
+SOBER_BUSY = 75               # o flock sai com isto: a conta já está aberta
+# Já como root do namespace do pasta, na rede e no namespace de montagem
+# novos: o DNS do pasta no lugar do resolv.conf (o do computador costuma ser
+# o 127.0.0.53 do systemd-resolved, que dali não se alcança), a pasta da
+# conta por cima da do Sober e, antes do flatpak, de volta ao usuário de
+# verdade. O arquivo "run" guarda o pid que vira o flatpak e a rede dele.
+# Sem "$$" nem "${": o systemd-run do escopo troca "$$" por "$" e expande
+# "${X}" nos argumentos (o pid sai do /proc/self/stat do próprio sh).
+SOBER_INNER = r'''set -e
+data=$1; target=$2; resolv=$3; run=$4; uid=$5; gid=$6; shift 6
+real=$(readlink -f /etc/resolv.conf) || real=/etc/resolv.conf
+if [ -e "$real" ]; then mount --bind "$resolv" "$real"; fi
+mkdir -p "$target"
+mount --bind "$data" "$target"
+read -r pid rest < /proc/self/stat
+printf '%s\n%s\n' "$pid" "$(readlink /proc/self/ns/net)" > "$run.tmp"
+mv -f "$run.tmp" "$run"
+exec unshare --user --map-user="$uid" --map-group="$gid" -- "$@"
+'''
+SOBER_TWICE_ACCOUNT = ("{name} is already open outside the Dock. Close it, "
+                       "then press Start the game.")
+SOBER_ACCOUNT_HERE = "{name} is already open in the Dock."
+SOBER_ACCOUNT_LINK = ("Sober is already open in {name}, and it takes a link "
+                      "only when it opens, so {url} was not opened. Close it "
+                      "first.")
+_HELP_TEXT = {}
+
+
+def _help_of(tool):
+    """O --help de uma ferramenta (guardado): diz que opções ela tem."""
+    if tool not in _HELP_TEXT:
+        try:
+            r = subprocess.run([tool, "--help"], capture_output=True,
+                               text=True, timeout=5)
+            _HELP_TEXT[tool] = (r.stdout or "") + (r.stderr or "")
+        except (OSError, subprocess.SubprocessError):
+            _HELP_TEXT[tool] = ""
+    return _HELP_TEXT[tool]
+
+
+def sober_pasta():
+    """O pasta da conta: rede configurada e nenhuma porta aberta, nem de
+    fora para dentro nem de dentro para fora. Com -T auto (o padrão) ele
+    traria para dentro as portas do 127.0.0.1 do computador, a 54587 do
+    Sober de sempre inclusive, e o da conta não abriria. Sem namespace de
+    pid (o pid do flatpak tem que ser o de fora) e sem o 127.0.0.1 do
+    computador atrás do gateway, nas versões do pasta que têm as opções."""
+    h = _help_of("pasta")
+    argv = ["pasta", "--config-net", "--quiet", "-t", "none", "-u", "none",
+            "-T", "none", "-U", "none", "--dns-forward", SOBER_DNS]
+    if "--no-pidns" in h:
+        argv.append("--no-pidns")
+    if "--map-host-loopback" in h:
+        argv += ["--map-host-loopback", "none"]
+    elif "--no-map-gw" in h:
+        argv.append("--no-map-gw")
+    return argv + ["--"]
+
+
+def sober_accounts_dir():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+        "~/.local/share")
+    return os.path.join(base, "wayclick", "sober-accounts")
+
+
+def sober_data_dir(home=None):
+    """A pasta do Sober de sempre, a que a conta cobre (só para ela)."""
+    return os.path.join(home or os.path.expanduser("~"), ".var", "app",
+                        SOBER_APP)
+
+
+def netns_of(pid="self"):
+    """A rede de um processo ("net:[4026531840]"), ou None."""
+    try:
+        return os.readlink(f"/proc/{pid}/ns/net")
+    except (OSError, ValueError):
+        return None
+
+
+def cgroup_unit(pid):
+    """A unidade do systemd em que o processo está (o último .scope ou
+    .service do cgroup dele), ou ""."""
+    try:
+        with open(f"/proc/{int(pid)}/cgroup") as fh:
+            text = fh.read()
+    except (OSError, ValueError):
+        return ""
+    for line in text.splitlines():
+        path = line.split(":", 2)[-1]
+        for part in reversed(path.split("/")):
+            if part.endswith((".scope", ".service")):
+                return part
+    return ""
+
+
+def flatpak_instances(app=SOBER_APP, env=None):
+    """[(instância, pid)] das cópias abertas do app, pelo flatpak ps."""
+    try:
+        out = subprocess.run(
+            ["flatpak", "ps", "--columns=instance,pid,application"],
+            capture_output=True, text=True, timeout=5, env=env).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2] == app:
+            try:
+                found.append((parts[0], int(parts[1])))
+            except ValueError:
+                pass
+    return found
+
+
+def userns_allowed():
+    """O kernel deixa um usuário comum criar namespaces de usuário (o pasta
+    e o unshare precisam)."""
+    for path in ("/proc/sys/kernel/unprivileged_userns_clone",
+                 "/proc/sys/user/max_user_namespaces"):
+        try:
+            with open(path) as fh:
+                if fh.read().strip() == "0":
+                    return False
+        except OSError:
+            pass
+    return True
+
+
+def sober_tools_missing():
+    """O que falta neste computador para as contas do Sober, ou ""."""
+    if not shutil.which("flatpak"):
+        return _("Sober accounts need Flatpak, with Sober from Flathub.")
+    if not shutil.which("pasta"):
+        return _("Sober accounts need pasta, from the passt package. "
+                 "Arch: sudo pacman -S passt. Fedora: sudo dnf install "
+                 "passt. Debian and Ubuntu: sudo apt install passt.")
+    for tool in ("unshare", "flock", "mount"):
+        if not shutil.which(tool):
+            return _("Sober accounts need {tool}, from util-linux.",
+                     tool=tool)
+    if "--map-user" not in _help_of("unshare"):
+        return _("Sober accounts need util-linux 2.38 or newer (unshare "
+                 "--map-user).")
+    if not userns_allowed():
+        return _("Sober accounts need user namespaces, and this system "
+                 "turns them off for users.")
+    return ""
+
+
+def sober_installed():
+    try:
+        return subprocess.run(["flatpak", "info", SOBER_APP],
+                              capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def normalize_sober_accounts(raw):
+    """A lista de contas da configuração: id de 8 hex, nome curto, sem
+    repetir, no máximo SOBER_ACCOUNTS_MAX."""
+    out, seen = [], set()
+    for a in raw if isinstance(raw, list) else []:
+        if not isinstance(a, dict):
+            continue
+        acc_id = str(a.get("id") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{8}", acc_id) or acc_id in seen:
+            continue
+        name = " ".join(str(a.get("name") or "").split())[:40]
+        seen.add(acc_id)
+        out.append({"id": acc_id, "name": name or acc_id})
+        if len(out) >= SOBER_ACCOUNTS_MAX:
+            break
+    return out
+
+
+class SoberAccount:
+    """Uma conta do Sober: a pasta dela, a trava, e o que abre e fecha o
+    Sober dela.
+
+    Aberto, o processo é flock (segura a trava enquanto vive) → pasta (a
+    rede) → sh com SOBER_INNER (as montagens) → unshare → flatpak run, e o
+    flatpak põe o Sober no escopo dele, como sempre. A trava diz se a conta
+    está aberta, mesmo depois de o WayClick fechar e abrir de novo; a rede
+    gravada no "run" acha a cópia dela no flatpak ps, e nunca a do Sober de
+    sempre, que está na rede do computador.
+    """
+
+    def __init__(self, acc_id, name):
+        self.id, self.name = acc_id, name
+        self.proc = None                 # o Popen do último launch()
+        self.started = 0.0
+
+    def __repr__(self):
+        return f"SoberAccount({self.id!r}, {self.name!r})"
+
+    # ---------------------------------------------------------- lugares --
+    def folder(self):
+        return os.path.join(sober_accounts_dir(), self.id)
+
+    def data(self):
+        """O que o Sober da conta vê como ~/.var/app/org.vinegarhq.Sober."""
+        return os.path.join(self.folder(), "app")
+
+    def lock_path(self):
+        return os.path.join(self.folder(), "lock")
+
+    def run_path(self):
+        return os.path.join(self.folder(), "run")
+
+    def log_path(self):
+        return os.path.join(self.folder(), "launch.log")
+
+    def resolv_path(self):
+        return os.path.join(self.folder(), "resolv.conf")
+
+    def prepare(self):
+        os.makedirs(self.data(), mode=0o700, exist_ok=True)
+        os.chmod(self.folder(), 0o700)
+        with open(self.resolv_path(), "w") as fh:
+            fh.write(f"nameserver {SOBER_DNS}\n")
+        with open(self.lock_path(), "a"):
+            pass
+
+    # ----------------------------------------------------------- estado --
+    def running(self):
+        """O Sober da conta está aberto: alguém segura a trava (o flock que
+        abriu, que vive enquanto ele vive)."""
+        try:
+            fd = os.open(self.lock_path(), os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
+
+    def run_info(self):
+        """(pid, rede) que o script de dentro gravou, ou (None, None). A
+        rede do computador nunca vale: com ela, a cópia achada seria o Sober
+        de sempre."""
+        try:
+            with open(self.run_path()) as fh:
+                pid, net = fh.read().split()[:2]
+            pid = int(pid)
+        except (OSError, ValueError):
+            return None, None
+        if not net.startswith("net:[") or net == netns_of():
+            return None, None
+        return pid, net
+
+    def instance(self, env=None):
+        """(instância, pid) da cópia do Sober desta conta, ou None."""
+        if not self.running():
+            return None
+        _pid, net = self.run_info()
+        if not net:
+            return None
+        for inst, pid in flatpak_instances(env=env):
+            if netns_of(pid) == net:
+                return inst, pid
+        return None
+
+    def _member(self):
+        """Um processo vivo da conta, na rede dela (para fechar quando o
+        flatpak ainda não listou a cópia), ou None."""
+        pid, net = self.run_info()
+        if pid is not None and net and netns_of(pid) == net:
+            return pid
+        found = self.instance()
+        return found[1] if found else None
+
+    # ------------------------------------------------------------ abrir --
+    def command(self, argv, home=None):
+        """O argv que roda `argv` (o flatpak run do Sober) nesta conta."""
+        return (["flock", "--nonblock", "--close", "--conflict-exit-code",
+                 str(SOBER_BUSY), self.lock_path()] + sober_pasta()
+                + ["sh", "-c", SOBER_INNER, "wayclick-sober", self.data(),
+                   sober_data_dir(home), self.resolv_path(), self.run_path(),
+                   str(os.getuid()), str(os.getgid())] + list(argv))
+
+    def scope_prefix(self):
+        """Um escopo do systemd só para ela, quando há systemd do usuário:
+        fechar o WayClick, ou o serviço que abriu ele, não leva junto a rede
+        da conta, que segue aberta."""
+        rt = os.environ.get("XDG_RUNTIME_DIR") or ""
+        if shutil.which("systemd-run") and rt and \
+                os.path.exists(os.path.join(rt, "systemd", "private")):
+            argv = ["systemd-run", "--user", "--scope", "--quiet",
+                    "--collect", f"--unit=wayclick-sober-{self.id}-"
+                    f"{int(time.time() * 1000) % 10 ** 10}"]
+            # os argumentos vão como estão (o systemd 254 em diante tem a
+            # opção; os de antes expandem "$$" e "${X}", e o script não usa)
+            if "--expand-environment" in _help_of("systemd-run"):
+                argv.append("--expand-environment=no")
+            return argv
+        return []
+
+    def launch(self, argv, env=None, prefix=None, home=None):
+        """Abre o Sober da conta (argv é o flatpak run dele) e volta o
+        Popen. prefix None é o escopo próprio; [] roda direto (a Doca)."""
+        if self.running():
+            # e o "run" da aberta fica: é por ele que ela é achada e fechada
+            raise OSError(_("{name} is already open.", name=self.name))
+        self.prepare()
+        try:
+            os.remove(self.run_path())
+        except OSError:
+            pass
+        cmd = (self.scope_prefix() if prefix is None else list(prefix)) \
+            + self.command(argv, home)
+        with open(self.log_path(), "wb") as out:
+            p = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL,
+                                 stdout=out, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+        self.proc, self.started = p, time.monotonic()
+        threading.Thread(target=p.wait, daemon=True,
+                         name="wayclick-sober-account").start()
+        return p
+
+    def log_tail(self, n=400):
+        try:
+            with open(self.log_path(), "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - n))
+                return fh.read().decode("utf-8", "replace").strip()
+        except OSError:
+            return ""
+
+    # ----------------------------------------------------------- fechar --
+    def close(self, env=None):
+        """Fecha o Sober da conta, e só ele: o escopo da cópia dele (achada
+        pela rede da conta), ou um TERM no processo da conta. True se mandou
+        fechar."""
+        if not self.running():
+            return False
+        found = self.instance(env)
+        pid = found[1] if found else self._member()
+        if pid is None:
+            return False
+        unit = cgroup_unit(pid)
+        if (unit.startswith(f"app-flatpak-{SOBER_APP}-")
+                or unit.startswith(f"wayclick-sober-{self.id}-")) \
+                and shutil.which("systemctl"):
+            try:
+                r = subprocess.run(["systemctl", "--user", "stop",
+                                    "--no-block", unit],
+                                   capture_output=True, timeout=10)
+                if r.returncode == 0:
+                    return True
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except OSError:
+            return False
+
+    # ------------------------------------------------------------ pasta --
+    def disk_bytes(self):
+        total = 0
+        for root, _dirs, files in os.walk(self.folder()):
+            for f in files:
+                try:
+                    total += os.lstat(os.path.join(root, f)).st_size
+                except OSError:
+                    pass
+        return total
+
+    def remove_data(self):
+        """Apaga a pasta da conta (login, configurações, downloads). Nunca
+        com ela aberta, e nunca fora da pasta das contas."""
+        if self.running():
+            raise OSError(_("Close it first."))
+        root = os.path.realpath(sober_accounts_dir())
+        path = os.path.realpath(self.folder())
+        if os.path.dirname(path) != root or not re.fullmatch(
+                r"[0-9a-f]{8}", os.path.basename(path)):
+            raise OSError("not an account folder: " + path)
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+
+
+def human_bytes(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
 
 
 _DOCK = None
@@ -8985,14 +9442,16 @@ TRANSLATIONS = {
         "The game opens in a window of its own that belongs to WayClick. "
         "Macros set to Play in the Dock press keys, click and look at the "
         "screen only in there, so your mouse and keyboard stay free, and the "
-        "Dock window can stay behind other windows or minimized. Sober opens "
-        "one copy at a time: close it before starting it in the Dock.":
+        "Dock window can stay behind other windows or minimized. Your usual "
+        "Sober opens one copy at a time: close it before starting it in the "
+        "Dock, or pick one of your Sober accounts in Account.":
             "O jogo abre numa janela só dele, que é do WayClick. Os macros "
             "marcados com Jogar na Doca apertam teclas, clicam e olham a "
             "tela só lá dentro, então o seu mouse e o seu teclado ficam "
             "livres, e a janela da Doca pode ficar atrás das outras ou "
-            "minimizada. O Sober abre uma cópia por vez: feche o seu antes "
-            "de abrir ele na Doca.",
+            "minimizada. O seu Sober de sempre abre uma cópia por vez: "
+            "feche ele antes de abrir na Doca, ou escolha uma das suas "
+            "contas do Sober em Conta.",
         "Play in the Dock": "Jogar na Doca",
         "Keys, clicks and screen steps go only to the game in the Dock, "
         "never to the window in front, and positions are those of the Dock "
@@ -9032,9 +9491,11 @@ TRANSLATIONS = {
             "A janela da Doca está com {w}×{h}, não {W}×{H}: ela cabe na "
             "tela? Macros feitos em {W}×{H} podem errar.",
         "Sober is already open outside the Dock, and it opens one copy at a "
-        "time. Close it, then press Start the game.":
+        "time. Close it, or pick one of your Sober accounts in Account, then "
+        "press Start the game.":
             "O Sober já está aberto fora da Doca, e ele abre uma cópia por "
-            "vez. Feche ele e aperte Abrir o jogo.",
+            "vez. Feche ele, ou escolha uma das suas contas do Sober em "
+            "Conta, e aperte Abrir o jogo.",
         "Recording in {n} s, play inside the Dock window…":
             "Gravando em {n} s, jogue dentro da janela da Doca…",
         "Capturing the Dock in {n} s…": "Capturando a Doca em {n} s…",
@@ -9477,6 +9938,97 @@ TRANSLATIONS = {
             "Telas",
         "{file} holds a Tower Defense strategy, not macros. Import it on the Tower Defense tab?":
             "{file} traz uma estratégia de Tower Defense, não macros. Importar na aba Tower Defense?",
+        # --- 1.11.0: a barra lateral e as contas do Sober
+        "Search…": "Buscar…", "Search (Ctrl+F)": "Buscar (Ctrl+F)",
+        "Nothing found.": "Nada encontrado.",
+        "Automation": "Automação", "Games": "Jogos",
+        "Sober accounts": "Contas do Sober",
+        "Account:": "Conta:", "Your usual Sober": "O seu Sober de sempre",
+        "Which Sober the Dock opens: your usual one, or one of the accounts "
+        "of the Sober accounts page. Other games ignore it.":
+            "Qual Sober a Doca abre: o de sempre, ou uma das contas da página "
+            "Contas do Sober. Os outros jogos não usam isto.",
+        "{name} is already open outside the Dock. Close it, then press "
+        "Start the game.":
+            "{name} já está aberta fora da Doca. Feche ela e aperte Abrir o "
+            "jogo.",
+        "{name} is already open in the Dock.": "{name} já está aberta na Doca.",
+        "Sober is already open in {name}, and it takes a link only when it "
+        "opens, so {url} was not opened. Close it first.":
+            "O Sober já está aberto em {name}, e ele só recebe um link ao "
+            "abrir, então {url} não foi aberto. Feche ele antes.",
+        "Sober accounts need Flatpak, with Sober from Flathub.":
+            "As contas do Sober precisam do Flatpak, com o Sober do Flathub.",
+        "Sober accounts need pasta, from the passt package. Arch: sudo "
+        "pacman -S passt. Fedora: sudo dnf install passt. Debian and Ubuntu: "
+        "sudo apt install passt.":
+            "As contas do Sober precisam do pasta, do pacote passt. Arch: "
+            "sudo pacman -S passt. Fedora: sudo dnf install passt. Debian e "
+            "Ubuntu: sudo apt install passt.",
+        "Sober accounts need {tool}, from util-linux.":
+            "As contas do Sober precisam do {tool}, do util-linux.",
+        "Sober accounts need util-linux 2.38 or newer (unshare --map-user).":
+            "As contas do Sober precisam do util-linux 2.38 ou mais novo "
+            "(unshare --map-user).",
+        "Sober accounts need user namespaces, and this system turns them "
+        "off for users.":
+            "As contas do Sober precisam de namespaces de usuário, e este "
+            "sistema desliga eles para usuários comuns.",
+        "Close it first.": "Feche ela antes.",
+        "Each account is a separate Sober, with its own Roblox sign-in, "
+        "settings and network, so it opens next to your usual Sober and both "
+        "play at the same time. The first time, Sober sets itself up in the "
+        "new account (it downloads Roblox again) and you sign in there. Your "
+        "usual Sober and its files stay as they are.":
+            "Cada conta é um Sober separado, com login do Roblox, "
+            "configurações e rede próprios, então ela abre ao lado do seu "
+            "Sober de sempre e os dois jogam ao mesmo tempo. Na primeira vez "
+            "o Sober se prepara na conta nova (baixa o Roblox de novo) e você "
+            "entra com o login lá. O seu Sober de sempre e os arquivos dele "
+            "ficam como estão.",
+        "Roblox calls running two clients at once an exploit, though it says "
+        "it does not ban for it today, and Sober does not support it. Use it "
+        "at your own risk.":
+            "O Roblox chama rodar dois clientes ao mesmo tempo de exploit, "
+            "embora diga que hoje não bane por isso, e o Sober não dá suporte "
+            "a isso. Use por sua conta e risco.",
+        "{name} (closing…)": "{name} (fechando…)",
+        "{name} (open)": "{name} (aberta)",
+        "{n} accounts at most.": "No máximo {n} contas.",
+        "{name} is already open.": "{name} já está aberta.",
+        "Sober did not open in {name}: {why}":
+            "O Sober não abriu em {name}: {why}",
+        "exit code {n}": "código de saída {n}",
+        "{name} is closed.": "{name} foi fechada.",
+        "{name} did not close. Close its window.":
+            "{name} não fechou. Feche a janela dela.",
+        "Account {n}": "Conta {n}",
+        "Add account": "Adicionar conta", "Add account…": "Adicionar conta…",
+        "Rename account": "Renomear conta", "Rename…": "Renomear…",
+        "Remove account": "Remover conta", "Remove…": "Remover…",
+        "Open": "Abrir", "Close": "Fechar",
+        "Added {name}. Open it, and Sober sets itself up there the first "
+        "time.":
+            "{name} adicionada. Abra ela, e o Sober se prepara lá na "
+            "primeira vez.",
+        "Remove {name}? Its Sober data on this computer is deleted: the "
+        "Roblox sign-in, the settings and the downloads ({size}). The Roblox "
+        "account itself stays as it is.":
+            "Remover {name}? Os dados do Sober dela neste computador são "
+            "apagados: o login do Roblox, as configurações e os downloads "
+            "({size}). A conta do Roblox em si fica como está.",
+        "{name} was not removed: {err}": "{name} não foi removida: {err}",
+        "Removed {name}.": "{name} removida.",
+        "Sober is not installed. Install it from Flathub "
+        "(org.vinegarhq.Sober) and open it once.":
+            "O Sober não está instalado. Instale pelo Flathub "
+            "(org.vinegarhq.Sober) e abra uma vez.",
+        "Opening {name}… its Sober window shows up in a few seconds.":
+            "Abrindo {name}… a janela do Sober dela aparece em alguns "
+            "segundos.",
+        "Closing {name}…": "Fechando {name}…",
+        "Open the Sober of this account on the desktop":
+            "Abrir o Sober desta conta na área de trabalho",
     },
 }
 LANGS = {"English": "en_US", "Português (BR)": "pt_BR"}
@@ -13580,8 +14132,673 @@ DOCK_TAB_HINT = ("The game opens in a window of its own that belongs to "
                  "WayClick. Macros set to Play in the Dock press keys, click "
                  "and look at the screen only in there, so your mouse and "
                  "keyboard stay free, and the Dock window can stay behind "
-                 "other windows or minimized. Sober opens one copy at a "
-                 "time: close it before starting it in the Dock.")
+                 "other windows or minimized. Your usual Sober opens one "
+                 "copy at a time: close it before starting it in the Dock, "
+                 "or pick one of your Sober accounts in Account.")
+
+
+# ------------------------------------------------------ a barra lateral ---
+def fold_text(text):
+    """Texto para comparar na busca: sem acento e sem caixa, então
+    "automacao" acha "Automação"."""
+    t = unicodedata.normalize("NFKD", str(text or "")).casefold()
+    return "".join(c for c in t if not unicodedata.combining(c))
+
+
+def nav_icon(names, letter):
+    """O primeiro destes ícones que o tema tiver. Sem nenhum (outro desktop,
+    tema incompleto), a inicial num quadrado: no modo estreito a lista só
+    tem os ícones, e um vazio não diria nada."""
+    for name in names:
+        if QIcon.hasThemeIcon(name):
+            return QIcon.fromTheme(name)
+    pm = QPixmap(48, 48)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor("#3daee9"))
+    p.drawRoundedRect(QRectF(3, 3, 42, 42), 10, 10)
+    f = p.font()
+    f.setBold(True)
+    f.setPixelSize(26)
+    p.setFont(f)
+    p.setPen(QColor("#ffffff"))
+    p.drawText(QRectF(0, 0, 48, 48), Qt.AlignCenter, letter[:1].upper())
+    p.end()
+    return QIcon(pm)
+
+
+class SideNav(QWidget):
+    """As páginas numa lista à esquerda, em grupos, como nas Configurações
+    do Sistema do KDE, no lugar das abas: com oito páginas as abas já não
+    cabiam numa janela pequena, e cada função nova piorava.
+
+    Em cima da lista, uma busca que olha o nome da página e os textos dela
+    (sem acento e sem caixa). Quando a janela fica estreita demais para os
+    nomes, a lista vira só ícones (o nome no tooltip, o ponto de "ligado"
+    no ícone) e a busca vira um botão, que abre a lista até escolher.
+    Fala a língua do QTabWidget (addTab, tabText, setTabText,
+    setCurrentWidget, currentChanged...), que é o que o resto do app usa.
+    """
+    currentChanged = Signal(int)
+    WIDE = 184            # px da lista com os nomes
+    NARROW = 50           # px da lista só com os ícones
+    ICON = 22
+    ROW = 30              # altura de uma página na lista
+    DOT = "● "            # o começo do nome de uma página ligada
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pages = []            # widget, text, icon, group, item
+        self._heads = {}            # grupo -> item do título dele
+        self._compact = False       # a janela não comporta os nomes
+        self._peek = False          # estreita, mas aberta para buscar
+        self.search = QLineEdit()
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._filter)
+        self.search.returnPressed.connect(self._first_match)
+        self.search.installEventFilter(self)
+        self.find_btn = QToolButton()
+        self.find_btn.setAutoRaise(True)
+        self.find_btn.setIcon(nav_icon(["edit-find", "system-search"], "?"))
+        self.find_btn.clicked.connect(self.start_search)
+        self.list = QListWidget()
+        self.list.setIconSize(QSize(self.ICON, self.ICON))
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list.setTextElideMode(Qt.ElideRight)
+        self.list.currentRowChanged.connect(self._row_changed)
+        self.list.itemClicked.connect(self._picked)
+        self.list.installEventFilter(self)
+        self.empty = QLabel()
+        self.empty.setWordWrap(True)
+        self.empty.setEnabled(False)            # cinza pela paleta
+        self.empty.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self.empty.hide()
+        self.side = QWidget()
+        col = QVBoxLayout(self.side)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(4)
+        col.addWidget(self.search)
+        col.addWidget(self.find_btn, 0, Qt.AlignHCenter)
+        col.addWidget(self.list, 1)
+        col.addWidget(self.empty)
+        self.stack = QStackedWidget()
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        row.addWidget(self.side)
+        row.addWidget(self.stack, 1)
+        # os atalhos do QTabWidget, mais o de buscar
+        for keys, step in ((("Ctrl+PgDown", "Ctrl+Tab"), 1),
+                           (("Ctrl+PgUp", "Ctrl+Shift+Tab"), -1)):
+            for k in keys:
+                sc = QShortcut(QKeySequence(k), self)
+                sc.setContext(Qt.WindowShortcut)
+                sc.activated.connect(lambda s=step: self.step(s))
+        find = QShortcut(QKeySequence(QKeySequence.Find), self)
+        find.setContext(Qt.WindowShortcut)
+        find.activated.connect(self.start_search)
+        self.retranslate()
+        self._apply()
+
+    # ------------------------------------------ o que o QTabWidget tem --
+    def addTab(self, widget, text, icon=None, group=None):
+        if group and group not in self._heads:
+            head = QListWidgetItem(_(group))
+            head.setFlags(Qt.NoItemFlags)      # não seleciona, as setas pulam
+            head.setData(Qt.UserRole, -1)
+            f = head.font()
+            f.setBold(True)
+            head.setFont(f)
+            # o segundo grupo em diante com um respiro em cima
+            head.setSizeHint(QSize(0, self.ROW + (8 if self._heads else 0)))
+            self.list.addItem(head)
+            self._heads[group] = head
+        i = len(self._pages)
+        item = QListWidgetItem(text)
+        item.setData(Qt.UserRole, i)
+        item.setSizeHint(QSize(0, self.ROW))
+        self.list.addItem(item)
+        self.stack.addWidget(widget)
+        self._pages.append({"widget": widget, "text": text,
+                            "icon": icon if icon is not None else QIcon(),
+                            "group": group, "item": item})
+        self._paint(i)
+        if self.list.currentRow() < 0:
+            self.list.setCurrentItem(item)
+        return i
+
+    def count(self):
+        return len(self._pages)
+
+    def widget(self, i):
+        return self._pages[i]["widget"] if 0 <= i < len(self._pages) else None
+
+    def indexOf(self, widget):
+        for i, p in enumerate(self._pages):
+            if p["widget"] is widget:
+                return i
+        return -1
+
+    def currentIndex(self):
+        return self.stack.currentIndex() if self._pages else -1
+
+    def currentWidget(self):
+        return self.stack.currentWidget()
+
+    def setCurrentIndex(self, i):
+        if not 0 <= i < len(self._pages):
+            return
+        item = self._pages[i]["item"]
+        if item.isHidden():                 # a busca escondia: desfaz
+            self.search.clear()
+        self.list.setCurrentItem(item)
+
+    def setCurrentWidget(self, widget):
+        self.setCurrentIndex(self.indexOf(widget))
+
+    def tabText(self, i):
+        return self._pages[i]["text"] if 0 <= i < len(self._pages) else ""
+
+    def setTabText(self, i, text):
+        if 0 <= i < len(self._pages) and self._pages[i]["text"] != text:
+            self._pages[i]["text"] = text
+            self._paint(i)
+            if self.search.text().strip():
+                self._filter(self.search.text())
+
+    def tabIcon(self, i):
+        return self._pages[i]["icon"] if 0 <= i < len(self._pages) else QIcon()
+
+    def narrow(self):
+        """Só os ícones agora (a janela está estreita e a busca, fechada)."""
+        return self._compact and not self._peek
+
+    def step(self, d):
+        """A página seguinte (d=1) ou a anterior (d=-1) das que a busca
+        mostra, dando a volta."""
+        n = len(self._pages)
+        i = self.currentIndex()
+        for _k in range(n):
+            i = (i + d) % n
+            if not self._pages[i]["item"].isHidden():
+                self.setCurrentIndex(i)
+                return
+
+    def retranslate(self):
+        self.search.setPlaceholderText(_("Search…"))
+        self.find_btn.setToolTip(_("Search (Ctrl+F)"))
+        self.empty.setText(_("Nothing found."))
+        for group, head in self._heads.items():
+            head.setText(_(group))
+        if self.search.text().strip():
+            self._filter(self.search.text())
+
+    # -------------------------------------------------------- a lista --
+    def _row_changed(self, row):
+        item = self.list.item(row)
+        i = item.data(Qt.UserRole) if item is not None else None
+        if not isinstance(i, int) or i < 0:
+            return
+        if self.stack.currentIndex() != i:
+            self.stack.setCurrentIndex(i)
+            self.currentChanged.emit(i)
+
+    def _picked(self, _item):
+        self._end_peek()
+
+    def _paint(self, i):
+        p = self._pages[i]
+        item, text = p["item"], p["text"]
+        if self.narrow():
+            item.setText("")
+            item.setIcon(self._dotted(p["icon"]) if text.startswith(self.DOT)
+                         else p["icon"])
+            item.setToolTip(text)
+        else:
+            item.setText(text)
+            item.setIcon(p["icon"])
+            item.setToolTip("")
+
+    def _dotted(self, icon):
+        """O ícone com o ponto verde de "ligado" no canto, para o modo
+        estreito, em que o nome (e o ● dele) não aparece."""
+        s = self.ICON
+        dpr = max(1.0, self.devicePixelRatioF())
+        pm = QPixmap(int(round(s * dpr)), int(round(s * dpr)))
+        pm.setDevicePixelRatio(dpr)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        icon.paint(p, 0, 0, s, s)
+        r = s * 0.46
+        p.setPen(QPen(self.palette().color(QPalette.Base), 1.5))
+        p.setBrush(QColor("#27ae60"))
+        p.drawEllipse(QRectF(s - r - 0.75, s - r - 0.75, r, r))
+        p.end()
+        return QIcon(pm)
+
+    # -------------------------------------------------------- a busca --
+    def _haystack(self, i):
+        """Tudo o que a página escreve, para a busca achar "intervalo" na
+        página Clique ou o nome de um macro na página Atalhos."""
+        p = self._pages[i]
+        bits = [p["text"], _(p["group"]) if p["group"] else ""]
+        for w in [p["widget"]] + p["widget"].findChildren(QWidget):
+            if isinstance(w, (QLabel, QAbstractButton)):
+                bits.append(w.text())
+            elif isinstance(w, QGroupBox):
+                bits.append(w.title())
+            elif isinstance(w, QLineEdit):
+                bits.append(w.placeholderText())
+            elif isinstance(w, QComboBox):
+                bits += [w.itemText(k) for k in range(w.count())]
+            elif isinstance(w, QListWidget):
+                bits += [w.item(k).text() for k in range(w.count())]
+            elif isinstance(w, QTabWidget):
+                bits += [w.tabText(k) for k in range(w.count())]
+            if w.toolTip():
+                bits.append(w.toolTip())
+        return fold_text(" ".join(bits))
+
+    def _filter(self, text):
+        words = fold_text(text).split()
+        groups, shown = set(), 0
+        for i, p in enumerate(self._pages):
+            ok = not words or all(w in self._haystack(i) for w in words)
+            p["item"].setHidden(not ok)
+            if ok:
+                shown += 1
+                groups.add(p["group"])
+        for group, head in self._heads.items():
+            head.setHidden(self.narrow() or group not in groups)
+        self.empty.setVisible(bool(words) and not shown and not self.narrow())
+
+    def _first_match(self):
+        for p in self._pages:
+            if not p["item"].isHidden():
+                self.list.setCurrentItem(p["item"])
+                break
+        self._end_peek()
+
+    def start_search(self):
+        """Ctrl+F ou o botão da lupa: estreita, a lista abre com os nomes até
+        escolher uma página (ou Esc)."""
+        if self._compact and not self._peek:
+            self._peek = True
+            self._apply()
+        self.search.setFocus(Qt.ShortcutFocusReason)
+        self.search.selectAll()
+
+    def _end_peek(self):
+        if self._peek:
+            self._peek = False
+            self._apply()
+
+    def _maybe_end_peek(self):
+        if not self._peek:
+            return
+        fw = QApplication.focusWidget()
+        if fw is not None and (fw is self.side or self.side.isAncestorOf(fw)):
+            return
+        self._end_peek()
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if obj is self.search and t in (QEvent.ShortcutOverride,
+                                        QEvent.KeyPress) \
+                and ev.key() == Qt.Key_Escape \
+                and (self.search.text() or self._peek):
+            # o Esc da busca é dela: limpa e fecha, sem chegar ao Esc da
+            # janela (que para o autoclicker)
+            ev.accept()
+            if t == QEvent.KeyPress:
+                self.search.clear()
+                was = self._peek
+                self._end_peek()
+                if was:
+                    self.list.setFocus(Qt.OtherFocusReason)
+            return t == QEvent.KeyPress
+        if t == QEvent.FocusOut and obj in (self.search, self.list):
+            QTimer.singleShot(0, self._maybe_end_peek)
+        return super().eventFilter(obj, ev)
+
+    # ---------------------------------------------- largo ou estreito --
+    def _need(self):
+        """A largura com que os nomes cabem sem apertar as páginas."""
+        return (self.WIDE + self.layout().spacing()
+                + self.stack.minimumSizeHint().width())
+
+    def minimumSizeHint(self):
+        # o mínimo é o do modo estreito: é ele que deixa a janela encolher
+        st = self.stack.minimumSizeHint()
+        return QSize(self.NARROW + self.layout().spacing() + st.width(),
+                     max(st.height(), self.ROW * 4))
+
+    def sizeHint(self):
+        st = self.stack.sizeHint()
+        return QSize(self.WIDE + self.layout().spacing() + st.width(),
+                     max(st.height(), self.ROW * 4))
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._fit()
+
+    def _fit(self):
+        compact = self.width() < self._need()
+        if compact != self._compact:
+            self._compact = compact
+            if not compact:
+                self._peek = False
+            self._apply()
+
+    def _apply(self):
+        narrow = self.narrow()
+        self.side.setFixedWidth(self.NARROW if narrow else self.WIDE)
+        self.search.setVisible(not narrow)
+        self.find_btn.setVisible(narrow)
+        # estreita, a barra de rolagem comeria os ícones; a roda ainda rola
+        self.list.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff if narrow else Qt.ScrollBarAsNeeded)
+        self._filter(self.search.text())
+        for i in range(len(self._pages)):
+            self._paint(i)
+
+
+# ---------------------------------------------- a página das contas -----
+SOBER_PAGE_HINT = ("Each account is a separate Sober, with its own Roblox "
+                   "sign-in, settings and network, so it opens next to your "
+                   "usual Sober and both play at the same time. The first "
+                   "time, Sober sets itself up in the new account (it "
+                   "downloads Roblox again) and you sign in there. Your usual "
+                   "Sober and its files stay as they are.")
+SOBER_RISK = ("Roblox calls running two clients at once an exploit, though "
+              "it says it does not ban for it today, and Sober does not "
+              "support it. Use it at your own risk.")
+
+
+class SoberPage(QWidget):
+    """A página Contas do Sober: a lista, abrir e fechar cada uma.
+
+    Os estados vêm da trava de cada conta, lida de tempos em tempos (é só
+    um flock, sem processo nenhum): uma conta aberta antes de o WayClick
+    abrir aparece aberta, e uma que o Sober fechou sozinho volta a fechada.
+    """
+    changed = Signal()           # a lista mudou: salvar, e o combo da Doca
+    state_changed = Signal()     # uma conta abriu ou fechou
+    POLL_MS = 1500
+    FAST_FAIL_S = 30             # saiu com erro antes disso: mostra o porquê
+    CLOSE_S = 25                 # mandou fechar e não fechou: avisa
+
+    def __init__(self, accounts, parent=None):
+        super().__init__(parent)
+        self.accounts = accounts         # a lista do App, a mesma
+        self.env = None                  # o ambiente do Sober (os testes)
+        self.prefix = None               # idem: o escopo em que ele roda
+        self.home = None
+        self.open_ids = set()            # as abertas na última olhada
+        self._closing = {}               # id -> quando mandou fechar
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setEnabled(False)
+        self.list = QListWidget()
+        self.list.currentRowChanged.connect(lambda _r: self._sync())
+        self.list.itemDoubleClicked.connect(lambda _i: self.open_selected())
+        self.b_add = QPushButton()
+        self.b_add.clicked.connect(self.add)
+        self.b_rename = QPushButton()
+        self.b_rename.clicked.connect(self.rename)
+        self.b_remove = QPushButton()
+        self.b_remove.clicked.connect(self.remove)
+        self.b_open = QPushButton()
+        self.b_open.clicked.connect(self.open_selected)
+        self.b_close = QPushButton()
+        self.b_close.clicked.connect(self.close_selected)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.status.hide()
+        self.risk = QLabel()
+        self.risk.setWordWrap(True)
+        self.risk.setEnabled(False)
+        self.risk.setStyleSheet("font-size:11px;")
+        edit = QHBoxLayout()
+        for b in (self.b_add, self.b_rename, self.b_remove):
+            edit.addWidget(b)
+        edit.addStretch()
+        run = QHBoxLayout()
+        for b in (self.b_open, self.b_close):
+            run.addWidget(b)
+        run.addStretch()
+        col = QVBoxLayout(self)
+        col.addWidget(self.hint)
+        col.addWidget(self.list, 1)
+        col.addLayout(edit)
+        col.addLayout(run)
+        col.addWidget(self.status)
+        col.addWidget(self.risk)
+        self.timer = QTimer(self)
+        self.timer.setInterval(self.POLL_MS)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start()
+        self.retranslate()
+        self.refresh()
+
+    # -------------------------------------------------------- a lista --
+    def selected(self):
+        row = self.list.currentRow()
+        return self.accounts[row] if 0 <= row < len(self.accounts) else None
+
+    def find(self, acc_id):
+        for acc in self.accounts:
+            if acc.id == acc_id:
+                return acc
+        return None
+
+    def _text(self, acc):
+        if acc.id in self._closing:
+            return _("{name} (closing…)", name=acc.name)
+        if acc.id in self.open_ids:
+            return SideNav.DOT + _("{name} (open)", name=acc.name)
+        return acc.name
+
+    def fill(self, select=None):
+        keep = select or (self.selected().id if self.selected() else None)
+        self.list.blockSignals(True)
+        self.list.clear()
+        row = 0
+        for i, acc in enumerate(self.accounts):
+            self.list.addItem(self._text(acc))
+            if acc.id == keep:
+                row = i
+        self.list.blockSignals(False)
+        if self.accounts:
+            self.list.setCurrentRow(row)
+        self._sync()
+
+    def _sync(self):
+        acc = self.selected()
+        is_open = acc is not None and acc.id in self.open_ids
+        self.b_add.setEnabled(len(self.accounts) < SOBER_ACCOUNTS_MAX)
+        self.b_add.setToolTip("" if self.b_add.isEnabled() else _(
+            "{n} accounts at most.", n=SOBER_ACCOUNTS_MAX))
+        self.b_rename.setEnabled(acc is not None)
+        self.b_remove.setEnabled(acc is not None and not is_open)
+        self.b_open.setEnabled(acc is not None and not is_open)
+        self.b_close.setEnabled(acc is not None and is_open
+                                and acc.id not in self._closing)
+
+    def refresh(self):
+        """Olha a trava de cada conta e acompanha o que mudou."""
+        now = time.monotonic()
+        opened = set()
+        for acc in self.accounts:
+            if acc.running():
+                opened.add(acc.id)
+            p = acc.proc
+            if p is not None and p.poll() is not None and acc.id not in opened:
+                acc.proc = None
+                code = p.returncode
+                if code == SOBER_BUSY:
+                    self._say(_("{name} is already open.", name=acc.name))
+                elif code and now - acc.started < self.FAST_FAIL_S:
+                    tail = acc.log_tail().splitlines()[-3:]
+                    self._say(_("Sober did not open in {name}: {why}",
+                                name=acc.name,
+                                why=" ".join(tail) or _("exit code {n}",
+                                                         n=code)), True)
+            if acc.id in self._closing:
+                if acc.id not in opened:
+                    del self._closing[acc.id]
+                    self._say(_("{name} is closed.", name=acc.name))
+                elif now - self._closing[acc.id] > self.CLOSE_S:
+                    del self._closing[acc.id]
+                    self._say(_("{name} did not close. Close its window.",
+                                name=acc.name), True)
+        moved = opened != self.open_ids
+        self.open_ids = opened
+        for i, acc in enumerate(self.accounts):
+            item = self.list.item(i)
+            if item is not None and item.text() != self._text(acc):
+                item.setText(self._text(acc))
+        if self.list.count() != len(self.accounts):
+            self.fill()
+        self._sync()
+        if moved:
+            self.state_changed.emit()
+
+    def _say(self, text, bad=False):
+        self.status.setText(text)
+        self.status.setStyleSheet("color:#d04030;" if bad else "")
+        # vazia, a linha só roubaria altura do texto de cima
+        self.status.setVisible(bool(text))
+
+    # ------------------------------------------------------------ ações --
+    def _ask_name(self, title, text):
+        name, ok = QInputDialog.getText(self, title, _("Name:"),
+                                        QLineEdit.Normal, text)
+        name = " ".join((name or "").split())[:40]
+        return name if ok and name else None
+
+    def add(self):
+        if len(self.accounts) >= SOBER_ACCOUNTS_MAX:
+            return None
+        names = {a.name for a in self.accounts}
+        n = 2                       # a conta 1 é a do Sober de sempre
+        while _("Account {n}", n=n) in names:
+            n += 1
+        name = self._ask_name(_("Add account"), _("Account {n}", n=n))
+        if name is None:
+            return None
+        ids = {a.id for a in self.accounts}
+        acc_id = os.urandom(4).hex()
+        while acc_id in ids:
+            acc_id = os.urandom(4).hex()
+        acc = SoberAccount(acc_id, name)
+        self.accounts.append(acc)
+        self.fill(select=acc.id)
+        self._say(_("Added {name}. Open it, and Sober sets itself up there "
+                    "the first time.", name=name))
+        self.changed.emit()
+        return acc
+
+    def rename(self):
+        acc = self.selected()
+        if acc is None:
+            return
+        name = self._ask_name(_("Rename account"), acc.name)
+        if name is None or name == acc.name:
+            return
+        acc.name = name
+        self.fill(select=acc.id)
+        self.changed.emit()
+
+    def remove(self):
+        acc = self.selected()
+        if acc is None or acc.running():
+            return
+        size = human_bytes(acc.disk_bytes())
+        ans = QMessageBox.question(
+            self, _("Remove account"),
+            _("Remove {name}? Its Sober data on this computer is deleted: "
+              "the Roblox sign-in, the settings and the downloads ({size}). "
+              "The Roblox account itself stays as it is.", name=acc.name,
+              size=size), QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ans != QMessageBox.Yes:
+            return
+        try:
+            acc.remove_data()
+        except OSError as e:
+            self._say(_("{name} was not removed: {err}", name=acc.name,
+                        err=e), True)
+            return
+        self.accounts.remove(acc)
+        self.fill()
+        self._say(_("Removed {name}.", name=acc.name))
+        self.changed.emit()
+
+    def sober_env(self):
+        if self.env is not None:
+            return self.env
+        env = dict(os.environ)
+        for k in ("XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID",
+                  "WAYLAND_SOCKET"):
+            env.pop(k, None)
+        return env
+
+    def open_selected(self):
+        acc = self.selected()
+        if acc is None or acc.running():
+            return False
+        why = sober_tools_missing()
+        if not why and not sober_installed():
+            why = _("Sober is not installed. Install it from Flathub "
+                    "(org.vinegarhq.Sober) and open it once.")
+        if why:
+            self._say(why, True)
+            return False
+        try:
+            acc.launch(["flatpak", "run", SOBER_APP], env=self.sober_env(),
+                       prefix=self.prefix, home=self.home)
+        except OSError as e:
+            self._say(_("Sober did not open in {name}: {why}", name=acc.name,
+                        why=e), True)
+            return False
+        self._say(_("Opening {name}… its Sober window shows up in a few "
+                    "seconds.", name=acc.name))
+        QTimer.singleShot(300, self.refresh)
+        return True
+
+    def close_selected(self):
+        acc = self.selected()
+        if acc is None or not acc.running():
+            return False
+        if not acc.close(env=self.env):
+            self._say(_("{name} did not close. Close its window.",
+                        name=acc.name), True)
+            return False
+        self._closing[acc.id] = time.monotonic()
+        self._say(_("Closing {name}…", name=acc.name))
+        self.refresh()
+        return True
+
+    def retranslate(self):
+        self.hint.setText(_(SOBER_PAGE_HINT))
+        self.risk.setText(_(SOBER_RISK))
+        self.b_add.setText(_("Add account…"))
+        self.b_rename.setText(_("Rename…"))
+        self.b_remove.setText(_("Remove…"))
+        self.b_open.setText(_("Open"))
+        self.b_close.setText(_("Close"))
+        self.b_open.setToolTip(_("Open the Sober of this account on the "
+                                 "desktop"))
+        self.fill()
+
+    def shutdown(self):
+        self.timer.stop()
+
+
 MODES = {"No trigger (hotkey toggles)": "toggle",
          "Runs while the trigger is held": "hold"}
 CFG = os.path.join(XDG_CONFIG, "wayclick.json")
@@ -13759,10 +14976,10 @@ class App(QWidget):
         self.scope_lbl = self._row(form, "Trigger holds:", scope_row)
         self._row(form, "Start delay:", self.delay)
         self._row(form, "Auto-stop after:", self.duration)
-        hk_row = QHBoxLayout()
-        hk_row.addWidget(self.hk, 1)
-        hk_row.addWidget(self.hk_block)
-        self._row(form, "Arm/disarm hotkey:", hk_row)
+        # a caixa vai na linha de baixo: ao lado do atalho, o texto em
+        # português alargava a página toda e a barra lateral perdia os nomes
+        self._row(form, "Arm/disarm hotkey:", self.hk)
+        form.addRow("", self.hk_block)
         trigger_form = form
 
         # --- macros com atalho, como scripts do AutoHotkey ---
@@ -13880,6 +15097,11 @@ class App(QWidget):
         checks.addWidget(self.autostart)
         checks.addStretch()
 
+        # --- as contas do Sober (a página delas e o combo Conta da Doca) ---
+        self.sober_accounts = [
+            SoberAccount(d["id"], d["name"])
+            for d in normalize_sober_accounts(cfg.get("sober_accounts"))]
+
         # --- a Doca: o jogo numa tela só do WayClick ---
         self.dock = DOCK()
         self.dock_size = QComboBox()
@@ -13904,9 +15126,13 @@ class App(QWidget):
         for b in (self.dock_open, self.dock_game, self.dock_show):
             dock_row.addWidget(b)
         dock_row.addStretch()
+        self.dock_acct = QComboBox()
+        self._fill_dock_accounts(str(cfg.get("dock_account") or ""))
+        self.dock_acct.currentIndexChanged.connect(self._dock_acct_changed)
         dock_form = QFormLayout()
         self._row(dock_form, "Size:", self.dock_size)
         self._row(dock_form, "Game:", self.dock_cmd)
+        self._row(dock_form, "Account:", self.dock_acct)
         dock_form.addRow(dock_row)
         self.dock_state = QLabel("")
         self.dock_state.setWordWrap(True)
@@ -13937,28 +15163,51 @@ class App(QWidget):
         self._save_timer.timeout.connect(self._save_cfg)
         self.tower.changed.connect(self._save_timer.start)
 
-        # Abas em vez de tudo empilhado: com todos os grupos numa tela só a
-        # janela passava de 900 px de altura e não cabia num 1366x768.
-        self.tabs = QTabWidget()
+        # --- as contas do Sober ---
+        self.sober_page = SoberPage(self.sober_accounts)
+        self.sober_page.changed.connect(self._sober_changed)
+        self.sober_page.state_changed.connect(self._sync_tabs)
+
+        # Páginas numa lista à esquerda, em grupos, em vez de tudo empilhado
+        # (passava de 900 px de altura) e em vez das abas (com oito páginas
+        # elas não cabiam mais numa janela pequena).
+        self.tabs = SideNav()
         self.tab_pages = []
+        auto, games = "Automation", "Games"
         self.tabs.addTab(self._page(self.click_box, click_form,
                                     _("1000 ms is 1 click/s, 0.1 ms is 10,000. "
-                                      "Lower is faster.")), "")
+                                      "Lower is faster.")), "",
+                         nav_icon(["input-mouse"], "C"), auto)
         self.tabs.addTab(self._page(self.key_box, key_form,
                                     _("Click the key field and press the key "
-                                      "you want.")), "")
+                                      "you want.")), "",
+                         nav_icon(["input-keyboard"], "K"), auto)
         self.tabs.addTab(self._page(self.macro_box, macro_form,
-                                    _(MACRO_TAB_HINT), grow=True), "")
+                                    _(MACRO_TAB_HINT), grow=True), "",
+                         nav_icon(["preferences-desktop-keyboard-shortcut",
+                                   "configure-shortcuts"], "H"), auto)
         self.tabs.addTab(self._page(self.target_box, target_form, None,
-                                    extra=self.win_warn), "")
+                                    extra=self.win_warn), "",
+                         nav_icon(["preferences-system-windows", "window"],
+                                  "W"), auto)
         self.tabs.addTab(self._page(None, trigger_form, None,
-                                    extra=[afk_row, checks]), "")
+                                    extra=[afk_row, checks]), "",
+                         nav_icon(["media-playback-start", "player-time"],
+                                  "T"), auto)
         self.tabs.addTab(self._page(None, dock_form, None,
                                     extra=[self.dock_state, self.dock_note,
-                                           self.dock_hint]), "")
-        self.tabs.addTab(self.tower_scroll, "")
+                                           self.dock_hint]), "",
+                         nav_icon(["preferences-desktop-display",
+                                   "video-display"], "D"), games)
+        self.tabs.addTab(self.tower_scroll, "",
+                         nav_icon(["applications-games",
+                                   "games-config-tiles"], "T"), games)
+        self.tabs.addTab(self.sober_page, "",
+                         nav_icon(["system-users", "user-group-properties",
+                                   "im-user"], "S"), games)
         self._tab_names = ["Click", "Keyboard", "Hotkeys", "Window",
-                           "Trigger", "Dock", "Tower Defense"]
+                           "Trigger", "Dock", "Tower Defense",
+                           "Sober accounts"]
         self._sync_tabs()
         self.tower.running_changed.connect(self._sync_tabs)
         self.tabs.currentChanged.connect(self._tab_changed)
@@ -13992,7 +15241,18 @@ class App(QWidget):
         outer.addWidget(self.status)
         outer.addWidget(self.btn)
         outer.addWidget(self.warn)
-        self.resize(460, 470)
+        # larga o bastante para a barra lateral abrir com os nomes: a conta
+        # vem das páginas (fonte, estilo e idioma mudam tudo), com folga
+        # e alta o bastante para os textos das páginas e a lista inteira,
+        # sem passar da tela
+        m = outer.contentsMargins()
+        width = max(660, self.tabs._need() + m.left() + m.right() + 40)
+        height = max(500, outer.totalHeightForWidth(width))
+        scr = self.screen()
+        if scr is not None:
+            height = min(height, max(500, scr.availableGeometry().height()
+                                     - 80))
+        self.resize(width, height)
         self.setWindowIcon(wayclick_icon())
         self._show_rate()
         self._paint_status()
@@ -14194,7 +15454,8 @@ class App(QWidget):
                   m["enabled"] for m in getattr(self, "macros", [])),
               self.target_box.isChecked(), self.mode_key() != "toggle",
               getattr(self, "dock", None) is not None and self.dock.alive(),
-              hasattr(self, "tower") and self.tower.running()]
+              hasattr(self, "tower") and self.tower.running(),
+              hasattr(self, "sober_page") and bool(self.sober_page.open_ids)]
         for i, name in enumerate(self._tab_names):
             mark = "● " if on[i] else ""
             self.tabs.setTabText(i, mark + _(name))
@@ -14211,6 +15472,42 @@ class App(QWidget):
     def _dock_size_changed(self, _i=0):
         self.dock.set_size(*self._dock_size_value())
         self._show_dock()
+
+    def _account(self, acc_id):
+        for acc in self.sober_accounts:
+            if acc.id == acc_id:
+                return acc
+        return None
+
+    def _fill_dock_accounts(self, keep=None):
+        """O combo Conta da Doca: o Sober de sempre e as contas do Sober."""
+        if keep is None:
+            keep = self.dock_acct.currentData() or ""
+        self.dock_acct.blockSignals(True)
+        self.dock_acct.clear()
+        self.dock_acct.addItem(_("Your usual Sober"), "")
+        for acc in self.sober_accounts:
+            self.dock_acct.addItem(acc.name, acc.id)
+        self.dock_acct.setCurrentIndex(max(0, self.dock_acct.findData(keep)))
+        self.dock_acct.blockSignals(False)
+        self.dock_acct.setToolTip(_(
+            "Which Sober the Dock opens: your usual one, or one of the "
+            "accounts of the Sober accounts page. Other games ignore it."))
+        self.dock.account = self._account(self.dock_acct.currentData() or "")
+
+    def _dock_acct_changed(self, _i=0):
+        self.dock.account = self._account(self.dock_acct.currentData() or "")
+        self.dock.note = ""
+        self._show_dock()
+        self._save_timer.start()
+
+    def _sober_changed(self):
+        """Contas novas, renomeadas ou removidas: o combo da Doca segue, e a
+        configuração é gravada logo."""
+        self._fill_dock_accounts()
+        self._show_dock()
+        self._sync_tabs()
+        self._save_timer.start()
 
     def _dock_cmd_changed(self, text):
         self.dock.command = text.strip()
@@ -14428,6 +15725,9 @@ class App(QWidget):
         self.afk.setText(_("Anti-AFK: nudge the cursor every"))
         for lbl, src in self._hints:
             lbl.setText(_(src))
+        self.tabs.retranslate()
+        self.sober_page.retranslate()
+        self._fill_dock_accounts()
         self._sync_tabs()
         self._show_dock()
         self.tower.retranslate()
@@ -15730,6 +17030,9 @@ class App(QWidget):
                 "dock_size": "x".join(
                     map(str, self._dock_size_value())),
                 "dock_command": self.dock_cmd.text().strip(),
+                "dock_account": self.dock_acct.currentData() or "",
+                "sober_accounts": [{"id": a.id, "name": a.name}
+                                   for a in self.sober_accounts],
                 "update_check": self.update_auto,
                 "update_tag": self._update_tag,
                 "update_url": self._update_url,
@@ -15766,6 +17069,7 @@ class App(QWidget):
         if self.bridge or _KWIN:
             (self.bridge or _KWIN).cleanup()
         self._save_timer.stop()
+        self.sober_page.shutdown()
         self.tower.shutdown()
         self.engine.stop_dock()
         self.dock.stop()

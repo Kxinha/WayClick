@@ -1062,7 +1062,8 @@ tab.shutdown()
 w = a.App()
 w.sound.setChecked(False)
 names = [w.tabs.tabText(i) for i in range(w.tabs.count())]
-check("the window has a Tower Defense tab", names[-1] == "Tower Defense",
+check("the window has a Tower Defense page", "Tower Defense" in names
+      and w.tabs.widget(names.index("Tower Defense")) is w.tower_scroll,
       str(names))
 w.show()
 pump(0.2)
@@ -1095,7 +1096,8 @@ check("a strategy file given to the Hotkeys import goes to the tab",
       and "Tower Defense strategy" in ASK["asked"][-1][1])
 a.LANG = "pt_BR"
 w.retranslate()
-check("translated", w.tabs.tabText(w.tabs.count() - 1) == "Tower Defense"
+check("translated", w.tabs.tabText(w.tabs.indexOf(w.tower_scroll))
+      == "Tower Defense"
       and w.tower.b_dock.text() == "Abrir a Doca")
 a.LANG = "en_US"
 w.retranslate()

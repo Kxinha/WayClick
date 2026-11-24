@@ -46,6 +46,9 @@ compositor e sem nada rodando como root.
   linha do tempo que você grava jogando, o lobby, imagens do fim da partida,
   Iniciar F4, Parar F5 e Pausar F6, um registro e as contagens. Ele só olha
   a tela e aperta teclas, nunca lê a memória do jogo
+- **Contas do Sober** abrem mais cópias do Sober ao lado da de sempre, cada
+  uma com login do Roblox, configurações e rede próprios, então uma segunda
+  conta joga ao mesmo tempo que a primeira, na área de trabalho ou na Doca
 - **Mandar tecla para uma janela** — escolha uma janela aberta e alimente ela
   com uma tecla; em alvo X11 chega sem mexer no foco, mesmo minimizada
 - **Anti-AFK** — mexe o ponteiro e devolve, com deriva zero
@@ -66,6 +69,7 @@ compositor e sem nada rodando como root.
 | Bindings Qt | PySide6 (`QtMultimedia` é opcional — só para os bipes) |
 | Permissões | seu usuário no grupo `input`, e `/dev/uinput` gravável por ele |
 | Passos de tela (opcional) | numpy, PyGObject e GStreamer com o plugin do PipeWire, mais o portal do desktop (`xdg-desktop-portal-kde` no Plasma) |
+| Contas do Sober (opcional) | Sober do Flathub, `pasta` do pacote `passt`, util-linux 2.38 ou mais novo, e namespaces de usuário ligados para usuários comuns |
 
 ## Instalação
 
@@ -167,14 +171,26 @@ wayclick --import script.ahk --dry-run   # no que um script do AutoHotkey vira
 wayclick --version
 ```
 
-São seis abas. **Atalhos** guarda os macros estilo AutoHotkey, que rodam nos
-próprios atalhos e não precisam do Iniciar. **Clique**, **Teclado** e
-**Janela** são as três coisas que o Iniciar executa. Cada uma tem sua caixa de
-habilitar, e a aba ganha um ponto quando está ligada, então dá para ver o que está armado sem abrir. Habilite
-qualquer combinação. **Acionamento** é como tudo liga e desliga, mais o
-Anti-AFK, que roda por fora do Iniciar/Parar. **Doca** abre o jogo na
-[Doca](#a-doca). O status e o botão Iniciar ficam
-sempre visíveis abaixo das abas, e a janela cabe numa tela de 1366×768.
+As páginas ficam numa barra lateral à esquerda, em dois grupos, como nas
+Configurações do Sistema. **Automação** tem **Clique**, **Teclado**,
+**Atalhos**, **Janela** e **Acionamento**, e **Jogos** tem **Doca**, **Tower
+Defense** e **Contas do Sober**. **Atalhos** guarda os macros estilo
+AutoHotkey, que rodam nos próprios atalhos e não precisam do Iniciar.
+**Clique**, **Teclado** e **Janela** são as três coisas que o Iniciar
+executa. Cada uma tem sua caixa de habilitar, e o nome dela na barra ganha um
+ponto quando está ligada, então dá para ver o que está armado sem abrir.
+Habilite qualquer combinação. **Acionamento** é como tudo liga e desliga, mais
+o Anti-AFK, que roda por fora do Iniciar/Parar. **Doca** abre o jogo na
+[Doca](#a-doca), e **Contas do Sober** abre
+[um segundo Sober](#contas-do-sober).
+
+A busca em cima das páginas (Ctrl+F) acha uma página pelo nome ou por
+qualquer texto dela, e Ctrl+Tab ou Ctrl+PgDown vai para a próxima página
+(Ctrl+Shift+Tab ou Ctrl+PgUp volta). Numa janela estreita demais para os
+nomes a barra mostra só os ícones, com o nome no tooltip e o ponto no ícone,
+e a busca vira um botão. O status e o botão Iniciar ficam sempre visíveis
+abaixo das páginas, e a janela abre com 709×548 em português (660 de largura
+em inglês), o que cabe numa tela de 1366×768.
 
 O resto está na barra de menus: **Arquivo** inicia, para, esconde na bandeja e
 sai; **Configurações** tem **Tema** e **Idioma** (English, Português BR), além
@@ -474,8 +490,13 @@ tela…** passam a funcionar na Doca também. Fechar a janela da Doca, ou
 **Fechar a Doca**, fecha o jogo e para os macros dela, e um macro da Doca
 iniciado com a Doca fechada avisa e não roda.
 
-O Sober abre uma cópia por vez, então feche o Sober que estiver aberto antes
-de abrir ele na Doca; a aba Doca avisa quando encontra um. A Doca precisa de
+**Conta** escolhe qual Sober a Doca abre, o de sempre ou uma das
+[Contas do Sober](#contas-do-sober), e os outros jogos não usam isso. O seu
+Sober de sempre abre uma cópia por vez, então feche ele antes de abrir na
+Doca, ou escolha uma conta. A página Doca avisa quando o Sober que ela
+abriria já está aberto em outro lugar. O Sober só recebe um link `roblox://`
+ao abrir, então o link de um macro da Doca não é aberto enquanto uma conta
+está aberta na Doca, e a Doca avisa. A Doca precisa de
 uma sessão Wayland do Plasma (`kwin_wayland`) e do `dbus-daemon`, que vêm
 com o Plasma.
 
@@ -594,6 +615,59 @@ para o WayClick e 4% para o KWin da Doca. Ainda não foi testado no Tower
 Defense Simulator de verdade, e nenhuma estratégia pronta vem com o
 WayClick. Confira as regras do jogo antes, já que muitos jogos online banem
 farm automático.
+
+### Contas do Sober
+
+O Sober abre uma cópia por vez. Uma segunda acha a primeira por uma porta
+fixa do 127.0.0.1 e não abre, então no Linux duas contas do Roblox não
+jogavam juntas como jogam no Windows. A página **Contas do Sober** dá a cada
+conta um Sober só dela, com login do Roblox, configurações e rede próprios,
+então ela abre ao lado do seu Sober de sempre e os dois jogam ao mesmo tempo.
+
+Aperte **Adicionar conta…**, dê um nome e aperte **Abrir** (ou clique duas
+vezes nela). Na primeira vez o Sober se prepara na conta nova e baixa o
+Roblox de novo, e você entra com o login do Roblox lá. Depois disso ela abre
+direto no Roblox. **Fechar** fecha só aquela conta, **Renomear…** muda o
+nome, e **Remover…** apaga os dados do Sober dela neste computador (o login
+do Roblox, as configurações e os downloads), enquanto a conta do Roblox em si
+fica como está. Dá para ter até quatro contas. Uma conta que já estava aberta
+antes de o WayClick abrir aparece aberta, e sair do WayClick deixa as contas
+abertas rodando. Na página Doca, **Conta** abre uma delas na Doca.
+
+Como funciona. Cada conta roda o Sober numa rede só dela, feita pelo
+`pasta`, onde a porta do 127.0.0.1 do seu Sober de sempre não existe, e
+nenhuma porta é repassada para dentro ou para fora. Lá dentro a pasta da
+conta (`~/.local/share/wayclick/sober-accounts/<id>/app`) é montada sobre
+`~/.var/app/org.vinegarhq.Sober` só para aquela cópia, e o `unshare` devolve
+o seu próprio usuário ao Sober antes de o `flatpak run` abrir ele como
+sempre. O seu Sober de sempre, a pasta dele e o escopo dele nunca são
+tocados. Uma trava na pasta da conta diz se ela está aberta, e a rede anotada
+ao abrir é como o WayClick acha aquela cópia no `flatpak ps` para fechar,
+nunca a que está na rede do seu computador.
+
+Isso foi medido com o Sober de verdade num KWin aninhado
+(`tests/t_sober_accounts_kwin.py`). Duas contas chegaram ao Roblox com poucos
+segundos de diferença e ficaram abertas lado a lado, cada uma numa rede só
+dela, com o Sober gravando só na pasta da conta. Fechar uma deixou a outra
+aberta, uma conta vazia abriu na primeira tela do Sober, e o Sober do
+computador que rodou o teste não foi tocado.
+
+Limites
+
+- toda cópia é o mesmo app com o mesmo título de janela, então um passo
+  *Janela* que procura o Sober acha qualquer uma delas;
+- cada conta aberta usa a memória de um Roblox a mais;
+- o Sober só recebe um link `roblox://` ao abrir, então um link para uma
+  conta que já está aberta não é aberto (medido, um segundo Sober na mesma
+  conta para em "An instance of Sober is already running");
+- precisa do `pasta` e do util-linux 2.38 ou mais novo, e um Sober futuro
+  pode trazer verificações que isso não passa.
+
+A equipe do Roblox já chamou rodar mais de um cliente de exploit, dizendo
+que hoje isso não é banido, mas que pode mudar
+([DevForum, julho de 2025](https://devforum.roblox.com/t/is-fishstrap-bloxstrap-no-longer-allowed-on-the-platform/3829253/13)),
+e o Sober não dá suporte a isso ([FAQ do Sober](https://vinegarhq.org/Sober/FAQ/index.html)).
+Use por sua conta e risco.
 
 ### Acionamento
 
@@ -923,6 +997,9 @@ python3 tests/t_sober_dock.py                       # o Sober abrindo na Doca, c
 python3 tests/t_screen_portal.py                    # o portal de verdade, dentro do bubblewrap
 python3 tests/bench_find_image.py                   # busca de imagem, acha ou não e com que rapidez
 python3 tests/t_sober_kwin.py                       # tudo isso contra o Roblox (Sober), num KWin aninhado
+python3 tests/t_sidenav.py                          # a barra lateral: grupos, pontos, busca, teclas, só ícones quando estreita
+python3 tests/t_sober_accounts.py                   # as Contas do Sober num Sober falso: trava, pasta, fechar só a cópia dela, a página, a Doca
+python3 tests/t_sober_accounts_kwin.py              # duas contas com o Sober de verdade ao mesmo tempo, num KWin aninhado
 ```
 
 O `t_screen_portal.py` roda o `xdg-desktop-portal` de verdade dentro do `bwrap`,
@@ -960,6 +1037,16 @@ manifest" dele. Um macro da Doca então acha o botão Close dessa tela pela
 imagem e clica, e o Sober fecha. O Roblox em si precisa de rede, então essa
 parte fica com o `t_sober_kwin.py`. O `t_dock_hidden.py` precisa do
 `es2gears_wayland` (mesa-demos) e pula sem ele.
+
+O `t_sober_accounts.py` roda o `flock`, o `pasta` e o `unshare` de verdade em
+volta de um Sober falso que segura a porta do 127.0.0.1 em cada rede, com
+`flatpak`, `systemctl` e `systemd-run` falsos na frente do PATH. Ele se recusa
+a abrir na rede do seu computador, então nunca encontra o seu Sober. O
+`t_sober_accounts_kwin.py` abre três contas com o Sober de verdade no KWin
+aninhado, cada uma pelo `pasta` com internet e sem login (os APKs do Roblox e
+a versão são copiados do seu, como acima), na menor prioridade de CPU, e
+confere antes de fechar qualquer coisa que ela é do teste. Sem o `pasta` o
+primeiro pula as partes que abrem um Sober, e o segundo pula.
 
 Rode com `QT_QPA_PLATFORM=offscreen`. Os outros precisam do compositor; rode a
 partir da raiz do projeto:
@@ -1005,7 +1092,8 @@ processo termina. As imagens dos passos de imagem ficam em
 `~/.config/wayclick/screen-token`. A tela só é compartilhada enquanto um macro
 precisa dela, e nenhum quadro sai da máquina, a não ser que um passo poste um
 print no webhook que você deu a ele. As imagens de arquivos `.wayclick`
-importados vão para a mesma pasta de imagens.
+importados vão para a mesma pasta de imagens. As Contas do Sober ficam em
+`~/.local/share/wayclick/sober-accounts`, uma pasta para cada.
 
 Use onde automação for permitida. Muito jogo online bane automação de entrada.
 
@@ -1025,8 +1113,8 @@ release — veja [`.github/workflows/release.yml`](.github/workflows/release.yml
 ## Desinstalando
 
 ```bash
-bash uninstall.sh            # mantém suas configurações e a regra de udev
-bash uninstall.sh --purge    # remove essas também
+bash uninstall.sh            # mantém suas configurações, a regra de udev e as Contas do Sober
+bash uninstall.sh --purge    # remove essas também, menos uma Conta do Sober que esteja aberta
 ```
 
 Se instalou por pacote, use o gerenciador (`dnf remove wayclick`,

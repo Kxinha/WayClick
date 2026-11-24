@@ -46,6 +46,7 @@ optdepend = python-numpy: screen steps, find an image or a pixel color
 optdepend = python-gobject: screen steps, the screen capture portal
 optdepend = gst-plugin-pipewire: screen steps, frames from PipeWire
 optdepend = gst-plugins-base: screen steps, videoconvert and appsink
+optdepend = passt: Sober accounts, a network of its own for each
 INFO
 
 # .MTREE: o índice de integridade que o pacman confere na instalação
