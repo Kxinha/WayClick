@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.11.0
+Version:        1.11.1
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -77,6 +77,13 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Tue Nov 24 2026 gabrielmf1998 <noreply@github.com> - 1.11.1-1
+- Each Sober account gets a time namespace of its own. Sober locks parts
+  of /proc/self/ns/time, and an account sharing it with the usual Sober
+  stopped 1 to 3 minutes after opening at status != SL_RESULT_SUCCESS
+- The Sober accounts page says when an account is up, when it closes by
+  itself, and why Sober stopped, from the FATAL line of its log
+
 * Tue Nov 24 2026 gabrielmf1998 <noreply@github.com> - 1.11.0-1
 - Sober accounts: more copies of Sober next to the usual one, each with
   its own Roblox sign-in, settings and a network of its own through pasta,

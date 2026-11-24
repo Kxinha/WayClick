@@ -1,5 +1,7 @@
 """As contas do Sober com o Sober de verdade, numa caixa (kwin_nested.py):
-duas contas abertas juntas, cada uma na rede e na pasta dela, fechar uma sem
+duas contas abertas juntas, cada uma na rede, no namespace de tempo e na
+pasta dela, e as duas juntas por WCTEST_SOAK segundos (240; sem o namespace
+de tempo a segunda caía em 1 a 3 minutos), fechar uma sem
 a outra, um segundo Sober dentro da conta aberta (que para em "An instance
 of Sober is already running": o Sober só recebe um link ao abrir, e por isso
 a Doca não manda link para uma conta aberta) e uma conta vazia, que mostra a
@@ -31,6 +33,11 @@ import wayclick as a              # noqa: E402
 
 APP = a.SOBER_APP
 HOSTNET = os.readlink("/proc/self/ns/net")
+HOSTTIME = os.readlink("/proc/self/ns/time")
+HOSTTIME_LOCK = "00:07:" + HOSTTIME[len("time:["):-1]
+# quanto tempo as duas contas ficam abertas juntas: sem um namespace de
+# tempo próprio, a segunda caía entre 1 e 3 minutos (SL_RESULT_SUCCESS)
+SOAK_S = int(os.environ.get("WCTEST_SOAK", "240"))
 LINK = "roblox://placeId=1818"
 R = []
 
@@ -47,6 +54,38 @@ def read(path):
             return fh.read().decode("utf-8", "replace")
     except OSError:
         return ""
+
+
+def scope_procs(pid):
+    """Os processos do escopo (cgroup) de `pid`."""
+    try:
+        with open(f"/proc/{pid}/cgroup") as fh:
+            cg = fh.read().strip().split(":", 2)[-1]
+        with open(f"/sys/fs/cgroup{cg}/cgroup.procs") as fh:
+            return [int(x) for x in fh.read().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def time_ns(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/ns/time")
+    except OSError:
+        return ""
+
+
+def locks_of(pids):
+    """As travas do /proc/locks desses processos: [dispositivo:inode]."""
+    pids = {str(p) for p in pids}
+    out = []
+    with open("/proc/locks") as fh:
+        for line in fh:
+            parts = line.split()
+            if "->" in parts:
+                continue
+            if len(parts) >= 6 and parts[4] in pids:
+                out.append(parts[5])
+    return out
 
 
 def files_in(path):
@@ -231,6 +270,42 @@ def main():
                   S.user_instances() == before_user
                   and not ({x[0] for x in (ia, ib) if x}
                            & S.user_instances()))
+
+            # ------------------- o namespace de tempo, e as duas juntas --
+            procs = {k: scope_procs(v[1]) for k, v in (("A", ia), ("B", ib))
+                     if v}
+            tns = {k: sorted({time_ns(q) for q in v} - {""})
+                   for k, v in procs.items()}
+            check("each account has a time namespace of its own, neither "
+                  "the computer's",
+                  len(tns) == 2 and all(len(v) == 1 for v in tns.values())
+                  and tns["A"] != tns["B"]
+                  and HOSTTIME not in tns["A"] + tns["B"], json.dumps(tns))
+            t_soak = time.monotonic()
+            end = t_soak + SOAK_S
+            dead = ""
+            while time.monotonic() < end and not dead:
+                for acc in (A, B):
+                    if acc.proc.poll() is not None or not acc.running():
+                        dead = f"{acc.name} closed"
+                    elif "SL_RESULT_SUCCESS" in acc.log_tail(1 << 16):
+                        dead = f"{acc.name}: SL_RESULT_SUCCESS"
+                time.sleep(2)
+            lk = {k: locks_of(v) for k, v in procs.items()}
+            own = {k: [x for x in v if x.startswith("00:07:")]
+                   for k, v in lk.items()}
+            # o Sober trava aos poucos (uma por objeto de áudio, parece):
+            # basta uma das duas já ter travado, e nenhuma no de sempre
+            check("their locks on /proc/self/ns/time are on their own "
+                  "namespaces, never the one of the usual Sober",
+                  any(own.values())
+                  and not any(HOSTTIME_LOCK in v for v in lk.values()),
+                  json.dumps({k: sorted(set(v)) + [len(v)]
+                              for k, v in own.items()}))
+            check(f"both stay open together for {SOAK_S} s",
+                  not dead and A.running() and B.running(),
+                  (dead or "ok") + f" after "
+                  f"{time.monotonic() - t_soak:.0f} s")
 
             # ------------------- um segundo Sober dentro da B aberta --
             # o que a Doca não faz: entrar na rede e na pasta da B e abrir

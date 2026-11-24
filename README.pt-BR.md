@@ -69,7 +69,7 @@ compositor e sem nada rodando como root.
 | Bindings Qt | PySide6 (`QtMultimedia` é opcional — só para os bipes) |
 | Permissões | seu usuário no grupo `input`, e `/dev/uinput` gravável por ele |
 | Passos de tela (opcional) | numpy, PyGObject e GStreamer com o plugin do PipeWire, mais o portal do desktop (`xdg-desktop-portal-kde` no Plasma) |
-| Contas do Sober (opcional) | Sober do Flathub, `pasta` do pacote `passt`, util-linux 2.38 ou mais novo, e namespaces de usuário ligados para usuários comuns |
+| Contas do Sober (opcional) | Sober do Flathub, `pasta` do pacote `passt`, util-linux 2.38 ou mais novo, Linux 5.6 ou mais novo, e namespaces de usuário ligados para usuários comuns |
 
 ## Instalação
 
@@ -639,16 +639,23 @@ Como funciona. Cada conta roda o Sober numa rede só dela, feita pelo
 nenhuma porta é repassada para dentro ou para fora. Lá dentro a pasta da
 conta (`~/.local/share/wayclick/sober-accounts/<id>/app`) é montada sobre
 `~/.var/app/org.vinegarhq.Sober` só para aquela cópia, e o `unshare` devolve
-o seu próprio usuário ao Sober antes de o `flatpak run` abrir ele como
-sempre. O seu Sober de sempre, a pasta dele e o escopo dele nunca são
+o seu próprio usuário ao Sober, mais um namespace de tempo só dele com os
+mesmos relógios, antes de o `flatpak run` abrir ele como sempre. O Sober
+trava trechos do `/proc/self/ns/time` (depois de um tempo aparecem umas cem
+travas no `/proc/locks`), e uma conta que dividia esse namespace com o seu
+Sober de sempre parava de 1 a 3 minutos depois de abrir em "status !=
+SL_RESULT_SUCCESS", a mesma queda que o RAM-Linux lista, onde
+[uma issue](https://github.com/broreirik/RAM-Linux/issues/1) propõe a mesma
+correção. O seu Sober de sempre, a pasta dele e o escopo dele nunca são
 tocados. Uma trava na pasta da conta diz se ela está aberta, e a rede anotada
 ao abrir é como o WayClick acha aquela cópia no `flatpak ps` para fechar,
 nunca a que está na rede do seu computador.
 
 Isso foi medido com o Sober de verdade num KWin aninhado
 (`tests/t_sober_accounts_kwin.py`). Duas contas chegaram ao Roblox com poucos
-segundos de diferença e ficaram abertas lado a lado, cada uma numa rede só
-dela, com o Sober gravando só na pasta da conta. Fechar uma deixou a outra
+segundos de diferença e ficaram abertas lado a lado por 4 minutos, cada uma
+numa rede e num namespace de tempo só dela, com o Sober gravando só na pasta
+da conta e travando no namespace dela. Fechar uma deixou a outra
 aberta, uma conta vazia abriu na primeira tela do Sober, e o Sober do
 computador que rodou o teste não foi tocado.
 
@@ -660,8 +667,13 @@ Limites
 - o Sober só recebe um link `roblox://` ao abrir, então um link para uma
   conta que já está aberta não é aberto (medido, um segundo Sober na mesma
   conta para em "An instance of Sober is already running");
-- precisa do `pasta` e do util-linux 2.38 ou mais novo, e um Sober futuro
-  pode trazer verificações que isso não passa.
+- precisa do `pasta`, do util-linux 2.38 ou mais novo e do Linux 5.6 ou
+  mais novo (namespaces de tempo), e um Sober futuro pode trazer
+  verificações que isso não passa.
+
+Quando o Sober de uma conta para, a página diz o porquê em vermelho, pela
+linha `FATAL` do log dele (`launch.log` na pasta da conta), e o Sober deixa a
+janela de erro dele aberta até você fechar.
 
 A equipe do Roblox já chamou rodar mais de um cliente de exploit, dizendo
 que hoje isso não é banido, mas que pode mudar

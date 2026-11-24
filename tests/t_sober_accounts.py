@@ -33,6 +33,7 @@ CALLS = os.path.join(TMP, "calls.log")
 PS = os.path.join(TMP, "ps.txt")
 TARGET = os.path.join(HOME, ".var", "app", "org.vinegarhq.Sober")
 HOSTNET = os.readlink("/proc/self/ns/net")
+HOSTTIME = os.readlink("/proc/self/ns/time")
 SOBER = ["flatpak", "run", "org.vinegarhq.Sober"]
 os.environ.update({
     "HOME": HOME,
@@ -107,7 +108,8 @@ if port:
     t.close()
 signal.signal(signal.SIGTERM, lambda *_a: sys.exit(0))
 report = {"pid": os.getpid(), "uid": os.getuid(), "gid": os.getgid(),
-          "net": net, "resolv": read("/etc/resolv.conf"),
+          "net": net, "time": os.readlink("/proc/self/ns/time"),
+          "resolv": read("/etc/resolv.conf"),
           "resolv_real": os.path.realpath("/etc/resolv.conf"),
           "wayland": os.environ.get("WAYLAND_DISPLAY"), "url": url,
           "token": os.environ.get("XDG_ACTIVATION_TOKEN"),
@@ -393,6 +395,12 @@ if rep is not None:
           f"54587 on the computer: {'taken' if taken else 'free'}")
     check("the loopback ports of the computer are not reachable from it",
           rep["host_port_reachable"] is False)
+    # o Sober trava trechos do /proc/self/ns/time: com o namespace de tempo
+    # do Sober de sempre, o da conta caía em SL_RESULT_SUCCESS
+    check("and a time namespace of its own, so its locks on "
+          "/proc/self/ns/time never meet those of the usual Sober",
+          rep["time"] != HOSTTIME and rep["time"].startswith("time:["),
+          f"{rep['time']} vs {HOSTTIME}")
     check("it runs as the real user", rep["uid"] == os.getuid()
           and rep["gid"] == os.getgid())
     check("it sees the account folder where Sober looks",
@@ -531,9 +539,10 @@ if HAVE_PASTA:
           and until(lambda: report("dockie") is not None, 20),
           dockie.log_tail())
     rep2 = report("dockie") or {}
-    check("on the Dock socket, in the account network",
+    check("on the Dock socket, in the account network and time namespace",
           rep2.get("wayland") == a.DOCK_SOCKET
-          and rep2.get("net") not in (None, HOSTNET), str(rep2))
+          and rep2.get("net") not in (None, HOSTNET)
+          and rep2.get("time") not in (None, HOSTTIME), str(rep2))
     check("and the Dock knows it opened it", dock.account_here(dockie))
     dock.note = ""
     check("Start the game again says it is open in the Dock",
@@ -685,6 +694,29 @@ if HAVE_PASTA:
     check("as the page opens it: in the account network, without the "
           "activation token of WayClick",
           rep3["net"] != HOSTNET and rep3["token"] is None, str(rep3))
+
+    def log_more(text):
+        with open(acc.log_path(), "a") as fh:
+            fh.write(text)
+
+    log_more('info: app_interface$json: {"type":"did_handle_app_startup"}\n')
+    page.refresh()
+    check("once Roblox is up, Opening… becomes open",
+          page.status.text() == "Best friend is open.", page.status.text())
+    # o que o Sober da conta fazia antes do namespace de tempo: para, e
+    # fica aberto com a janela de erro dele
+    log_more("FATAL: application called abort: status != "
+             "SL_RESULT_SUCCESS\nFATAL: Crash: Previous error is fatal, "
+             "trying to show GUI error dialog...\nFATAL: Crash: Aborting..."
+             "\n")
+    page.refresh()
+    stopped, red = page.status.text(), page.status.styleSheet()
+    page._say("")
+    page.refresh()
+    check("a Sober that stops says so, in red, once",
+          stopped == "Sober stopped in Best friend: application called "
+          "abort: status != SL_RESULT_SUCCESS"
+          and "color:#d04030" in red and page.status.text() == "", stopped)
     set_ps(("page", rep3["pid"]), ("usual", user.pid))
     states.clear()
     shut = page.close_selected()
@@ -696,6 +728,17 @@ if HAVE_PASTA:
           until(lambda: acc.id not in page.open_ids
                 and page.status.text() == "Best friend is closed.", 15)
           and page.list.item(0).text() == "Best friend" and states,
+          page.status.text())
+
+    with open(os.path.join(acc.data(), "who"), "w") as fh:
+        fh.write("page2")
+    check("open once more", page.open_selected()
+          and until(lambda: report("page2") is not None, 20)
+          and until(lambda: acc.id in page.open_ids, 5), acc.log_tail())
+    os.kill(report("page2")["pid"], signal.SIGTERM)
+    check("an account that closes by itself (its window) shows closed",
+          until(lambda: acc.id not in page.open_ids
+                and page.status.text() == "Best friend is closed.", 15),
           page.status.text())
 
     class Done:

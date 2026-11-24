@@ -68,7 +68,7 @@ running as root.
 | Qt bindings | PySide6 (`QtMultimedia` optional — only for the beeps) |
 | Permissions | your user in the `input` group, and `/dev/uinput` writable by it |
 | Screen steps (optional) | numpy, PyGObject and GStreamer with its PipeWire plugin, plus the desktop portal (`xdg-desktop-portal-kde` on Plasma) |
-| Sober accounts (optional) | Sober from Flathub, `pasta` from the `passt` package, util-linux 2.38 or newer, and user namespaces turned on for users |
+| Sober accounts (optional) | Sober from Flathub, `pasta` from the `passt` package, util-linux 2.38 or newer, Linux 5.6 or newer, and user namespaces turned on for users |
 
 ## Install
 
@@ -631,7 +631,14 @@ How it works. Each account runs Sober in a network of its own, made by
 port is forwarded in or out. In there the account folder
 (`~/.local/share/wayclick/sober-accounts/<id>/app`) is mounted over
 `~/.var/app/org.vinegarhq.Sober` for that copy only, and `unshare` gives
-Sober back your own user before `flatpak run` starts it as usual. Your usual
+Sober back your own user, plus a time namespace of its own with the same
+clocks, before `flatpak run` starts it as usual. Sober locks parts of
+`/proc/self/ns/time` (about a hundred locks show in `/proc/locks` after a
+while), and an account sharing that namespace with your usual Sober stopped
+1 to 3 minutes after opening at "status != SL_RESULT_SUCCESS", the crash
+RAM-Linux lists too, where
+[an issue](https://github.com/broreirik/RAM-Linux/issues/1) proposes the
+same fix. Your usual
 Sober, its folder and its scope are never touched. A lock in the account
 folder tells whether it is open, and the network written down at start is how
 WayClick finds that copy in `flatpak ps` to close it, never the one in the
@@ -639,8 +646,9 @@ network of your computer.
 
 This was measured with the real Sober in a nested KWin
 (`tests/t_sober_accounts_kwin.py`). Two accounts reached Roblox a few seconds
-apart and stayed open side by side, each in a network of its own, with Sober
-writing only into the account folder. Closing one left the other open, an
+apart and stayed open side by side for 4 minutes, each in a network and a
+time namespace of its own, with Sober writing only into the account folder
+and taking its locks on its own namespace. Closing one left the other open, an
 empty account opened at the first screen of Sober, and the Sober of the
 computer running the test was not touched.
 
@@ -652,8 +660,12 @@ Limits
 - Sober takes a `roblox://` link only when it opens, so a link for an account
   that is already open is not opened (measured, a second Sober in the same
   account stops at "An instance of Sober is already running");
-- it needs `pasta` and util-linux 2.38 or newer, and a later Sober may add
-  checks that this does not get past.
+- it needs `pasta`, util-linux 2.38 or newer and Linux 5.6 or newer (time
+  namespaces), and a later Sober may add checks that this does not get past.
+
+When the Sober of an account stops, the page says why in red, from the
+`FATAL` line of its log (`launch.log` in the account folder), and Sober keeps
+its error window open until you close it.
 
 Roblox staff have called running more than one client an exploit while
 saying it is not banned today, though that may change

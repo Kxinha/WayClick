@@ -37,7 +37,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -7075,6 +7075,11 @@ SOBER_BUSY = 75               # o flock sai com isto: a conta já está aberta
 # verdade. O arquivo "run" guarda o pid que vira o flatpak e a rede dele.
 # Sem "$$" nem "${": o systemd-run do escopo troca "$$" por "$" e expande
 # "${X}" nos argumentos (o pid sai do /proc/self/stat do próprio sh).
+# O unshare também dá ao Sober um namespace de tempo dele (os relógios ficam
+# iguais, sem deslocamento): o Sober trava trechos do /proc/self/ns/time (no
+# /proc/locks, umas cem travas READ em 00:07:<inode do namespace de tempo>),
+# e com o mesmo namespace do Sober de sempre o da conta parava entre 1 e 3
+# minutos depois de abrir em "status != SL_RESULT_SUCCESS" (o áudio dele).
 SOBER_INNER = r'''set -e
 data=$1; target=$2; resolv=$3; run=$4; uid=$5; gid=$6; shift 6
 real=$(readlink -f /etc/resolv.conf) || real=/etc/resolv.conf
@@ -7084,7 +7089,7 @@ mount --bind "$data" "$target"
 read -r pid rest < /proc/self/stat
 printf '%s\n%s\n' "$pid" "$(readlink /proc/self/ns/net)" > "$run.tmp"
 mv -f "$run.tmp" "$run"
-exec unshare --user --map-user="$uid" --map-group="$gid" -- "$@"
+exec unshare --user --time --map-user="$uid" --map-group="$gid" -- "$@"
 '''
 SOBER_TWICE_ACCOUNT = ("{name} is already open outside the Dock. Close it, "
                        "then press Start the game.")
@@ -7213,6 +7218,8 @@ def sober_tools_missing():
     if not userns_allowed():
         return _("Sober accounts need user namespaces, and this system "
                  "turns them off for users.")
+    if not os.path.exists("/proc/self/ns/time"):
+        return _("Sober accounts need time namespaces (Linux 5.6 or newer).")
     return ""
 
 
@@ -9970,6 +9977,9 @@ TRANSLATIONS = {
         "Sober accounts need util-linux 2.38 or newer (unshare --map-user).":
             "As contas do Sober precisam do util-linux 2.38 ou mais novo "
             "(unshare --map-user).",
+        "Sober accounts need time namespaces (Linux 5.6 or newer).":
+            "As contas do Sober precisam de namespaces de tempo (Linux 5.6 "
+            "ou mais novo).",
         "Sober accounts need user namespaces, and this system turns them "
         "off for users.":
             "As contas do Sober precisam de namespaces de usuário, e este "
@@ -10000,6 +10010,8 @@ TRANSLATIONS = {
             "O Sober não abriu em {name}: {why}",
         "exit code {n}": "código de saída {n}",
         "{name} is closed.": "{name} foi fechada.",
+        "{name} is open.": "{name} está aberta.",
+        "Sober stopped in {name}: {why}": "O Sober parou em {name}: {why}",
         "{name} did not close. Close its window.":
             "{name} não fechou. Feche a janela dela.",
         "Account {n}": "Conta {n}",
@@ -14539,6 +14551,8 @@ class SoberPage(QWidget):
         self.home = None
         self.open_ids = set()            # as abertas na última olhada
         self._closing = {}               # id -> quando mandou fechar
+        self._opening = None             # a conta do "Abrindo…" na tela
+        self._fatal = {}                 # id -> o FATAL já mostrado
         self.hint = QLabel()
         self.hint.setWordWrap(True)
         self.hint.setEnabled(False)
@@ -14629,6 +14643,17 @@ class SoberPage(QWidget):
         self.b_close.setEnabled(acc is not None and is_open
                                 and acc.id not in self._closing)
 
+    @staticmethod
+    def _fatal_of(acc):
+        """A primeira linha FATAL do Sober desta abertura (o launch.log é
+        recriado a cada uma), ou "". Ele fica aberto com a janela de erro
+        depois dela."""
+        for line in acc.log_tail(1 << 14).splitlines():
+            if line.startswith("FATAL:") and "Previous error" not in line \
+                    and "Aborting" not in line:
+                return line[len("FATAL:"):].strip()[:200]
+        return ""
+
     def refresh(self):
         """Olha a trava de cada conta e acompanha o que mudou."""
         now = time.monotonic()
@@ -14636,6 +14661,25 @@ class SoberPage(QWidget):
         for acc in self.accounts:
             if acc.running():
                 opened.add(acc.id)
+            was_open = acc.id in self.open_ids
+            if acc.id in opened or was_open:
+                fatal = self._fatal_of(acc)
+                if fatal and self._fatal.get(acc.id) != (acc.started, fatal):
+                    self._fatal[acc.id] = (acc.started, fatal)
+                    self._opening = None
+                    self._say(_("Sober stopped in {name}: {why}",
+                                name=acc.name, why=fatal), True)
+                elif self._opening == acc.id and any(
+                        k in acc.log_tail(1 << 16) for k in (
+                            "did_handle_app_startup",
+                            "starting onboarding flow")):
+                    self._opening = None
+                    self._say(_("{name} is open.", name=acc.name))
+                if was_open and acc.id not in opened and not fatal \
+                        and acc.id not in self._closing:
+                    # fechou sozinha (a janela do Sober, ou fora daqui)
+                    self._opening = None
+                    self._say(_("{name} is closed.", name=acc.name))
             p = acc.proc
             if p is not None and p.poll() is not None and acc.id not in opened:
                 acc.proc = None
@@ -14767,6 +14811,8 @@ class SoberPage(QWidget):
             return False
         self._say(_("Opening {name}… its Sober window shows up in a few "
                     "seconds.", name=acc.name))
+        self._opening = acc.id
+        self._fatal.pop(acc.id, None)
         QTimer.singleShot(300, self.refresh)
         return True
 
