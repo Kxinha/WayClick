@@ -37,7 +37,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.11.1"
+VERSION = "1.12.0"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -1468,6 +1468,45 @@ class HotkeyWatcher(QObject):
         self.hub.remove(self)
 
 
+class SuspendWatcher(HotkeyWatcher):
+    """O Suspend do AutoHotkey (F7::Suspend): uma tecla, com ou sem
+    modificadores, que liga e desliga os macros de atalho. Vale mesmo com os
+    macros desligados (é ela que liga de volta) e some para o jogo."""
+
+    def __init__(self, keycode=0, mods=(), hub=None):
+        super().__init__(keycode, block=True, hub=hub)
+        self.mods = frozenset(mods)
+        self._down = False
+
+    def set_key(self, keycode, mods=()):
+        self.mods = frozenset(mods)
+        self._down = False
+        super().set_key(keycode)
+
+    def matches(self, code):
+        """A tecla e os modificadores de agora são os do Suspend. Roda na
+        thread do hub."""
+        return bool(self._on and self.keycode and code == self.keycode
+                    and self.mods <= self.hub.mods_active())
+
+    def wants_grab(self, d):
+        return self._on and bool(self.keycode) and d.kbd \
+            and d.has(self.keycode)
+
+    def on_key(self, d, code, value):
+        if not self._on or not self.keycode or code != self.keycode \
+                or not d.kbd:
+            return False
+        if value == 1:
+            if CAPTURE.is_set() or not self.mods <= self.hub.mods_active():
+                return False
+            self._down = True
+            self.pressed.emit()
+            return True
+        if value == 0:
+            was, self._down = self._down, False
+            return was
+        return self._down                # repetição automática do aperto
 
 
 # --------------------------------------------------- segurar o botão --------
@@ -1874,6 +1913,38 @@ def pixel_at(frames, x, y):
         p = f.to_pixel(x + 0.5, y + 0.5)
         if p:
             return tuple(int(c) for c in f.rgb[p[1], p[0]])
+    return None
+
+
+def pixel_search(frames, region, rgb, tol, cols=False, rtl=False,
+                 btt=False):
+    """A cor em algum ponto de region (lógico), como o PixelSearch do
+    AutoHotkey: o centro lógico do primeiro ponto achado, ou None. A ordem
+    é a dele, linha por linha (cols: coluna por coluna, o modo padrão do
+    v1), da direita para a esquerda com rtl e de baixo para cima com btt."""
+    np = _numpy()
+    want = np.array(rgb, np.int16)
+    for f in frames:
+        sub, ox, oy = f.crop(region)
+        if sub is None:
+            continue
+        mask = np.abs(sub.astype(np.int16) - want).max(axis=2) <= tol
+        if not mask.any():
+            continue
+        if rtl:
+            mask = mask[:, ::-1]
+        if btt:
+            mask = mask[::-1]
+        h, w = mask.shape
+        if cols:
+            px, py = divmod(int(np.flatnonzero(mask.T)[0]), h)
+        else:
+            py, px = divmod(int(np.flatnonzero(mask)[0]), w)
+        if rtl:
+            px = w - 1 - px
+        if btt:
+            py = h - 1 - py
+        return f.to_global(ox + px + 0.5, oy + py + 0.5)
     return None
 
 
@@ -2449,6 +2520,15 @@ WATCH_KINDS = ("image", "pixel", "window")
 WINDOW_ACTS = ("check", "focus")
 FLOWS = ("next", "stop", "restart", "jump")
 COORD = 100000                   # |x|, |y| máximos de uma posição na tela
+
+
+def _whole_screen(region):
+    """Uma área que cobre qualquer tela: o "0, 0, A_ScreenWidth,
+    A_ScreenHeight" de um .ahk vira isso."""
+    return bool(region) and region[0] <= 0 and region[1] <= 0 \
+        and region[2] >= COORD and region[3] >= COORD
+
+
 MAX_MACROS = 50
 MAX_STEPS = 2000
 MAX_RUNS = 1000000               # "parar depois de N" e "a cada N"
@@ -2626,10 +2706,21 @@ def _sight(kind, s):
         color = parse_color(s.get("color"))
         if color is None:
             return None
-        return {"x": _num(s.get("x"), 0, -COORD, COORD, int),
-                "y": _num(s.get("y"), 0, -COORD, COORD, int),
-                "color": color_hex(color),
-                "tol": _num(s.get("tol", 16), 16, 0, 255, int)}
+        out = {"x": _num(s.get("x"), 0, -COORD, COORD, int),
+               "y": _num(s.get("y"), 0, -COORD, COORD, int),
+               "color": color_hex(color),
+               "tol": _num(s.get("tol", 16), 16, 0, 255, int)}
+        # com uma área, procura a cor nela toda (o PixelSearch); a ordem da
+        # busca só existe para o que veio de um .ahk
+        region = _rect(s.get("region"))
+        if region:
+            out["region"] = region
+            if s.get("scan") == "cols":
+                out["scan"] = "cols"
+            for key in ("rtl", "btt"):
+                if s.get(key) is True:
+                    out[key] = True
+        return out
     match = " ".join(str(s.get("match") or "").split())[:100]
     return {"match": match} if match else None
 
@@ -2743,6 +2834,16 @@ def step_label(s):
             name = image_name(s["path"])
             text = (_("Find “{img}”", img=name) if seen else
                     _("Wait until “{img}” is gone", img=name))
+        elif op == "pixel" and _whole_screen(s.get("region")):
+            text = (_("Find {color} anywhere on the screen", color=s["color"])
+                    if seen else
+                    _("No {color} anywhere on the screen", color=s["color"]))
+        elif op == "pixel" and s.get("region"):
+            x, y, w, h = s["region"]
+            text = (_("Find {color} in {w}×{h} at {x}, {y}", color=s["color"],
+                      w=w, h=h, x=x, y=y) if seen else
+                    _("No {color} in {w}×{h} at {x}, {y}", color=s["color"],
+                      w=w, h=h, x=x, y=y))
         elif op == "pixel":
             where = f"{s['x']}, {s['y']}"
             text = (_("Pixel {at} is {color}", at=where, color=s["color"])
@@ -2772,6 +2873,17 @@ def step_label(s):
             name = image_name(s["path"])
             text = (_("Watch for “{img}”", img=name) if seen else
                     _("Watch for “{img}” to go away", img=name))
+        elif kind == "pixel" and _whole_screen(s.get("region")):
+            text = (_("Watch for {color} anywhere on the screen",
+                      color=s["color"]) if seen else
+                    _("Watch for {color} to go away from the screen",
+                      color=s["color"]))
+        elif kind == "pixel" and s.get("region"):
+            x, y, w, h = s["region"]
+            text = (_("Watch for {color} in {w}×{h} at {x}, {y}",
+                      color=s["color"], w=w, h=h, x=x, y=y) if seen else
+                    _("Watch for {color} to go away from {w}×{h} at {x}, {y}",
+                      color=s["color"], w=w, h=h, x=x, y=y))
         elif kind == "pixel":
             where = f"{s['x']}, {s['y']}"
             text = (_("Watch pixel {at} for {color}", at=where,
@@ -3067,6 +3179,10 @@ class MacroRunner(threading.Thread):
                                     path=st["path"]))
             hit = locate(frames, tpl, st["conf"], st.get("region"))
             return hit[:2] if hit else None
+        if st.get("region"):
+            return pixel_search(frames, st["region"], parse_color(st["color"]),
+                                st["tol"], st.get("scan") == "cols",
+                                bool(st.get("rtl")), bool(st.get("btt")))
         if color_close(pixel_at(frames, st["x"], st["y"]),
                        parse_color(st["color"]), st["tol"]):
             return (st["x"], st["y"])
@@ -3414,6 +3530,10 @@ class MacroEngine(QObject):
         self.runners = {}
         self.held = {}
         self.mice = None
+        # (código) -> bool: é a tecla do Suspend agora. Ela é do Suspend, e um
+        # macro com a mesma tecla não roda junto (se rodasse, desligar os
+        # macros ligaria esse no mesmo aperto)
+        self.exempt = None
         self.hub.add(self)
 
     def configure(self, macros, active):
@@ -3452,7 +3572,7 @@ class MacroEngine(QObject):
         if not self.active:
             return False
         ms = self.by_code.get(code)
-        if not ms:
+        if not ms or (self.exempt and self.exempt(code)):
             return False
         mods = self.hub.mods_active()
         return any(m.mods <= mods for m in ms)
@@ -3480,7 +3600,7 @@ class MacroEngine(QObject):
         if not ms:
             return False
         if value == 1:
-            if CAPTURE.is_set():
+            if CAPTURE.is_set() or (self.exempt and self.exempt(code)):
                 return False
             mods = self.hub.mods_active()
             hit = [m for m in ms if m.mods <= mods]
@@ -4255,10 +4375,16 @@ class AhkImport:
     """Resultado da importação: `macros` (normalizados) e `notes`, cada nota
     um (linha, texto-fonte, campos), traduzida só na hora de mostrar."""
 
-    def __init__(self, text):
+    def __init__(self, text, folder=None):
         self.toks = _ahk_tokens(text)
+        self.folder = folder            # onde o .ahk está (A_ScriptDir)
         self.notes = []
         self.macros = []
+        self.suspend = None             # (código, mods, atalho) do F7::Suspend
+        self.v2 = bool(re.search(r"^\s*#Requires\s+AutoHotkey\s+v?2", text,
+                                 re.I | re.M))
+        self._label_n = 0
+        self._conf_noted = False
         self.labels, self.funcs = {}, {}
         self.hotkeys = []       # (linha, spec, corpo | None, remap)
         self.auto = []
@@ -4270,6 +4396,10 @@ class AhkImport:
         # a não ser com CoordMode Mouse, Screen
         self.screen_coords = bool(re.search(
             r"^\s*CoordMode\b[\s,(]*[\"']?Mouse[\"']?\s*,\s*[\"']?Screen",
+            text, re.I | re.M))
+        # o mesmo para PixelGetColor, PixelSearch e ImageSearch
+        self.pixel_screen = bool(re.search(
+            r"^\s*CoordMode\b[\s,(]*[\"']?Pixel[\"']?\s*,\s*[\"']?Screen",
             text, re.I | re.M))
         try:
             self._parse_top()
@@ -4469,6 +4599,18 @@ class AhkImport:
                          r"(?:,\s*[\"']?(\w*)[\"']?)?\s*\)", e, re.I)
         if m:
             return ("key", m.group(1).strip(), neg)
+        # v2: if ImageSearch(&x, &y, ...) e if PixelSearch(...)
+        m = re.fullmatch(r"(PixelSearch|ImageSearch)\s*\((.*)\)", e, re.I)
+        if m:
+            return ("scall", m.group(1).lower(), _split_args(m.group(2)),
+                    not neg, expr.strip())
+        # v2: if PixelGetColor(x, y) = 0xFF0000
+        m = re.fullmatch(r"PixelGetColor\s*\((.*)\)\s*(=|==|!=|<>)\s*(.+)",
+                         e, re.I)
+        if m:
+            want = m.group(2) in ("=", "==")
+            return ("pgc", _split_args(m.group(1)), want != neg,
+                    _unquote(m.group(3)), expr.strip())
         if re.fullmatch(r"(?i:true|1)", e):
             return ("const", not neg)
         if re.fullmatch(r"(?i:false|0)", e):
@@ -4489,6 +4631,7 @@ class AhkImport:
                 return ("var", var, want)
             if val in ("0", "false"):
                 return ("var", var, not want)
+            return ("cmp", var, want, val, expr.strip())
         return ("unknown", expr.strip())
 
     def _cmd(self, ln, t):
@@ -4504,8 +4647,14 @@ class AhkImport:
             r = re.fullmatch(r"Random\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)", val, re.I)
             if r:
                 return ("random", var, int(r.group(1)), int(r.group(2)))
+            r = re.fullmatch(r"(PixelGetColor|PixelSearch|ImageSearch)\s*"
+                             r"\((.*)\)", val, re.I)
+            if r:
+                return ("screen", var, r.group(1).lower(),
+                        _split_args(r.group(2)), True)
             return ("assign", var, val)
         m = re.fullmatch(r"([A-Za-z_]\w*)\s*\((.*)\)", t)
+        called = bool(m)
         if m:
             name, args = m.group(1), _split_args(m.group(2))
         else:
@@ -4557,6 +4706,15 @@ class AhkImport:
             return ("keywait", _unquote(args[0]) if args else "")
         if low == "mousemove":
             return ("move", args)
+        if low in ("pixelgetcolor", "pixelsearch", "imagesearch"):
+            v2 = called or self.v2 or any(a.strip().startswith("&")
+                                          for a in args)
+            if low == "pixelgetcolor":
+                if v2:                  # o v2 devolve a cor; sozinho é nada
+                    return ("ignore", name)
+                return ("screen", _unquote(args[0]).lower() if args else "",
+                        low, args[1:], False)
+            return ("screen", None, low, args, v2)
         if low in ("tooltip", "traytip", "soundbeep", "soundplay", "msgbox",
                    "setbatchlines", "setworkingdir", "setmousedelay",
                    "coordmode", "settitlematchmode", "detecthiddenwindows",
@@ -4567,7 +4725,7 @@ class AhkImport:
                    "listlines", "sendlevel"):
             return ("ignore", name)
         if low in ("pause", "suspend", "reload", "exitapp"):
-            return ("control", name)
+            return ("control", name, args)
         if not args and (low in self.labels or low in self.funcs
                          or m and t.endswith(")")):
             return ("call", low)
@@ -4663,9 +4821,40 @@ class AhkImport:
         return {"code": code, "key": label, "mods": sorted(mods),
                 "block": block, "name": ""}
 
+    def _suspend_key(self, ln, spec, hk, nodes):
+        """F7::Suspend vira a tecla do Suspend do WayClick. True quando o
+        atalho era isso (e não vira macro)."""
+        first = next((n for n in nodes if n[0] != "noop"), None)
+        if not first or first[0] != "cmd" or first[1][0] != "control" \
+                or first[1][1].lower() != "suspend":
+            return False
+        args = first[1][2] if len(first[1]) > 2 else []
+        mode = _unquote(args[0]).strip().lower() if args else ""
+        if mode == "permit":
+            return False
+        if is_button(hk["code"]):
+            self.note(ln, "{hk}: a mouse button cannot be the Suspend hotkey "
+                          "here", hk=spec)
+            return True
+        if self.suspend:
+            self.note(ln, "{hk}: the Suspend hotkey is already {key}, this "
+                          "one was left out", hk=spec, key=self.suspend[2])
+            return True
+        if mode in ("on", "1", "true", "off", "0", "false"):
+            self.note(ln, "{hk}: Suspend {mode} became the Suspend hotkey, "
+                          "which switches the macros on and off", hk=spec,
+                      mode=args[0].strip())
+        if len([n for n in nodes if n[0] != "noop"]) > 1:
+            self.note(ln, "{hk}: only Suspend was imported, the rest of it "
+                          "was left out", hk=spec)
+        self.suspend = (hk["code"], hk["mods"], hotkey_label(hk))
+        return True
+
     def _hotkey(self, ln, spec, body, remap):
         hk = self._parse_spec(ln, spec)
         if hk is None:
+            return None
+        if not remap and self._suspend_key(ln, spec, hk, self._flat(body)):
             return None
         base = dict(hk, press_ms=self.press_ms)
         if remap:
@@ -4691,6 +4880,8 @@ class AhkImport:
         if m is None:
             steps = self._steps(nodes, ln)
             m = dict(base, mode="once", repeat=False, steps=steps)
+        if m.get("steps"):
+            m["steps"] = self._resolve(m["steps"])
         if not m.get("steps"):
             self.note(ln, "{hk}: nothing WayClick can do", hk=spec)
             return None
@@ -4718,13 +4909,13 @@ class AhkImport:
         if not body:
             self.note(ln, "SetTimer: {name} was not found", name=label)
             return None
-        steps = self._steps(self._flat(body), ln)
+        steps = self._steps(self._flat(body), ln, ctx={"macro_loop": p > 0})
         if p < 0:
             return {"name": name, "mode": "once", "repeat": False,
-                    "steps": [{"op": "wait", "ms": -p}] + steps,
+                    "steps": self._resolve([{"op": "wait", "ms": -p}] + steps),
                     "press_ms": self.press_ms, "block": True}
         return {"name": name, "mode": "toggle", "repeat": True,
-                "period_ms": float(p), "steps": steps,
+                "period_ms": float(p), "steps": self._resolve(steps),
                 "press_ms": self.press_ms, "block": True}
 
     def _period(self, text, ln):
@@ -4823,7 +5014,7 @@ class AhkImport:
                 reps = max(1, MAX_STEPS // len(one))
                 self.note(loop[3], "Loop {n} shortened to {m} repetitions",
                           n=loop[1], m=reps)
-            steps += one * reps
+            steps += self._times(one, reps)
             steps += self._steps(nodes[idx + 1:], ln)
             return dict(base, mode="once", repeat=False, steps=steps)
         else:
@@ -4846,7 +5037,20 @@ class AhkImport:
         if dropped:
             self.note(ln, "{hk}: what runs before the loop was left out",
                       hk=spec)
-        steps = [s for s in pre if s["op"] == "down"] + self._steps(body, loop[3])
+        steps = [s for s in pre if s["op"] == "down"] + \
+            self._steps(body, loop[3], ctx={"macro_loop": True})
+        waits = [s["ms"] for s in steps if s["op"] == "wait" and s["ms"] > 0]
+        if waits and not base.get("press_ms") and any(
+                s["op"] in ("tap", "text") for s in steps):
+            # o SendInput aperta e solta de uma vez; aqui cada aperto fica
+            # seguro pela menor espera do laço (no máximo 40 ms), para o jogo
+            # ver a tecla sem o laço perder o ritmo do script
+            press = round(min(KeyMacro.HOLD_S * 1000.0, min(waits)), 1)
+            base = dict(base, press_ms=press)
+            self.note(loop[3], "{hk}: each press is held {ms} ms, as long as "
+                               "the shortest wait of the loop, so the game "
+                               "sees it and the loop keeps the script's pace",
+                      hk=spec, ms=_ms(press))
         return dict(base, mode=mode, repeat=True, period_ms=0.0, steps=steps)
 
     def _from_toggle_if(self, ln, base, nodes, flips):
@@ -4867,29 +5071,409 @@ class AhkImport:
         return None
 
     # ------------------------------------------------------- passos --
-    def _steps(self, nodes, ln, depth=0, rand=None):
+    def _steps(self, nodes, ln, depth=0, rand=None, ctx=None):
         rand = {} if rand is None else rand
+        # o que as buscas na tela deixaram: variável -> o que ela olha, e
+        # "errorlevel" -> a última busca do v1
+        ctx = {} if ctx is None else ctx
         out = []
-        for n in nodes:
+        nodes = list(nodes)
+        k = 0
+        while k < len(nodes):
+            n = nodes[k]
+            k += 1
             kind = n[0]
             if kind == "block":
-                out += self._steps(n[1], ln, depth, rand)
+                out += self._steps(n[1], ln, depth, rand, ctx)
             elif kind == "cmd":
-                out += self._cmd_steps(n[1], n[2], depth, rand)
+                out += self._cmd_steps(n[1], n[2], depth, rand, ctx)
             elif kind == "loop" and n[1]:
-                one = self._steps(self._flat([n[2]]), n[3], depth, rand)
+                inner = dict(ctx, macro_loop=False)
+                one = self._steps(self._flat([n[2]]), n[3], depth, rand, inner)
                 reps = min(n[1], max(1, MAX_STEPS // max(1, len(one))))
-                out += one * reps
+                out += self._times(one, reps)
             elif kind == "return":
                 break
-            elif kind in ("if", "while", "loop"):
+            elif kind == "if":
+                got = self._screen_guard(n, nodes[k:], ctx)
+                if got is not None:
+                    got, used = got
+                    k += used
+                else:
+                    got = self._screen_if(n, depth, rand, ctx)
+                if got is None:
+                    self.note(n[-1], "a condition inside the actions was "
+                                     "skipped")
+                else:
+                    out += got
+            elif kind in ("while", "loop"):
                 self.note(n[-1], "a condition inside the actions was skipped")
             if len(out) > MAX_STEPS:
                 return out[:MAX_STEPS]
         return out
 
-    def _cmd_steps(self, c, ln, depth, rand):
+    # ------------------------------------------- buscas na tela ----
+    # PixelGetColor, PixelSearch e ImageSearch viram os passos Cor e Imagem,
+    # e o if que olha o resultado vira o "se acontecer / se não" deles. Os
+    # saltos são marcados com rótulos ("@") enquanto o macro é montado, e
+    # _resolve troca cada um pelo número do passo no fim.
+    def _label(self):
+        self._label_n += 1
+        return self._label_n
+
+    def _times(self, one, reps):
+        """reps cópias dos passos, cada uma com rótulos próprios."""
+        if not any(st.get("op") == "@" for st in one):
+            return one * reps
+        out = []
+        for _r in range(reps):
+            ids = {st["id"]: self._label() for st in one if st.get("op") == "@"}
+            for st in one:
+                st = dict(st)
+                if st.get("op") == "@":
+                    st["id"] = ids[st["id"]]
+                for key in ("ok_to", "fail_to"):
+                    v = st.get(key)
+                    if isinstance(v, tuple) and v[1] in ids:
+                        st[key] = ("@", ids[v[1]])
+                out.append(st)
+        return out
+
+    @staticmethod
+    def _resolve(steps):
+        """Rótulos viram números de passo. Um salto para o fim ganha um
+        passo de espera de 0 ms lá, para ter onde cair."""
+        if not any(isinstance(st.get("ok_to"), tuple) or
+                   isinstance(st.get("fail_to"), tuple) or
+                   st.get("op") == "@" for st in steps):
+            return steps
+        out, at = [], {}
+        for st in steps:
+            if st.get("op") == "@":
+                at[st["id"]] = len(out) + 1
+            else:
+                out.append(dict(st))
+        end = False
+        for st in out:
+            for key in ("ok_to", "fail_to"):
+                v = st.get(key)
+                if isinstance(v, tuple):
+                    to = at.get(v[1], len(out) + 1)
+                    end = end or to > len(out)
+                    st[key] = to
+        if end:
+            out.append({"op": "wait", "ms": 0.0})
+        return out
+
+    @staticmethod
+    def _coord(text):
+        """Uma coordenada: número, ou A_ScreenWidth/A_ScreenHeight (a tela
+        inteira; o recorte para nas bordas)."""
+        t = _unquote(text or "").strip().strip("%").strip()
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", t):
+            return int(float(t))
+        if re.fullmatch(r"(?i:A_Screen(?:Width|Height)|A_VirtualScreen"
+                        r"(?:Width|Height))(?:\s*-\s*\d+)?", t):
+            return COORD
+        return None
+
+    @staticmethod
+    def _color_value(text, bgr):
+        t = _unquote(text or "").strip().strip("%").strip()
+        try:
+            v = int(t, 16) if t.lower().startswith("0x") else int(t)
+        except ValueError:
+            return None
+        if not 0 <= v <= 0xFFFFFF:
+            return None
+        r, g, b = v >> 16, (v >> 8) & 255, v & 255
+        return (b, g, r) if bgr else (r, g, b)
+
+    def _pixel_note(self, ln):
+        if not self.pixel_screen and not getattr(self, "_pix_noted", False):
+            self._pix_noted = True
+            self.note(ln, "positions are used as screen positions; "
+                          "AutoHotkey measured them from the active window "
+                          "(the same for a fullscreen game on the leftmost "
+                          "screen)")
+
+    def _image_path(self, spec, ln):
+        """O arquivo de ImageSearch, sem as opções (*50 *TransBlack...).
+        Devolve (caminho, variação) ou (None, 0)."""
+        t = spec.strip()
+        t = re.sub(r"(?i)%A_ScriptDir%[\\/]?", "", t)
+        t = re.sub(r"(?i)A_ScriptDir\s*\.?\s*", "", t)
+        t = _unquote(t)
+        var, opts = 0, []
+        while True:
+            m = re.match(r"\*(\S+)\s+", t)
+            if not m:
+                break
+            opts.append(m.group(1).lower())
+            t = t[m.end():]
+        for o in opts:
+            if o.isdigit():
+                var = min(255, int(o))
+            elif o.startswith("trans"):
+                self.note(ln, "ImageSearch *Trans: WayClick compares the whole "
+                              "picture, with no see-through color")
+            elif re.fullmatch(r"[wh]-?\d+", o):
+                self.note(ln, "ImageSearch *w/*h: the picture is used at its "
+                              "own size")
+        t = t.strip().strip("\"'").replace("\\", "/")
+        if not t or "%" in t:
+            return None, 0
+        name = t
+        if re.match(r"^[A-Za-z]:/", t) or not os.path.isabs(t):
+            # caminho do Windows ou relativo: o arquivo ao lado do script
+            rel = t.split(":/", 1)[-1] if re.match(r"^[A-Za-z]:/", t) else t
+            cands = [rel, os.path.basename(rel)]
+            path = None
+            if self.folder:
+                for c in cands:
+                    p = os.path.join(self.folder, c)
+                    if os.path.isfile(p):
+                        path = p
+                        break
+                path = path or os.path.join(self.folder,
+                                            os.path.basename(rel))
+            else:
+                path = os.path.basename(rel)
+        else:
+            path = t
+        if not os.path.isfile(path):
+            self.note(ln, "image {file} was not found next to the script; "
+                          "pick it in the step", file=os.path.basename(name))
+        return path, var
+
+    def _sight_of(self, ln, fname, args, v2):
+        """O que um PixelGetColor/PixelSearch/ImageSearch olha, para virar
+        passo: dict com "step" (sem want/fluxos), "outs" (as variáveis da
+        posição achada) e "color" (PixelGetColor: a cor sai depois)."""
+        if fname == "pixelgetcolor":
+            if len(args) < 2:
+                return None
+            x, y = self._coord(args[0]), self._coord(args[1])
+            if x is None or y is None:
+                self.note(ln, "{what}: the position is not a number, skipped",
+                          what="PixelGetColor")
+                return None
+            mode = _unquote(args[2]).lower().split() if len(args) > 2 else []
+            self._pixel_note(ln)
+            return {"kind": "color", "x": x, "y": y,
+                    "bgr": not v2 and "rgb" not in mode}
+        if len(args) < 7:
+            return None
+        outs = tuple(_unquote(a).strip().lstrip("&").strip().lower()
+                     for a in args[:2])
+        rect = [self._coord(a) for a in args[2:6]]
+        what = "PixelSearch" if fname == "pixelsearch" else "ImageSearch"
+        if None in rect:
+            self.note(ln, "{what}: the area is not made of numbers, skipped",
+                      what=what)
+            return None
+        self._pixel_note(ln)
+        x1, y1, x2, y2 = rect
+        region = [min(x1, x2), min(y1, y2), min(COORD, abs(x2 - x1) + 1),
+                  min(COORD, abs(y2 - y1) + 1)]
+        if fname == "pixelsearch":
+            mode = _unquote(args[8]).lower().split() \
+                if len(args) > 8 and not v2 else []
+            color = self._color_value(args[6], not v2 and "rgb" not in mode)
+            if color is None:
+                self.note(ln, "{what}: the color is not a number, skipped",
+                          what=what)
+                return None
+            tol = self._coord(args[7]) if len(args) > 7 and args[7].strip() \
+                else 0
+            step = {"op": "pixel", "x": region[0], "y": region[1],
+                    "color": color_hex(color),
+                    "tol": max(0, min(255, tol or 0)), "region": region}
+            # v1 sem Fast procura coluna por coluna; X1 > X2 e Y1 > Y2
+            # invertem o sentido
+            if not v2 and "fast" not in mode:
+                step["scan"] = "cols"
+            if x1 > x2:
+                step["rtl"] = True
+            if y1 > y2:
+                step["btt"] = True
+            return {"kind": "search", "step": step, "outs": outs,
+                    "center": False}
+        path, var = self._image_path(args[6], ln)
+        if path is None:
+            self.note(ln, "{what}: the image file is not a plain name, "
+                          "skipped", what=what)
+            return None
+        conf = round(max(0.6, 0.95 - var / 255.0 * 0.5), 2)
+        if not self._conf_noted:
+            self._conf_noted = True
+            self.note(ln, "ImageSearch: WayClick compares pictures by "
+                          "similarity, so *{n} became {pct}% similar; when "
+                          "found, the click goes to the middle of the "
+                          "picture (AutoHotkey gives its top left corner)",
+                      n=var, pct=int(round(conf * 100)))
+        step = {"op": "image", "path": path, "conf": conf}
+        whole = x1 <= 0 and y1 <= 0 and x2 >= COORD and y2 >= COORD
+        if not whole:
+            step["region"] = region
+        return {"kind": "search", "step": step, "outs": outs, "center": True}
+
+    def _screen_cond(self, cond, ctx, ln):
+        """(passo sem want, quer ver, sight) para um if, ou None."""
+        kind = cond[0]
+        if kind == "scall":
+            sight = self._sight_of(ln, cond[1], cond[2], True)
+            if sight and sight["kind"] == "search":
+                return dict(sight["step"]), cond[3], sight
+            return None
+        if kind == "pgc":
+            sight = self._sight_of(ln, "pixelgetcolor", cond[1], True)
+            color = self._color_value(cond[3], False) if sight else None
+            if color is None:
+                return None
+            return ({"op": "pixel", "x": sight["x"], "y": sight["y"],
+                     "color": color_hex(color), "tol": 0}, cond[2], None)
+        if kind == "cmp":
+            sight = ctx.get(cond[1])
+            if not sight or sight["kind"] != "color":
+                return None
+            color = self._color_value(cond[3], sight["bgr"])
+            if color is None:
+                return None
+            return ({"op": "pixel", "x": sight["x"], "y": sight["y"],
+                     "color": color_hex(color), "tol": 0}, cond[2], None)
+        if kind == "var":
+            sight = ctx.get(cond[1])
+            if not sight or sight["kind"] != "search":
+                return None
+            want = cond[2]
+            if cond[1] == "errorlevel":          # ErrorLevel 0: achou
+                want = not want
+            return dict(sight["step"]), want, sight
+        return None
+
+    def _fold_click(self, nodes, sight, ln):
+        """Click FoundX, FoundY logo depois da busca vira o "quando achar"
+        do passo: (ação, nós que sobram)."""
+        if not sight or not nodes or nodes[0][0] != "cmd":
+            return "none", nodes
+        c = nodes[0][1]
+        if c[0] not in ("click", "mouseclick", "move"):
+            return "none", nodes
+        outs = [o for o in sight["outs"] if o]
+        toks = []
+        for a in c[1]:
+            toks += [x for x in re.split(r"[\s,]+", _unquote(a).strip()) if x]
+        low = [t.strip("%").lower() for t in toks]
+        if not outs or not any(t.startswith(tuple(outs)) for t in low):
+            return "none", nodes
+        if any(t not in outs and t.startswith(tuple(outs)) for t in low) or \
+                any(t in ("+", "-") for t in low):
+            self.note(ln, "the offset added to the position found was left "
+                          "out")
+        if c[0] == "move":
+            return "move", nodes[1:]
+        rest = [t for t in low if not t.startswith(tuple(outs))]
+        if any(t in ("down", "d", "up", "u") for t in rest):
+            return "none", nodes
+        act = "left"
+        for t in rest:
+            if t in ("right", "r"):
+                act = "right"
+            elif t in ("middle", "m"):
+                act = "middle"
+            elif t == "2":
+                act = "double" if act == "left" else act
+        return act, nodes[1:]
+
+    def _screen_guard(self, n, rest, ctx):
+        """O jeito v2 de escrever: 'if !ImageSearch(&x, &y, ...) return' e
+        depois 'Click x, y'. Vira: achou, clica e segue; senão acaba esta
+        volta. Devolve (passos, nós usados de rest) ou None."""
+        cond, then, other, ln = n[1], n[2], n[3], n[4]
+        nodes = self._flat([then])
+        if other or len(nodes) != 1 or nodes[0][0] != "return":
+            return None
+        got = self._screen_cond(cond, ctx, ln)
+        if got is None:
+            return None
+        st, want, sight = got
+        if sight:
+            ctx["_last"] = sight         # a posição achada vale depois
+        go = not want                     # segue quando o if não volta
+        act, left = self._fold_click(list(rest), sight, ln) if go \
+            else ("none", rest)
+        st.update(want="seen" if go else "gone", wait=0.0, act=act,
+                  ok="next", fail="jump", fail_to=("@", "END"))
+        return [st], len(rest) - len(left)
+
+    def _screen_if(self, n, depth, rand, ctx):
+        """if de uma busca na tela -> passos com "se não" pulando o bloco."""
+        cond, then, other, ln = n[1], n[2], n[3], n[4]
+        got = self._screen_cond(cond, ctx, ln)
+        if got is None:
+            return None
+        st, want, sight = got
+        if sight and cond[0] == "scall":
+            ctx["_last"] = sight
+        nodes = self._flat([then])
+        stops = bool(nodes) and nodes[-1][0] == "return"
+        breaks = len(nodes) == 1 and nodes[0][0] == "break"
+        if want:
+            act, nodes = self._fold_click(nodes, sight, ln)
+        else:
+            act = "none"
+        st.update(want="seen" if want else "gone", wait=0.0, act=act,
+                  ok="next")
+        end = self._label()
+        if breaks:
+            if not ctx.get("macro_loop"):
+                return None
+            # "if achou, break" no laço do macro: achou, o macro para;
+            # não achou, segue
+            st["ok"], st["fail"] = "stop", "next"
+            return [st]
+        a = self._steps(nodes, ln, depth, rand, ctx)
+        b = self._steps(self._flat([other]), ln, depth, rand, ctx) \
+            if other else []
+        out = [st] + a
+        if stops:
+            # return no meio: acaba esta volta do macro
+            out.append({"op": "count", "name": "else", "every": 1,
+                        "ok": "jump", "ok_to": ("@", "END")})
+        if b:
+            els = self._label()
+            st["fail"], st["fail_to"] = "jump", ("@", els)
+            if not stops:
+                out.append({"op": "count", "name": "else", "every": 1,
+                            "ok": "jump", "ok_to": ("@", end)})
+            out += [{"op": "@", "id": els}] + b
+        else:
+            st["fail"], st["fail_to"] = "jump", ("@", end)
+        out.append({"op": "@", "id": end})
+        return out
+
+    def _cmd_steps(self, c, ln, depth, rand, ctx=None):
         kind = c[0]
+        if kind == "screen":
+            _k, var, fname, args, v2 = c
+            sight = self._sight_of(ln, fname, args, v2)
+            if sight and ctx is not None:
+                if fname == "pixelgetcolor" or var:
+                    if var:
+                        ctx[var] = sight
+                else:
+                    ctx["errorlevel"] = sight
+            return []
+        if kind in ("click", "mouseclick", "move") and ctx:
+            outs = {o for sg in ctx.values() if isinstance(sg, dict)
+                    for o in sg.get("outs") or () if o}
+            low = " ".join(_unquote(a) for a in c[1]).replace("%", "").lower()
+            if outs and any(re.search(rf"\b{re.escape(o)}\b", low)
+                            for o in outs):
+                self.note(ln, "the position found is used only by a click "
+                              "right after the search, skipped")
+                return []
         if kind == "send":
             return self._send(c[1], c[2], ln)
         if kind in ("click", "mouseclick"):
@@ -4903,7 +5487,7 @@ class AhkImport:
         if kind == "call":
             if depth < 4 and (c[1] in self.labels or c[1] in self.funcs):
                 return self._steps(self._flat(self._body(c[1])), ln,
-                                   depth + 1, rand)
+                                   depth + 1, rand, ctx)
             if c[1]:
                 self.note(ln, "{name} was not found", name=c[1])
             return []
@@ -5130,6 +5714,7 @@ class AhkImport:
 
 
 def import_ahk_file(path):
+    folder = os.path.dirname(os.path.abspath(path))
     with open(path, "rb") as fh:
         raw = fh.read(2 * 1024 * 1024)
     for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
@@ -5139,7 +5724,7 @@ def import_ahk_file(path):
                 break
         except UnicodeDecodeError:
             continue
-    return AhkImport(text)
+    return AhkImport(text, folder)
 
 
 def note_text(note):
@@ -9166,8 +9751,6 @@ TRANSLATIONS = {
             "Procura a imagem na tela, como o ImageSearch do AutoHotkey. Na "
             "primeira vez o sistema pergunta quais telas o WayClick pode ver, "
             "e guarda a resposta.",
-        "Reads the color of one point, like PixelGetColor in AutoHotkey.":
-            "Lê a cor de um ponto, como o PixelGetColor do AutoHotkey.",
         "Without a webhook it shows a desktop notification. With a Discord "
         "webhook (channel settings, Integrations) it posts in that channel. "
         "{run} in the text becomes the number of the run, {time} how long "
@@ -10041,6 +10624,92 @@ TRANSLATIONS = {
         "Closing {name}…": "Fechando {name}…",
         "Open the Sober of this account on the desktop":
             "Abrir o Sober desta conta na área de trabalho",
+        # 1.12.0: Suspend e buscas na tela vindas de um .ahk
+        "Suspend hotkey:": "Atalho de Suspend:",
+        "Like Suspend in AutoHotkey: this key turns the hotkey macros on "
+        "and off from inside the game, and the game never receives it. "
+        "Turning them off also stops the macros that are running.":
+            "Como o Suspend do AutoHotkey: esta tecla liga e desliga os "
+            "macros de atalho de dentro do jogo, e o jogo nunca a recebe. "
+            "Desligar também para os macros que estiverem rodando.",
+        "No Suspend hotkey": "Sem atalho de Suspend",
+        "{key} is the Suspend hotkey, so the macro with the same hotkey does "
+        "not run by it.":
+            "{key} é o atalho de Suspend, então o macro com o mesmo atalho "
+            "não roda por ele.",
+        "{key} is also the arm/disarm hotkey, so one press would arm the "
+        "clicker and switch the macros.":
+            "{key} também é o atalho de armar/desarmar, então um aperto "
+            "armaria o clique e trocaria os macros.",
+        "Suspend hotkey: {key} (switches the hotkey macros on and off, and "
+        "the game does not receive it)":
+            "Atalho de Suspend: {key} (liga e desliga os macros de atalho, e "
+            "o jogo não recebe a tecla)",
+        "Only the position": "Só a posição",
+        "Find {color} in {w}×{h} at {x}, {y}":
+            "Achar {color} na área {w}×{h} em {x}, {y}",
+        "No {color} in {w}×{h} at {x}, {y}":
+            "Sem {color} na área {w}×{h} em {x}, {y}",
+        "Watch for {color} in {w}×{h} at {x}, {y}":
+            "Vigiar {color} na área {w}×{h} em {x}, {y}",
+        "Watch for {color} to go away from {w}×{h} at {x}, {y}":
+            "Vigiar {color} sumir da área {w}×{h} em {x}, {y}",
+        "Find {color} anywhere on the screen":
+            "Achar {color} em qualquer lugar da tela",
+        "No {color} anywhere on the screen": "Sem {color} em toda a tela",
+        "Watch for {color} anywhere on the screen":
+            "Vigiar {color} em toda a tela",
+        "Watch for {color} to go away from the screen":
+            "Vigiar {color} sumir da tela",
+        "Reads the color of one point, like PixelGetColor in AutoHotkey. "
+        "With an area picked, it looks for the color anywhere in it, like "
+        "PixelSearch.":
+            "Lê a cor de um ponto, como o PixelGetColor do AutoHotkey. Com "
+            "uma área escolhida, procura a cor em qualquer lugar dela, como o "
+            "PixelSearch.",
+        "{hk}: a mouse button cannot be the Suspend hotkey here":
+            "{hk}: aqui um botão do mouse não pode ser o atalho de Suspend",
+        "{hk}: the Suspend hotkey is already {key}, this one was left out":
+            "{hk}: o atalho de Suspend já é {key}, este ficou de fora",
+        "{hk}: Suspend {mode} became the Suspend hotkey, which switches the "
+        "macros on and off":
+            "{hk}: Suspend {mode} virou o atalho de Suspend, que liga e "
+            "desliga os macros",
+        "{hk}: only Suspend was imported, the rest of it was left out":
+            "{hk}: só o Suspend foi importado, o resto ficou de fora",
+        "ImageSearch *Trans: WayClick compares the whole picture, with no "
+        "see-through color":
+            "ImageSearch *Trans: o WayClick compara a imagem inteira, sem cor "
+            "transparente",
+        "ImageSearch *w/*h: the picture is used at its own size":
+            "ImageSearch *w/*h: a imagem é usada no tamanho dela",
+        "image {file} was not found next to the script; pick it in the step":
+            "a imagem {file} não está ao lado do script; escolha no passo",
+        "{what}: the position is not a number, skipped":
+            "{what}: a posição não é um número, ignorado",
+        "{what}: the area is not made of numbers, skipped":
+            "{what}: a área não é feita de números, ignorado",
+        "{what}: the color is not a number, skipped":
+            "{what}: a cor não é um número, ignorado",
+        "{what}: the image file is not a plain name, skipped":
+            "{what}: o arquivo da imagem não é um nome simples, ignorado",
+        "ImageSearch: WayClick compares pictures by similarity, so *{n} "
+        "became {pct}% similar; when found, the click goes to the middle of "
+        "the picture (AutoHotkey gives its top left corner)":
+            "ImageSearch: o WayClick compara imagens por semelhança, então "
+            "*{n} virou {pct}% de semelhança; achada, o clique vai no meio "
+            "da imagem (o AutoHotkey dá o canto de cima à esquerda)",
+        "the offset added to the position found was left out":
+            "a soma feita na posição achada ficou de fora",
+        "the position found is used only by a click right after the search, "
+        "skipped":
+            "a posição achada só vale num clique logo depois da busca, "
+            "ignorado",
+        "{hk}: each press is held {ms} ms, as long as the shortest wait of "
+        "the loop, so the game sees it and the loop keeps the script's pace":
+            "{hk}: cada aperto fica seguro {ms} ms, o tempo da menor espera "
+            "do laço, para o jogo ver a tecla e o laço manter o ritmo do "
+            "script",
     },
 }
 LANGS = {"English": "en_US", "Português (BR)": "pt_BR"}
@@ -10936,6 +11605,8 @@ class StepDialog(QDialog):
                                "Lower finds more, and also finds wrong "
                                "places."))
         self.region = step.get("region")
+        # a ordem do PixelSearch de um .ahk, que o editor não mostra
+        self._scan = {k: step[k] for k in ("scan", "rtl", "btt") if k in step}
         self.region_lbl = QLabel()
         self.b_region = QPushButton(_("Pick area…"))
         self.b_region.clicked.connect(lambda: self._capture("region"))
@@ -11034,9 +11705,15 @@ class StepDialog(QDialog):
 
     def _set_region(self, rect):
         self.region = rect
-        self.region_lbl.setText(_("{w}×{h} at {x}, {y}", w=rect[2], h=rect[3],
-                                  x=rect[0], y=rect[1]) if rect
-                                else _("Whole screen"))
+        # o vigia nasce depois deste campo; _sync acerta o texto depois
+        kind = self._kind() if hasattr(self, "wkind") \
+            else self.op.currentData()
+        whole = _("Only the position") if kind == "pixel" \
+            else _("Whole screen")
+        self.region_lbl.setText(
+            _("Whole screen") if _whole_screen(rect) else
+            _("{w}×{h} at {x}, {y}", w=rect[2], h=rect[3], x=rect[0],
+              y=rect[1]) if rect else whole)
         self.b_whole.setEnabled(bool(rect))
 
     def _open_image(self):
@@ -11129,7 +11806,8 @@ class StepDialog(QDialog):
                       "AutoHotkey. The first time, the system asks which "
                       "screens WayClick may see, and remembers the answer.",
              "pixel": "Reads the color of one point, like PixelGetColor in "
-                      "AutoHotkey.",
+                      "AutoHotkey. With an area picked, it looks for the "
+                      "color anywhere in it, like PixelSearch.",
              "notify": "Without a webhook it shows a desktop notification. "
                        "With a Discord webhook (channel settings, "
                        "Integrations) it posts in that channel. {run} in "
@@ -11166,15 +11844,16 @@ class StepDialog(QDialog):
              "point": ("pos", "click", "human", "spread", "delay"),
              "image": ("image", "conf", "region", "want", "wait", "act",
                        "human", "ok", "fail", "delay"),
-             "pixel": ("pos", "color", "tol", "want", "wait", "act", "human",
-                       "ok", "fail", "delay"),
+             "pixel": ("pos", "color", "tol", "region", "want", "wait", "act",
+                       "human", "ok", "fail", "delay"),
              "window": ("match", "want", "wait", "winact", "ok", "fail"),
              "count": ("counter", "cevery", "cok"),
              "notify": ("msg", "hook", "shot"), "open": ("link",)}
     WATCH_SHOWN = {"image": ("wkind", "image", "conf", "region", "wwant",
                              "every", "act", "human", "wok", "delay"),
-                   "pixel": ("wkind", "pos", "color", "tol", "wwant",
-                             "every", "act", "human", "wok", "delay"),
+                   "pixel": ("wkind", "pos", "color", "tol", "region",
+                             "wwant", "every", "act", "human", "wok",
+                             "delay"),
                    "window": ("wkind", "match", "wwant", "every", "wok")}
 
     @staticmethod
@@ -11199,6 +11878,7 @@ class StepDialog(QDialog):
                              self.wwant.currentData() or self._wwant)
         self._sync_count()
         self._sync_want()
+        self._set_region(self.region)
         self.note.setText(_(self.NOTES[op]) if op in self.NOTES else "")
         self.note.setVisible(op in self.NOTES)
         self.adjustSize()
@@ -11223,7 +11903,7 @@ class StepDialog(QDialog):
                      tol=self.tol.value(), want=self.want.currentData(),
                      wait=self.wait_s.value() * 1000.0,
                      act=self.act.currentData(), ok=ok[0], ok_to=ok[1],
-                     fail=fail[0], fail_to=fail[1])
+                     fail=fail[0], fail_to=fail[1], **self._scan)
         elif op == "watch":
             ok = self.wok.value()
             s.update(kind=self.wkind.currentData(), x=self.px.value(),
@@ -11235,7 +11915,8 @@ class StepDialog(QDialog):
                      every=self.every.value() * 1000.0,
                      act=self.act.currentData(),
                      human=self.human.isChecked() and self.human.isEnabled(),
-                     ms=self.human_ms.value(), ok=ok[0], ok_to=ok[1])
+                     ms=self.human_ms.value(), ok=ok[0], ok_to=ok[1],
+                     **self._scan)
         elif op == "window":
             ok, fail = self.ok_flow.value(), self.fail_flow.value()
             s.update(match=self.match.currentText(),
@@ -11568,6 +12249,27 @@ def arm_clash_text(macros, code, name):
              "another arm/disarm hotkey to use both.", key=name)
 
 
+def suspend_clash_text(macros, code, mods, arm_code=0):
+    """O aviso de quando a tecla do Suspend é também a de um macro ligado
+    (ele deixa de rodar por ela) ou a de armar o clique (as duas coisas
+    aconteceriam no mesmo aperto)."""
+    if not code:
+        return ""
+    name = hotkey_label({"code": code, "mods": list(mods),
+                         "key": key_label(code)})
+    out = []
+    if any(m.get("enabled", True) and m.get("code") == code
+           and set(m.get("mods") or ()) >= set(mods)
+           and m.get("mode") != "always" for m in macros):
+        out.append(_("{key} is the Suspend hotkey, so the macro with the same "
+                     "hotkey does not run by it.", key=name))
+    if arm_code and code == arm_code and not mods:
+        out.append(_("{key} is also the arm/disarm hotkey, so one press "
+                     "would arm the clicker and switch the macros.",
+                     key=name))
+    return "\n".join(out)
+
+
 def import_report(imp, source, arm=None):
     """Texto do que um .ahk vira: um macro por linha e as observações. `arm`
     é (código, nome) da tecla de armar o clique, para avisar se bater."""
@@ -11580,7 +12282,16 @@ def import_report(imp, source, arm=None):
     for m in imp.macros:
         head = f"{m['name']}  " if m["name"] else ""
         lines.append(f"  • {head}[{macro_summary(m, 6)}]")
+    sus = getattr(imp, "suspend", None)
+    if sus:
+        lines += ["", _("Suspend hotkey: {key} (switches the hotkey macros "
+                        "on and off, and the game does not receive it)",
+                        key=sus[2])]
     clash = arm_clash_text(imp.macros, *arm) if arm else ""
+    if sus:
+        more = suspend_clash_text(imp.macros, sus[0], sus[1],
+                                  arm[0] if arm else 0)
+        clash = "\n  ".join(t for t in (clash, more) if t)
     if imp.notes or clash:
         lines += ["", _("Notes:")]
         lines += ["  " + note_text(x) for x in sorted(imp.notes,
@@ -11610,7 +12321,8 @@ class ImportDialog(QDialog):
         self.add = buttons.addButton(_("Add these macros"),
                                      QDialogButtonBox.AcceptRole)
         buttons.addButton(QDialogButtonBox.Cancel)
-        self.add.setEnabled(bool(imp.macros) and room > 0)
+        self.add.setEnabled((bool(imp.macros) and room > 0)
+                            or bool(getattr(imp, "suspend", None)))
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         col.addWidget(buttons)
@@ -15034,6 +15746,21 @@ class App(QWidget):
                        if isinstance(m, dict)][:MAX_MACROS]
         self.macro_box = QCheckBox(_("Enable hotkey macros"))
         self.macro_box.setChecked(bool(cfg.get("macros_enabled", True)))
+        # o Suspend do AutoHotkey (F7::Suspend): uma tecla que liga e desliga
+        # os macros, de dentro do jogo
+        self.suspend_mods = sorted({x for x in (cfg.get("suspend_mods") or [])
+                                    if x in MODIFIERS}) \
+            if isinstance(cfg.get("suspend_mods"), list) else []
+        scode = _num(cfg.get("suspend_code", 0), 0, 0, 0x2ff, int)
+        if scode and is_button(scode):
+            scode = 0
+        self.suspend_key = KeyCatcher(scode, self._suspend_name(
+            scode, self.suspend_mods, cfg.get("suspend_key")))
+        self.suspend_key.changed.connect(self._suspend_picked)
+        self.suspend_clear = QPushButton("×")
+        self.suspend_clear.setFixedWidth(30)
+        self.suspend_clear.clicked.connect(self._suspend_cleared)
+        self.suspend_clear.setEnabled(bool(scode))
         self.macro_list = QListWidget()
         self.macro_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.macro_list.itemChanged.connect(self._macro_item_changed)
@@ -15078,6 +15805,14 @@ class App(QWidget):
         macro_form.addWidget(self.macro_list, 1)
         macro_form.addLayout(mrow)
         macro_form.addLayout(mrow2)
+        srow = QHBoxLayout()
+        slbl = QLabel(_("Suspend hotkey:"))
+        self._labels.append((slbl, "Suspend hotkey:"))
+        srow.addWidget(slbl)
+        srow.addWidget(self.suspend_key, 1)
+        srow.addWidget(self.suspend_clear)
+        self._suspend_tips()
+        macro_form.addLayout(srow)
         macro_form.addWidget(self.macro_clash)
         macro_form.addWidget(self.macro_state)
 
@@ -15315,6 +16050,13 @@ class App(QWidget):
         # macros com atalho: vivem independentes do Start
         self.engine = MacroEngine(self._macro_outputs, hub=self.watcher.hub)
         self.watcher.shadow = self.engine.claims
+        self.suspend_w = SuspendWatcher(self.suspend_key.code,
+                                        self.suspend_mods,
+                                        hub=self.watcher.hub)
+        self.suspend_w.pressed.connect(self._suspend_pressed)
+        self.engine.exempt = self.suspend_w.matches
+        if self.suspend_key.code:
+            self.suspend_w.start()
         self.tower.set_claims(lambda code: self.engine.claims(code)
                               or code == self.hk.code)
         self.engine.changed.connect(self._macros_ran)
@@ -15766,6 +16508,10 @@ class App(QWidget):
         self.m_import.setToolTip(_("Turn the hotkeys of an AutoHotkey script "
                                    "(.ahk) into macros"))
         self._macro_tips()
+        self._suspend_tips()
+        if not self.suspend_key.code:
+            self.suspend_key.name = _("None")
+            self.suspend_key._refresh()
         self._fill_macros()
         self.target_box.setText(_("Enable sending the key"))
         self.afk.setText(_("Anti-AFK: nudge the cursor every"))
@@ -16726,12 +17472,73 @@ class App(QWidget):
 
     def _show_clash(self):
         """Avisa quando um macro usa a tecla de armar o clique: com os macros
-        ligados ela é do macro, e o clique não arma por ela."""
+        ligados ela é do macro, e o clique não arma por ela. E quando a
+        tecla do Suspend é a de um macro ou a de armar."""
         if not hasattr(self, "macro_clash"):
             return
         text = arm_clash_text(self.macros, self.hk.code, self.hk.name)
+        if hasattr(self, "suspend_key"):
+            more = suspend_clash_text(self.macros, self.suspend_key.code,
+                                      self.suspend_mods, self.hk.code)
+            text = "\n".join(t for t in (text, more) if t)
         self.macro_clash.setText(text)
         self.macro_clash.setVisible(bool(text))
+
+    # ---------------------------------------------------------- Suspend --
+    @staticmethod
+    def _suspend_name(code, mods, key=None):
+        if not code:
+            return _("None")
+        return hotkey_label({"code": code, "mods": list(mods),
+                             "key": key or key_label(code)})
+
+    def _suspend_tips(self):
+        self.suspend_key.setToolTip(_(
+            "Like Suspend in AutoHotkey: this key turns the hotkey macros on "
+            "and off from inside the game, and the game never receives it. "
+            "Turning them off also stops the macros that are running."))
+        self.suspend_clear.setToolTip(_("No Suspend hotkey"))
+
+    def set_suspend(self, code, mods=()):
+        """A tecla do Suspend (0: nenhuma), também do importador."""
+        code = 0 if not code or is_button(code) else int(code)
+        self.suspend_mods = sorted({x for x in mods if x in MODIFIERS}) \
+            if code else []
+        self.suspend_key.blockSignals(True)
+        self.suspend_key.set_key(code, self._suspend_name(
+            code, self.suspend_mods))
+        self.suspend_key.blockSignals(False)
+        self._suspend_apply()
+
+    def _suspend_picked(self):
+        code = self.suspend_key.code
+        if is_button(code):          # o campo só aceita teclas; por garantia
+            code = 0
+        self.set_suspend(code)
+
+    def _suspend_cleared(self):
+        self.set_suspend(0)
+
+    def _suspend_apply(self):
+        code = self.suspend_key.code
+        w = self.suspend_w if hasattr(self, "suspend_w") else None
+        if w is not None:
+            w.set_key(code, self.suspend_mods)
+            if code and not w._on:
+                w.start()
+            elif not code and w._on:
+                w.stop()
+        self.suspend_clear.setEnabled(bool(code))
+        self._show_clash()
+        if hasattr(self, "_save_timer"):
+            self._save_timer.start()
+
+    def _suspend_pressed(self):
+        """Apertou a tecla do Suspend: os macros de atalho trocam de estado
+        (desligar para também o que estiver rodando)."""
+        on = not self.macro_box.isChecked()
+        self.macro_box.setChecked(on)
+        self._beep("on" if on else "off")
 
     # ---------------------------------------------------- macros (atalhos) --
     def _macro_outputs(self):
@@ -16896,6 +17703,8 @@ class App(QWidget):
         if new:
             self.macro_list.setCurrentRow(len(self.macros) - len(new))
             self.macro_box.setChecked(True)
+        if imp.suspend:
+            self.set_suspend(imp.suspend[0], imp.suspend[1])
         self._apply_macros()
         return len(new)
 
@@ -17073,6 +17882,10 @@ class App(QWidget):
                 "hotkey_block": self.hk_block.isChecked(),
                 "macros": self.macros,
                 "macros_enabled": self.macro_box.isChecked(),
+                "suspend_code": self.suspend_key.code,
+                "suspend_key": key_label(self.suspend_key.code)
+                if self.suspend_key.code else "",
+                "suspend_mods": list(self.suspend_mods),
                 "dock_size": "x".join(
                     map(str, self._dock_size_value())),
                 "dock_command": self.dock_cmd.text().strip(),
@@ -17204,8 +18017,8 @@ def cli_import(argv):
     arm = cfg.get("hotkey_code") or KEYNAMES.get(cfg.get("hotkey", "F8"),
                                                  KEYNAMES["F8"])
     print(import_report(imp, path, (arm, cfg.get("hotkey") or "F8")))
-    if dry or not imp.macros:
-        return 0 if imp.macros else 1
+    if dry or not (imp.macros or imp.suspend):
+        return 0 if imp.macros or imp.suspend else 1
     pid = _other_instance()
     if pid:
         print("\n" + _("WayClick is running (pid {pid}). Import from its "
@@ -17217,6 +18030,10 @@ def cli_import(argv):
     room = MAX_MACROS - len(old)
     cfg["macros"] = old + imp.macros[:max(0, room)]
     cfg["macros_enabled"] = True
+    if imp.suspend:
+        cfg["suspend_code"] = imp.suspend[0]
+        cfg["suspend_key"] = key_label(imp.suspend[0])
+        cfg["suspend_mods"] = list(imp.suspend[1])
     os.makedirs(os.path.dirname(CFG), exist_ok=True)
     tmp = CFG + ".tmp"
     with open(tmp, "w") as fh:

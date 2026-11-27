@@ -23,10 +23,11 @@ running as root.
   shortcuts are set, each with its own interval; repeat or hold
 - **Hotkey macros, AutoHotkey style**: each macro with its own hotkey (key or
   mouse button, with modifiers), toggle, while held, once or always, a list of
-  steps, and the hotkey hidden from the game like AutoHotkey does. **Import
-  AHK** turns a `.ahk` script into macros
-- **Screen steps** in those macros, like AutoHotkey's `ImageSearch` and
-  `PixelGetColor`. Go to an exact spot and click, find an image, check a pixel
+  steps, and the hotkey hidden from the game like AutoHotkey does. A
+  **Suspend hotkey** switches them all off and on, like `F7::Suspend`.
+  **Import AHK** turns a `.ahk` script into macros
+- **Screen steps** in those macros, like AutoHotkey's `ImageSearch`,
+  `PixelSearch` and `PixelGetColor`. Go to an exact spot and click, find an image, check a pixel
   color, wait until it shows up or goes away and choose what comes next, post
   to a Discord webhook with a screenshot, open a link. **Pick on screen** takes
   the spot, the color or the picture from your own screen
@@ -281,6 +282,17 @@ steps run, as AutoHotkey does, so `Alt+A` sending `Ctrl+C` arrives as `Ctrl+C`
 and not `Ctrl+Alt+C`. Opening the editor pauses the macros, so you can pick a
 hotkey that a running macro already uses.
 
+The **Suspend hotkey** under the list (none by default) does what
+`F7::Suspend` does in a script: one press turns the hotkey macros off, so
+their keys reach the game as plain keys again, and the next press turns them
+back on, with the same sound as the arm hotkey. The game never receives the
+Suspend key itself, modifiers work as for a macro (`Ctrl+F7` leaves a plain
+`F7` alone), and a warning shows when it is also a macro's key or the
+arm/disarm hotkey. One difference from AutoHotkey: Suspend there leaves a
+running macro alone (that is `Pause`), while WayClick also stops the macros
+that are running and lets go of anything they hold, so a bhop that is
+spamming a key stops the moment you press it.
+
 **Import AHK…** reads a `.ahk` file (v1 or v2) and turns its hotkeys into
 macros, showing first what each one became and what it could not convert, by
 line number. It is not an AutoHotkey interpreter; it recognises the patterns
@@ -296,6 +308,11 @@ game scripts use:
 | `a::b`, `CapsLock::Ctrl` | While held, a remap |
 | `F5:: Send ..., Click, Sleep, Loop 3 { }` | Once per press |
 | `SetTimer` in the auto-execute section | Always |
+| `F7::Suspend`, `Suspend, Toggle`, `Suspend(-1)` | the Suspend hotkey |
+| `PixelGetColor, c, X, Y` + `if (c = 0x...)` | Check a pixel color, then / else |
+| `PixelSearch, Px, Py, X1, Y1, X2, Y2, color, var` + `if !ErrorLevel` + `Click %Px%, %Py%` | Check a pixel color in that area, click where found |
+| `ImageSearch, X, Y, X1, Y1, X2, Y2, *40 file.png` + `if (ErrorLevel = 0)` + `Click` | Find an image in that area, click it, else the other branch |
+| v2 `if PixelSearch(&x, &y, ...)`, `if !ImageSearch(...) return`, `found := ImageSearch(...)` | the same steps |
 | `Send` with `{Key down}`, `{Key up}`, `{Key N}`, `^!+#`, text, `{Click}`, `{WheelDown N}`; `Click`, `Sleep`, `Random`, `MouseMove ..., R`, `Gosub`, functions, stacked hotkeys, `$`, `*`, `~`, `sc`/`vk` names, `SetKeyDelay` | the matching steps |
 
 Hotstrings, `Key Up` hotkeys, `A & B` combinations, `#If` window conditions
@@ -303,6 +320,40 @@ Hotstrings, `Key Up` hotkeys, `A & B` combinations, `#If` window conditions
 and skipped. `Click X, Y` and `MouseMove X, Y` become
 [Go to a screen position](#screen-steps) steps, with a note when the script
 measured them from the active window, which is AutoHotkey's default.
+
+The screen commands keep AutoHotkey's rules, from its
+[PixelGetColor](https://www.autohotkey.com/docs/v1/lib/PixelGetColor.htm),
+[PixelSearch](https://www.autohotkey.com/docs/v1/lib/PixelSearch.htm) and
+[ImageSearch](https://www.autohotkey.com/docs/v1/lib/ImageSearch.htm) pages.
+In v1 a color is blue, green, red (`0x0000FF` is red) unless the command says
+`RGB`, and v2 always uses red, green, blue. v1 `PixelSearch` looks column by
+column from the left unless `Fast` is given, and `X1 > X2` or `Y1 > Y2`
+search from the other side; the variation becomes the step's tolerance. The
+`*n` variation of `ImageSearch` (0 to 255) becomes a similarity (`*40` is
+87 %), and the picture is looked for next to the script. `A_ScreenWidth`,
+`A_ScreenHeight` and the `A_VirtualScreen` names mean the whole screen. The
+`if`/`else` after the search becomes the step's *If it happens* and *If not*,
+including `else if` chains, `break` and `return`. Two things differ: WayClick
+clicks the center of a found picture, where AutoHotkey gives its top left
+corner, and a click at a variable that no search filled is skipped with a
+note.
+
+The bhop script a friend wrote in Python for Linux (hold Space and F9 is
+pressed every 15 ms, F7 pauses) is a three line AutoHotkey script, and imports
+as *Space, while held, tap F9, wait 15.6 ms* plus the Suspend hotkey F7:
+
+```ahk
+F7::Suspend
+*$Space:: while GetKeyState("Space", "P") {
+    Send {Blind}{F9}
+    Sleep 15
+}
+```
+
+A loop like that holds each press for its shortest wait (15.6 ms here)
+instead of the usual 40 ms, so a round takes 31.2 ms, about 32 F9 a second,
+which is the 30 ms of the original and what Roblox reads (about one key per
+frame at 60 fps, see below).
 
 The script attached to the first request for this feature imports as *F1,
 toggle, every 15.6 ms, tap E*:
@@ -348,7 +399,7 @@ Five more kinds of step cover what AutoHotkey scripts do with `Click X, Y`,
 |---|---|
 | **Go to a screen position** | Puts the pointer on an exact pixel, then clicks (left, right, middle or double) or only moves. *Curved, like a hand* glides there in the time you set instead of jumping, and *Random offset* lands up to that many pixels away each time. |
 | **Find an image on screen** | Looks for a picture on every screen, or only inside an area you mark, at a *Similarity* from 50 to 100 % (85 by default). When found it can point at it or click its center. |
-| **Check a pixel color** | Reads one point and compares it with a color, red, green and blue each within the *Tolerance*. |
+| **Check a pixel color** | Reads one point and compares it with a color, red, green and blue each within the *Tolerance*, like `PixelGetColor`. With an area marked (*Search in*) it looks for the color anywhere inside, like `PixelSearch`, and can click where it found it: row by row from the top left, or column by column when it came from a v1 script. |
 | **Send a notification** | A desktop notification. With a Discord webhook (channel settings, Integrations) it posts in that channel instead, and can attach a screenshot of each screen. |
 | **Open a link or file** | Opens it with the default program, so web pages, `roblox://` and `steam://` links and files all work. |
 
@@ -977,6 +1028,9 @@ root needed.
 
 ```bash
 python3 tests/t_ahk_import.py                       # the importer on the scripts in tests/ahk
+python3 tests/t_ahk_screen.py                       # PixelGetColor, PixelSearch, ImageSearch and Suspend from a .ahk, run on a fake screen
+sg input -c "python3 tests/t_suspend_ui.py"         # the Suspend hotkey: the bhop script, on, off, Ctrl, warnings, config, --import
+python3 tests/t_ahk_kwin.py                         # a .ahk end to end in a nested KWin, with two screenshots
 sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk at 15.6 and 1 ms, every mode, hiding, relay
 sg input -c "python3 tests/t_hotkeys_ui.py"         # the Hotkeys tab end to end, config, --import
 sg input -c "python3 tests/t_hotkeys_dialogs.py"    # the macro and step editors
@@ -1025,6 +1079,14 @@ the restore token and the dialog choices. It needs Sober with Roblox
 downloaded once, `pasta`, `bwrap`, `kwin_wayland`, `wl-clipboard` and
 `kscreen-doctor`, and skips when one is missing (`WCTEST_PASTA=/path/to/pasta`
 uses one that is not installed).
+
+`t_ahk_kwin.py` uses the same sandbox with one screen: a target window that
+shows the keys and clicks it gets, and the real WayClick importing
+`tests/ahk/kwin_e2e.ahk`. Holding Space sends F9 about 32 times a second
+(measured median 31.3 ms), F7 suspends and resumes, and the `ImageSearch` and
+`PixelSearch` hotkeys click the picture and the red dot. Screens come from the
+sandbox KWin's ScreenShot2, and two screenshots land in
+`/tmp/wayclick-ahk-kwin` (or `WCTEST_SHOTS`).
 
 `t_dock_kwin.py`, `t_dock_hidden.py`, `t_tower_kwin.py` and `t_sober_dock.py` open the Dock
 inside the same box, so its window lands on the nested KWin and nothing

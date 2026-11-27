@@ -25,9 +25,10 @@ compositor e sem nada rodando como root.
 - **Macros com atalho, estilo AutoHotkey**: cada macro com o seu atalho (tecla
   ou botão do mouse, com modificadores), liga e desliga, enquanto segura, uma
   vez ou sempre, uma lista de passos, e o atalho escondido do jogo como o
-  AutoHotkey faz. **Importar AHK** transforma um script `.ahk` em macros
-- **Passos de tela** nesses macros, como o `ImageSearch` e o `PixelGetColor`
-  do AutoHotkey. Ir a um ponto exato e clicar, achar uma imagem, conferir a
+  AutoHotkey faz. Um **atalho de Suspend** desliga e liga todos eles, como o
+  `F7::Suspend`. **Importar AHK** transforma um script `.ahk` em macros
+- **Passos de tela** nesses macros, como o `ImageSearch`, o `PixelSearch` e o
+  `PixelGetColor` do AutoHotkey. Ir a um ponto exato e clicar, achar uma imagem, conferir a
   cor de um pixel, esperar até aparecer ou sumir e escolher o que vem depois,
   postar num webhook do Discord com print da tela, abrir um link. **Escolher
   na tela** pega o ponto, a cor ou a imagem da sua própria tela
@@ -285,6 +286,17 @@ antes dos passos, como o AutoHotkey faz, então `Alt+A` mandando `Ctrl+C` chega
 como `Ctrl+C` e não `Ctrl+Alt+C`. Abrir o editor pausa os macros, para dar
 para escolher um atalho que um macro rodando já usa.
 
+O **atalho de Suspend** embaixo da lista (nenhum por padrão) faz o que o
+`F7::Suspend` faz num script: um aperto desliga os macros de atalho, então as
+teclas deles voltam a chegar ao jogo como teclas comuns, e o aperto seguinte
+liga de novo, com o mesmo som do atalho de armar. O jogo nunca recebe a
+própria tecla de Suspend, os modificadores valem como num macro (`Ctrl+F7`
+deixa um `F7` sozinho em paz), e aparece um aviso quando ela também é a tecla
+de um macro ou o atalho de armar e desarmar. Uma diferença do AutoHotkey: lá o
+Suspend não mexe num macro que já está rodando (isso é o `Pause`), e no
+WayClick ele também para os macros rodando e solta o que eles seguram, então
+um bhop que está disparando uma tecla para no instante do aperto.
+
 **Importar AHK…** lê um arquivo `.ahk` (v1 ou v2) e transforma os atalhos dele
 em macros, mostrando antes no que cada um virou e o que não deu para converter,
 com o número da linha. Não é um interpretador de AutoHotkey; ele reconhece os
@@ -300,6 +312,11 @@ padrões que scripts de jogo usam:
 | `a::b`, `CapsLock::Ctrl` | Enquanto segura, um remapeamento |
 | `F5:: Send ..., Click, Sleep, Loop 3 { }` | Uma vez por aperto |
 | `SetTimer` na seção de auto execução | Sempre |
+| `F7::Suspend`, `Suspend, Toggle`, `Suspend(-1)` | o atalho de Suspend |
+| `PixelGetColor, c, X, Y` + `if (c = 0x...)` | Conferir a cor de um pixel, se sim / se não |
+| `PixelSearch, Px, Py, X1, Y1, X2, Y2, cor, variação` + `if !ErrorLevel` + `Click %Px%, %Py%` | Conferir a cor de um pixel naquela área, clicando onde achou |
+| `ImageSearch, X, Y, X1, Y1, X2, Y2, *40 arquivo.png` + `if (ErrorLevel = 0)` + `Click` | Achar uma imagem naquela área, clicar nela, senão o outro caminho |
+| v2 `if PixelSearch(&x, &y, ...)`, `if !ImageSearch(...) return`, `achou := ImageSearch(...)` | os mesmos passos |
 | `Send` com `{Tecla down}`, `{Tecla up}`, `{Tecla N}`, `^!+#`, texto, `{Click}`, `{WheelDown N}`; `Click`, `Sleep`, `Random`, `MouseMove ..., R`, `Gosub`, funções, atalhos empilhados, `$`, `*`, `~`, nomes `sc`/`vk`, `SetKeyDelay` | os passos correspondentes |
 
 Hotstrings, atalhos `Tecla Up`, combinações `A & B`, condições de janela `#If`
@@ -307,6 +324,41 @@ Hotstrings, atalhos `Tecla Up`, combinações `A & B`, condições de janela `#I
 avisados e ignorados. `Click X, Y` e `MouseMove X, Y` viram passos
 [Ir a uma posição da tela](#passos-de-tela), com um aviso quando o script
 media a partir da janela ativa, que é o padrão do AutoHotkey.
+
+Os comandos de tela seguem as regras do AutoHotkey, das páginas
+[PixelGetColor](https://www.autohotkey.com/docs/v1/lib/PixelGetColor.htm),
+[PixelSearch](https://www.autohotkey.com/docs/v1/lib/PixelSearch.htm) e
+[ImageSearch](https://www.autohotkey.com/docs/v1/lib/ImageSearch.htm). No v1
+uma cor é azul, verde, vermelho (`0x0000FF` é vermelho) a menos que o comando
+diga `RGB`, e o v2 usa sempre vermelho, verde, azul. O `PixelSearch` do v1
+procura coluna por coluna a partir da esquerda a menos que tenha `Fast`, e
+`X1 > X2` ou `Y1 > Y2` procuram a partir do outro lado; a variação vira a
+tolerância do passo. A variação `*n` do `ImageSearch` (0 a 255) vira uma
+semelhança (`*40` dá 87 %), e a imagem é procurada ao lado do script.
+`A_ScreenWidth`, `A_ScreenHeight` e os nomes `A_VirtualScreen` querem dizer a
+tela toda. O `if`/`else` depois da busca vira o *Se acontecer* e o *Se não* do
+passo, inclusive cadeias de `else if`, `break` e `return`. Duas coisas são
+diferentes: o WayClick clica no centro da imagem achada, onde o AutoHotkey dá
+o canto de cima à esquerda, e um clique numa variável que nenhuma busca
+preencheu é pulado com um aviso.
+
+O script de bhop que um amigo escreveu em Python para Linux (segurar Espaço
+aperta F9 a cada 15 ms, F7 pausa) é um script de três linhas no AutoHotkey, e
+importa como *Space, enquanto segura, tocar F9, esperar 15,6 ms* mais o atalho
+de Suspend F7:
+
+```ahk
+F7::Suspend
+*$Space:: while GetKeyState("Space", "P") {
+    Send {Blind}{F9}
+    Sleep 15
+}
+```
+
+Um laço assim segura cada aperto pela menor espera dele (15,6 ms aqui) em vez
+dos 40 ms de sempre, então uma volta leva 31,2 ms, umas 32 vezes F9 por
+segundo, que são os 30 ms do original e o que o Roblox lê (mais ou menos uma
+tecla por quadro a 60 fps, veja abaixo).
 
 O script anexado ao primeiro pedido desta função importa como *F1, liga e
 desliga, a cada 15,6 ms, tocar E*:
@@ -347,13 +399,13 @@ que um WayClick aberto grava a própria lista ao sair).
 ### Passos de tela
 
 Mais cinco tipos de passo cobrem o que scripts do AutoHotkey fazem com
-`Click X, Y`, `ImageSearch`, `PixelGetColor` e `Run`.
+`Click X, Y`, `ImageSearch`, `PixelSearch`, `PixelGetColor` e `Run`.
 
 | Passo | O que faz |
 |---|---|
 | **Ir a uma posição da tela** | Põe o ponteiro num pixel exato e clica (esquerdo, direito, do meio ou duplo) ou só move. *Em curva, como a mão* desliza até lá no tempo que você definir em vez de pular, e *Desvio aleatório* cai até essa quantidade de pixels ao lado a cada vez. |
 | **Achar uma imagem na tela** | Procura uma imagem em todas as telas, ou só dentro de uma área que você marcar, com *Semelhança* de 50 a 100 % (85 por padrão). Achando, pode apontar para ela ou clicar no centro dela. |
-| **Conferir a cor de um pixel** | Lê um ponto e compara com uma cor, vermelho, verde e azul cada um dentro da *Tolerância*. |
+| **Conferir a cor de um pixel** | Lê um ponto e compara com uma cor, vermelho, verde e azul cada um dentro da *Tolerância*, como o `PixelGetColor`. Com uma área marcada (*Procurar em*) procura a cor em qualquer lugar dentro dela, como o `PixelSearch`, e pode clicar onde achou: linha por linha a partir do canto de cima à esquerda, ou coluna por coluna quando veio de um script v1. |
 | **Enviar um aviso** | Uma notificação do desktop. Com um webhook do Discord (configurações do canal, Integrações) ele posta naquele canal, e pode anexar um print de cada tela. |
 | **Abrir um link ou arquivo** | Abre com o programa padrão, então páginas da web, links `roblox://` e `steam://` e arquivos funcionam. |
 
@@ -990,6 +1042,9 @@ também como o teste lê o que teria chegado ao compositor (veja
 
 ```bash
 python3 tests/t_ahk_import.py                       # o importador nos scripts de tests/ahk
+python3 tests/t_ahk_screen.py                       # PixelGetColor, PixelSearch, ImageSearch e Suspend vindos de um .ahk, numa tela falsa
+sg input -c "python3 tests/t_suspend_ui.py"         # o atalho de Suspend: o script de bhop, liga, desliga, Ctrl, avisos, config, --import
+python3 tests/t_ahk_kwin.py                         # um .ahk de ponta a ponta num KWin aninhado, com duas capturas de tela
 sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk a 15,6 e a 1 ms, todos os modos, esconder, relay
 sg input -c "python3 tests/t_hotkeys_ui.py"         # a aba Atalhos de ponta a ponta, config, --import
 sg input -c "python3 tests/t_hotkeys_dialogs.py"    # os editores de macro e de passo
@@ -1038,6 +1093,14 @@ restauração e pelas escolhas do diálogo. Precisa do Sober com o Roblox já
 baixado uma vez, `pasta`, `bwrap`, `kwin_wayland`, `wl-clipboard` e
 `kscreen-doctor`, e pula quando falta algum (`WCTEST_PASTA=/caminho/do/pasta`
 usa um que não esteja instalado).
+
+O `t_ahk_kwin.py` usa a mesma caixa com uma tela só: uma janela alvo que
+mostra as teclas e os cliques que recebe, e o WayClick de verdade importando o
+`tests/ahk/kwin_e2e.ahk`. Segurar Espaço manda F9 umas 32 vezes por segundo
+(mediana medida de 31,3 ms), F7 suspende e volta, e os atalhos de `ImageSearch`
+e `PixelSearch` clicam na imagem e no ponto vermelho. A tela vem do
+ScreenShot2 do KWin da caixa, e duas capturas ficam em `/tmp/wayclick-ahk-kwin`
+(ou em `WCTEST_SHOTS`).
 
 O `t_dock_kwin.py`, o `t_dock_hidden.py`, o `t_tower_kwin.py` e o `t_sober_dock.py` abrem a Doca
 dentro da mesma caixa, então a janela dela cai no KWin aninhado e nada chega

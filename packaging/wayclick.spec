@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.11.1
+Version:        1.12.0
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -77,6 +77,16 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Fri Nov 27 2026 gabrielmf1998 <noreply@github.com> - 1.12.0-1
+- Suspend hotkey on the Hotkeys page, like F7::Suspend in AutoHotkey: it
+  switches the hotkey macros off and on and the game never receives it
+- Check a pixel color can search an area, like PixelSearch, and click
+  where it found the color
+- Import AHK converts PixelGetColor, PixelSearch and ImageSearch with
+  their if/else into screen steps (v1 BGR and column order, v2 RGB), and
+  Suspend into the Suspend hotkey
+- Loops of Send and a short Sleep hold each press for that Sleep, so the
+  bhop script (hold Space, F9 every 15 ms) runs at about 32 presses/s
 * Tue Nov 24 2026 gabrielmf1998 <noreply@github.com> - 1.11.1-1
 - Each Sober account gets a time namespace of its own. Sober locks parts
   of /proc/self/ns/time, and an account sharing it with the usual Sober
