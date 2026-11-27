@@ -53,8 +53,10 @@ running as root.
 - **Sober accounts** open more copies of Sober next to your usual one, each
   with its own Roblox sign-in, settings and network, so a second account
   plays at the same time as the first, on the desktop or in the Dock
-- **Send key to a window** — pick an open window and feed it a key; for X11
-  targets it arrives with no focus change, even minimized
+- **Send key to a window** feeds a list of up to 8 windows each its own key
+  and interval; X11 and Dock windows get it with no focus change, even
+  minimized, and Wayland windows get it in a borrowed instant of about 0.1 s
+  that holds your typing and keeps hidden windows hidden
 - **Anti-AFK** — nudges the pointer and puts it back, with zero drift
 - **Update check** — tells you a new release is out, from GitHub or GitLab,
   without you going to look
@@ -844,23 +846,61 @@ know the hotkey registered without looking.
 
 ### Send key to a window
 
-Pick one of your open windows and WayClick feeds it a key on an interval —
-Space into a game every 60 s, for instance, while you keep working. The list
-shows every open window with its real icon and a marker for how the key will
-get there, and the key is set by pressing it, same as in the macro:
+Make a list of up to 8 open windows and WayClick feeds each one its own key on
+its own interval: Space into a game every 60 s, Enter into a second game every
+5 s, while you keep working in a third window. **+ Add window** adds a row,
+**↻** reads the open windows again, and each row has the window (with its real
+icon), the key (set by pressing it, same as in the macro), how often, and a
+counter of keys sent. The list is saved, and a window that is closed stays in
+it marked ✕ until it opens again, so a game you restart is found by itself.
+
+The marker in front of each window says how the key gets there:
 
 | | |
 |---|---|
 | **⌨** | X11 window (Xwayland). The key is addressed to that window: your focus is never touched, and it works **even minimized**. |
-| **◐** | Pure Wayland window. There is no way to address it, so WayClick focuses it for ~40 ms, sends the key and hands focus back. |
+| **◐** | Pure Wayland window. Wayland has no way to address a key to a window, so WayClick lends it the focus for about 0.1 s, sends the key and gives the focus back. |
+| **▣** | A window in the Dock. The key goes through the Dock's own KWin, so the focus on your desktop never moves at all. |
 
-Measured against an X11 target running in its own process, with focus parked on
-another window the whole time: 3 of 3 delivered while unfocused, 6 more while
-minimized, 0 leaked into the focused window.
+For **◐** windows, the instant of borrowed focus is built so you do not notice
+it:
 
-If the window you picked is pure Wayland, the group shows a red notice. The way
-out is to reopen that program as an X11 client, which usually takes one
-environment variable:
+- **Your typing is held, not lost.** The keyboard you are using is frozen for
+  that instant: keys you type are queued and replayed in order right after, a
+  key you are holding is released and pressed again, so nothing of yours ever
+  lands in the game and nothing of the game's key lands in your window.
+- **Hidden windows stay hidden.** A target that is minimized, behind other
+  windows or on another virtual desktop is made fully transparent while it has
+  the focus, then put back exactly as it was: minimized again, on its own
+  desktop, in the same place in the stack.
+- **Several windows share the instant.** All ◐ windows that are due go in one
+  round, one after the other, and your window gets the focus back once.
+- **⌨ and ▣ never wait.** Each kind has its own lane, so an X11 or Dock window
+  keeps its interval even while a ◐ round is running.
+- **Nothing stays invisible.** If WayClick is killed in the middle of a round,
+  the window it made transparent is shown again as soon as WayClick opens.
+
+Measured in a nested KWin with Xwayland (`tests/t_winsend_kwin.py`, two runs),
+with a user window focused and a typist on it the whole time:
+
+| What | Result |
+|---|---|
+| Focus away from your window in a ◐ round | about 0.1 s per row due (105 ms with one, 206 ms with two) |
+| ⌨ window every 0.3 s while ◐ rounds run | 30 to 31 of about 31 expected, 50 ms per key, no focus change |
+| Keys typed in the user window during rounds | 63 of 63, in order, held 0.11 s median and 0.58 s at most (five rows due at once) |
+| Hidden targets seen on screen (over 90 screenshots per run) | 0 px |
+| KWrite on Wayland and on X11 as targets | every key saved in the file, the X11 one never focused |
+| ▣ game in the Dock every 0.3 s | every key arrived, 0 focus changes on the desktop |
+| Window left transparent by a kill | shown again 2.2 to 2.4 s after WayClick opens |
+
+What you may see during a ◐ round is the title bar of your window blinking to
+inactive for about 0.1 s, a little longer when several rows are due at once.
+A game that only reads keys while it has the focus gets them anyway, since for
+that instant it does have the focus.
+
+To skip the borrowed focus altogether, open the game in the Dock (▣), or
+reopen the program as an X11 client, which usually takes one environment
+variable:
 
 ```bash
 SDL_VIDEODRIVER=x11 ./game          # SDL (most games)
@@ -869,10 +909,11 @@ QT_QPA_PLATFORM=xcb ./app           # Qt
 flatpak run --env=SDL_VIDEODRIVER=x11 org.example.App
 ```
 
-Then it shows up as ⌨ and takes the key directly. Two honest caveats: an app
+Then it shows up as ⌨ and takes the key directly. Sober (Roblox) is Wayland
+only, so it is ◐ on the desktop or ▣ in the Dock. Two honest caveats: an app
 that reads raw input may ignore synthetic X11 events, and this is keyboard
-only — clicks follow the cursor rather than focus, so aiming them at a window
-would mean warping your pointer.
+only, since clicks follow the cursor rather than the focus, so aiming them at
+a window would mean moving your pointer.
 
 ### Updates
 
@@ -1122,6 +1163,8 @@ python3 tests/t_sober_kwin.py                       # all of it against Roblox (
 python3 tests/t_sidenav.py                          # the sidebar: groups, dots, search, keys, icons only when narrow
 python3 tests/t_sober_accounts.py                   # Sober accounts on a fake Sober: lock, pasta, closing only its copy, the page, the Dock
 python3 tests/t_sober_accounts_kwin.py              # two accounts with the real Sober at once, in a nested KWin
+python3 tests/t_winsend_ui.py                       # the Window tab: rows, saving, matching, held typing, rounds on a fake KWin
+python3 tests/t_winsend_kwin.py                     # Send key to a window in a nested KWin with Xwayland: games, KWrite, Dock, a typist
 ```
 
 `t_screen_portal.py` runs the real `xdg-desktop-portal` inside `bwrap` with
@@ -1183,6 +1226,13 @@ Sober, and the second skips.
 `t_dock_hidden.py` needs `es2gears_wayland` (mesa-demos) and skips without
 it.
 
+`t_winsend_kwin.py` starts the nested KWin with its own Xwayland, opens fake
+games there (minimized, covered, on desktop 2, an X11 one), a user window with
+a fake typist, two KWrite windows (Wayland and X11) and a game in the Dock,
+and checks every key, the typing order, the focus, the stacking order and,
+from screenshots taken all along, that no hidden game ever shows. It needs
+`kwin_wayland`, `Xwayland` and `kwrite`. `WCTEST_TIMELINE=1` prints the timeline of every round.
+
 Run them with `QT_QPA_PLATFORM=offscreen`. The rest need the compositor; run
 them from the project root:
 
@@ -1200,8 +1250,6 @@ sg input -c "python3 tests/t_multimouse.py"  # several mice, each cloned with it
 python3 tests/t_fast.py 0.1                  # emitted vs. delivered clicks at 10,000/s
 python3 tests/t_keymacro.py                  # keys delivered, and never left stuck
 python3 tests/t_antiafk.py                   # nudge amplitude on screen and drift over time
-sg input -c "python3 tests/t_xinject.py"     # key into an X11 window, unfocused then minimized
-sg input -c "python3 tests/t_target.py"      # same for a Wayland target, through the focus path
 sg input -c "python3 tests/t_holdtime.py"    # press duration, measured the way a game polls it
 ```
 

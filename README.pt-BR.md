@@ -54,8 +54,11 @@ compositor e sem nada rodando como root.
 - **Contas do Sober** abrem mais cópias do Sober ao lado da de sempre, cada
   uma com login do Roblox, configurações e rede próprios, então uma segunda
   conta joga ao mesmo tempo que a primeira, na área de trabalho ou na Doca
-- **Mandar tecla para uma janela** — escolha uma janela aberta e alimente ela
-  com uma tecla; em alvo X11 chega sem mexer no foco, mesmo minimizada
+- **Mandar tecla para uma janela** alimenta uma lista de até 8 janelas, cada
+  uma com sua tecla e intervalo; janelas X11 e da Doca recebem sem mexer no
+  foco, mesmo minimizadas, e janelas Wayland recebem num instante de foco
+  emprestado de cerca de 0,1 s que guarda sua digitação e mantém escondida a
+  janela escondida
 - **Anti-AFK** — mexe o ponteiro e devolve, com deriva zero
 - **Aviso de atualização** — avisa que saiu release nova, do GitHub ou do
   GitLab, sem você ir olhar
@@ -855,24 +858,65 @@ que o atalho pegou sem precisar olhar.
 
 ### Mandar tecla para uma janela
 
-Escolha uma das suas janelas abertas e o WayClick alimenta ela com uma tecla no
-intervalo definido — espaço num jogo a cada 60 s, por exemplo, enquanto você
-continua trabalhando. A lista mostra cada janela aberta com o ícone real do
-programa e uma marca de como a tecla vai chegar; a tecla se define apertando
-ela, igual na macro:
+Monte uma lista de até 8 janelas abertas e o WayClick alimenta cada uma com a
+sua tecla no seu intervalo: espaço num jogo a cada 60 s, Enter num segundo
+jogo a cada 5 s, enquanto você continua trabalhando numa terceira janela.
+**+ Adicionar janela** põe uma linha, **↻** lê as janelas abertas de novo, e
+cada linha tem a janela (com o ícone real do programa), a tecla (definida
+apertando ela, igual na macro), de quanto em quanto tempo, e um contador de
+teclas mandadas. A lista fica salva, e uma janela fechada continua nela
+marcada com ✕ até abrir de novo, então um jogo que você reabre é achado
+sozinho.
+
+A marca na frente de cada janela diz como a tecla chega:
 
 | | |
 |---|---|
 | **⌨** | Janela X11 (Xwayland). A tecla é endereçada àquela janela: seu foco nunca é tocado, e funciona **mesmo minimizada**. |
-| **◐** | Janela Wayland pura. Não há como endereçar, então o WayClick dá foco a ela por ~40 ms, manda a tecla e devolve o foco. |
+| **◐** | Janela Wayland pura. O Wayland não tem como endereçar tecla a uma janela, então o WayClick empresta o foco a ela por cerca de 0,1 s, manda a tecla e devolve o foco. |
+| **▣** | Janela na Doca. A tecla vai pelo KWin da própria Doca, então o foco da sua área de trabalho não mexe nunca. |
 
-Medido contra um alvo X11 em processo próprio, com o foco parado em outra janela
-o tempo todo: 3 de 3 entregues sem foco, mais 6 com a janela minimizada, 0
-vazaram para a janela em foco.
+Nas janelas **◐**, o instante de foco emprestado foi feito para você não
+perceber:
 
-Se a janela escolhida for Wayland pura, o grupo mostra um aviso vermelho. A saída
-é reabrir aquele programa como cliente X11, o que normalmente é uma variável de
-ambiente:
+- **Sua digitação fica guardada, não se perde.** O teclado que você está
+  usando congela naquele instante: o que você digita entra numa fila e é
+  repetido em ordem logo depois, e uma tecla que você está segurando é solta
+  e apertada de novo, então nada seu cai no jogo e nada do jogo cai na sua
+  janela.
+- **Janela escondida continua escondida.** Um alvo minimizado, atrás de outras
+  janelas ou em outra área de trabalho virtual fica totalmente transparente
+  enquanto tem o foco, e depois volta exatamente como estava: minimizado de
+  novo, na sua área de trabalho, no mesmo lugar da pilha.
+- **Várias janelas dividem o instante.** Todas as janelas ◐ que estão na hora
+  vão numa rodada só, uma depois da outra, e a sua janela recebe o foco de
+  volta uma vez.
+- **⌨ e ▣ nunca esperam.** Cada tipo tem sua própria fila, então uma janela
+  X11 ou da Doca mantém o intervalo mesmo durante uma rodada ◐.
+- **Nada fica invisível.** Se o WayClick for morto no meio de uma rodada, a
+  janela que ele deixou transparente aparece de novo assim que o WayClick
+  abre.
+
+Medido num KWin aninhado com Xwayland (`tests/t_winsend_kwin.py`, duas vezes),
+com uma janela de usuário em foco e alguém digitando nela o tempo todo:
+
+| O quê | Resultado |
+|---|---|
+| Foco fora da sua janela numa rodada ◐ | cerca de 0,1 s por linha na hora (105 ms com uma, 206 ms com duas) |
+| Janela ⌨ a cada 0,3 s durante rodadas ◐ | 30 a 31 de cerca de 31 esperadas, 50 ms por tecla, sem mexer no foco |
+| Teclas digitadas na janela do usuário durante as rodadas | 63 de 63, em ordem, guardadas 0,11 s na mediana e 0,58 s no máximo (cinco linhas na hora juntas) |
+| Alvos escondidos vistos na tela (mais de 90 capturas por rodada de teste) | 0 px |
+| KWrite em Wayland e em X11 como alvos | toda tecla salva no arquivo, o X11 nunca em foco |
+| Jogo ▣ na Doca a cada 0,3 s | toda tecla chegou, 0 trocas de foco na área de trabalho |
+| Janela deixada transparente por um kill | aparece de novo 2,2 a 2,4 s depois que o WayClick abre |
+
+O que você pode notar numa rodada ◐ é a barra de título da sua janela piscar
+como inativa por cerca de 0,1 s, um pouco mais quando várias linhas estão na
+hora juntas. Um jogo que só lê teclas quando está em foco recebe mesmo assim,
+porque naquele instante ele está em foco.
+
+Para não emprestar foco nenhum, abra o jogo na Doca (▣), ou reabra o
+programa como cliente X11, o que normalmente é uma variável de ambiente:
 
 ```bash
 SDL_VIDEODRIVER=x11 ./jogo          # SDL (a maioria dos jogos)
@@ -881,10 +925,11 @@ QT_QPA_PLATFORM=xcb ./app           # Qt
 flatpak run --env=SDL_VIDEODRIVER=x11 org.exemplo.App
 ```
 
-Aí ele passa a aparecer como ⌨ e recebe a tecla direto. Dois poréns honestos:
+Aí ele passa a aparecer como ⌨ e recebe a tecla direto. O Sober (Roblox) é só
+Wayland, então é ◐ na área de trabalho ou ▣ na Doca. Dois poréns honestos:
 programa que lê input raw pode ignorar evento sintético do X11, e isto vale só
-para teclado — clique segue o cursor, não o foco, então mirar clique numa janela
-exigiria teleportar seu ponteiro.
+para teclado, porque clique segue o cursor e não o foco, então mirar clique
+numa janela exigiria mover seu ponteiro.
 
 ### Atualizações
 
@@ -1138,6 +1183,8 @@ python3 tests/t_sober_kwin.py                       # tudo isso contra o Roblox 
 python3 tests/t_sidenav.py                          # a barra lateral: grupos, pontos, busca, teclas, só ícones quando estreita
 python3 tests/t_sober_accounts.py                   # as Contas do Sober num Sober falso: trava, pasta, fechar só a cópia dela, a página, a Doca
 python3 tests/t_sober_accounts_kwin.py              # duas contas com o Sober de verdade ao mesmo tempo, num KWin aninhado
+python3 tests/t_winsend_ui.py                       # a aba Janela: linhas, salvar, achar a janela, digitação guardada, rodadas num KWin falso
+python3 tests/t_winsend_kwin.py                     # Mandar tecla para uma janela num KWin aninhado com Xwayland: jogos, KWrite, Doca, alguém digitando
 ```
 
 O `t_screen_portal.py` roda o `xdg-desktop-portal` de verdade dentro do `bwrap`,
@@ -1197,6 +1244,14 @@ a versão são copiados do seu, como acima), na menor prioridade de CPU, e
 confere antes de fechar qualquer coisa que ela é do teste. Sem o `pasta` o
 primeiro pula as partes que abrem um Sober, e o segundo pula.
 
+O `t_winsend_kwin.py` abre o KWin aninhado com seu próprio Xwayland, abre lá
+jogos falsos (minimizado, coberto, na área de trabalho 2, um X11), uma janela
+de usuário com alguém digitando de mentira, dois KWrite (Wayland e X11) e um
+jogo na Doca, e confere cada tecla, a ordem da digitação, o foco, a ordem da
+pilha e, por capturas tiradas o tempo todo, que nenhum jogo escondido aparece.
+Ele precisa do `kwin_wayland`, do `Xwayland` e do `kwrite`.
+`WCTEST_TIMELINE=1` mostra a linha do tempo de cada rodada.
+
 Rode com `QT_QPA_PLATFORM=offscreen`. Os outros precisam do compositor; rode a
 partir da raiz do projeto:
 
@@ -1214,8 +1269,6 @@ sg input -c "python3 tests/t_multimouse.py"  # vários mouses, cada um clonado c
 python3 tests/t_fast.py 0.1                  # cliques emitidos x entregues a 10.000/s
 python3 tests/t_keymacro.py                  # teclas entregues, e nunca deixadas presas
 python3 tests/t_antiafk.py                   # amplitude do nudge na tela e deriva ao longo do tempo
-sg input -c "python3 tests/t_xinject.py"     # tecla numa janela X11, sem foco e depois minimizada
-sg input -c "python3 tests/t_target.py"      # o mesmo para alvo Wayland, pelo caminho do foco
 sg input -c "python3 tests/t_holdtime.py"    # duração da tecla, medida como um jogo consulta
 ```
 

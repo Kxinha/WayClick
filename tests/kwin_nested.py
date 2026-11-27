@@ -798,10 +798,17 @@ def inside_main():
         spawn("pipewire-pulse", ["pipewire-pulse"])
     w, h = os.environ.get("WCTEST_SIZE", "1920x1080").split("x")
     n = os.environ.get("WCTEST_OUTPUTS", "2")
+    xw = []
+    if os.environ.get("WCTEST_XWAYLAND") == "1":
+        # o KWin põe o socket do X aqui, mas não cria a pasta (o systemd do
+        # desktop é que cria); o /tmp da caixa é dela, vazio
+        os.makedirs("/tmp/.X11-unix", exist_ok=True)
+        os.chmod("/tmp/.X11-unix", 0o1777)
+        xw = ["--xwayland"]
     spawn("kwin", ["kwin_wayland", "--virtual", "--socket", SOCKET,
                    "--width", w, "--height", h, "--output-count", n,
                    "--no-lockscreen", "--no-global-shortcuts",
-                   "--no-kactivities"])
+                   "--no-kactivities"] + xw)
     if not until(lambda: os.path.exists(os.path.join(rt, SOCKET)), 20):
         sys.exit("kwin_wayland did not start")
     bsock = os.path.join(rt, "wctest-bridge.sock")
@@ -920,8 +927,13 @@ def render_node():
 class Bench:
     """Sobe a caixa e fala com ela. Use com `with Bench() as b:`."""
 
-    def __init__(self, size="1920x1080", outputs=2, keep=False):
+    def __init__(self, size="1920x1080", outputs=2, keep=False,
+                 xwayland=False):
+        """xwayland: o KWin da caixa sobe um Xwayland também (o X dele fica
+        no /tmp e na rede da caixa, longe do X de quem roda); display()
+        diz qual é."""
         self.size, self.n_outputs, self.keep = size, outputs, keep
+        self.xwayland = xwayland
         self.work = tempfile.mkdtemp(prefix="wctest-kwin-")
         self.rt = os.path.join(self.work, "rt")
         self.home = os.path.join(self.work, "home")
@@ -957,7 +969,9 @@ class Bench:
                 "QT_QPA_PLATFORM": "wayland", "PYTHONDONTWRITEBYTECODE": "1",
                 "GIO_USE_VFS": "local", "WCTEST_SANDBOX": "1",
                 "WCTEST_SIZE": self.size,
-                "WCTEST_OUTPUTS": str(self.n_outputs)}
+                "WCTEST_OUTPUTS": str(self.n_outputs),
+                "WCTEST_XWAYLAND": "1" if getattr(self, "xwayland", False)
+                else "0"}
 
     def start(self):
         if self.node is None:
@@ -1058,6 +1072,20 @@ class Bench:
 
     def run(self, argv, timeout=60, env=None):
         return self.request(op="run", argv=argv, timeout=timeout, env=env)
+
+    def display(self, timeout=20.0):
+        """O DISPLAY do Xwayland da caixa (":0"...), ou None. O KWin só
+        sobe o Xwayland quando um cliente X chega, mas o socket já existe
+        desde o começo."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            r = self.run(["sh", "-c", "ls /tmp/.X11-unix 2>/dev/null"])
+            names = sorted(n for n in (r.get("out") or "").split()
+                           if n.startswith("X") and n[1:].isdigit())
+            if names:
+                return ":" + names[0][1:]
+            time.sleep(0.3)
+        return None
 
     def tail(self, name, n=4000):
         p = os.path.join(self.work, "inside.log") if name == "inside" \

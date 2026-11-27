@@ -1307,7 +1307,8 @@ def main():
         reports, base = setup_config(b)
         h.check("wayclick --import takes the five scripts",
                 all(code == 0 for code, _o in reports.values())
-                and len(base.get("macros", [])) == 12,
+                # 13: desde a 1.13.0 o :*:btw:: do combo.ahk vira macro
+                and len(base.get("macros", [])) == 13,
                 f"{ {k: v[0] for k, v in reports.items()} }, "
                 f"{len(base.get('macros', []))} macros")
         h.check("--import warns that stacked.ahk's F8 is the arm hotkey",

@@ -120,6 +120,11 @@ with kn.Bench(outputs=2) as b:
     check("each question takes well under a second",
           max(x[3] for x in res) < 1.0, str([x[3] for x in res]))
 
+    # as duas janelas abrem juntas, e a que mapear por último fica ativa;
+    # o jogo tem de começar atrás para o foco ter o que provar
+    b.kwin.window_js("org.wctest.Browser",
+                     "workspace.activeWindow = w; report({});")
+    until(lambda: not wins(b)["org.wctest.Sober"]["active"], 5)
     before = wins(b)
     res = probe(b, ["find", ["sober", True]])
     after = wins(b)

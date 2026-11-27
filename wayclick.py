@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """WayClick — autoclicker para Wayland via /dev/uinput (kernel), sem X11."""
 import base64, binascii, ctypes, fcntl, glob, grp, hashlib, json, math, os, pwd
-import random, re, select
+import collections, random, re, select
 import shlex, shutil, socket, struct
 import signal, subprocess, sys, tempfile, threading, time, unicodedata
 import urllib.request, wave
@@ -38,7 +38,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.13.0"
+VERSION = "1.14.0"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -892,6 +892,8 @@ class HubDevice:
         self.dropping = False
         self.dead = False
         self.grab_error = 0.0
+        self.queue = None               # congelado: o que espera o thaw()
+        self.thaw_keys = ()             # soltas no freeze() ainda apertadas
 
     def has(self, code):
         return has_bit(self.keybits, code)
@@ -917,6 +919,8 @@ class InputHub:
         self._run = False
         self._thread = None
         self._next_scan = 0.0
+        self._frozen = 0
+        self._frozen_until = 0.0
 
     # ------------------------------------------------------ inscrições --
     def start(self):
@@ -984,6 +988,101 @@ class InputHub:
                 except OSError:
                     continue
                 d.swallowed.update(up)
+
+    # --------------------------------------------------------- segurar --
+    FREEZE_MAX_S = 1.5
+
+    def freeze(self, seconds=None):
+        """Segura o que os teclados capturados digitam, enquanto outra
+        janela tem o foco por um instante (a tecla para uma janela Wayland).
+        O compositor vê na hora cada tecla repassada sendo solta, então a
+        janela que perde o foco não fica com nada apertado e a que ganha não
+        recebe tecla de ninguém; o que se digita no meio fica guardado, na
+        ordem, e sai no thaw(), já na janela de volta. Sem thaw() em
+        `seconds` (FREEZE_MAX_S), solta sozinho: um teclado nunca fica
+        mudo. Devolve quantos teclados ficaram segurados."""
+        with self.lock:
+            self._frozen_until = time.monotonic() + (seconds
+                                                     or self.FREEZE_MAX_S)
+            self._frozen += 1
+            if self._frozen > 1:
+                return sum(1 for d in self.devs.values()
+                           if d.queue is not None)
+            n = 0
+            for d in self.devs.values():
+                if d.dead or not d.kbd or not d.grabbed or d.out is None:
+                    continue
+                held = sorted(d.down - d.swallowed)
+                d.queue, d.thaw_keys = bytearray(), held
+                n += 1
+                if held:
+                    try:
+                        os.write(d.out.fd, b"".join(_ev(EV_KEY, c, 0)
+                                                    for c in held) + SYN)
+                    except OSError:
+                        pass
+        self._wake()
+        return n
+
+    def thaw(self):
+        with self.lock:
+            if not self._frozen:
+                return
+            self._frozen -= 1
+            if not self._frozen:
+                self._thaw_all()
+
+    @staticmethod
+    def _first_key_events(buf):
+        """O primeiro valor de cada tecla na fila: 0 é que ela foi solta."""
+        first = {}
+        for i in range(0, len(buf) - EVENT_SIZE + 1, EVENT_SIZE):
+            _, _, etype, code, value = struct.unpack_from(EVENT_FMT, buf, i)
+            if etype == EV_KEY and value in (0, 1):
+                first.setdefault(code, value)
+        return first
+
+    def _thaw_all(self):
+        """Devolve ao compositor o que ficou segurado. Tecla que seguia
+        apertada desde o freeze() é apertada de novo (andar com W continua
+        andando); tecla solta no meio não é (digitando rápido, um "e" que
+        estava descendo no freeze não sai duas vezes). Depois vem a fila,
+        na ordem em que se digitou."""
+        self._frozen = 0
+        for d in self.devs.values():
+            q, held = d.queue, d.thaw_keys
+            d.queue, d.thaw_keys = None, ()
+            if q is None or d.dead or d.out is None:
+                continue
+            first = self._first_key_events(q)
+            again = [c for c in held if first.get(c) != 0 and c in d.down
+                     and c not in d.swallowed]
+            buf = bytearray()
+            if again:
+                buf += b"".join(_ev(EV_KEY, c, 1) for c in again) + SYN
+            buf += q
+            if buf:
+                try:
+                    os.write(d.out.fd, bytes(buf))
+                except OSError:
+                    pass
+
+    def keyboards(self):
+        """(capturados, presos): quantos teclados o hub repassa agora (e
+        pode segurar), e se um que ele não repassa tem tecla apertada."""
+        with self.lock:
+            grabbed, stuck = 0, False
+            for d in self.devs.values():
+                if d.dead or not d.kbd:
+                    continue
+                if d.grabbed and d.out is not None:
+                    grabbed += 1
+                elif not stuck:
+                    try:
+                        stuck = keys_down(d.fd)
+                    except OSError:
+                        pass
+            return grabbed, stuck
 
     # ------------------------------------------------------- consultas --
     def keyboard_files(self):
@@ -1216,6 +1315,7 @@ class InputHub:
         d.out = None
         d.swallowed.clear()
         d.frame = bytearray()
+        d.queue, d.thaw_keys = None, ()
         if d.clone is not None:
             self._closing.append(d.clone)
             d.clone = None
@@ -1287,6 +1387,9 @@ class InputHub:
             if grabbed:
                 d.frame += raw
         if out and d.out is not None:
+            if d.queue is not None:
+                d.queue += out              # congelado: sai no thaw()
+                return
             try:
                 os.write(d.out.fd, bytes(out))
             except OSError:
@@ -1347,6 +1450,9 @@ class InputHub:
                 pending = any(d.pending for d in live)
             wait = self.PENDING_S if pending else \
                 max(0.05, self._next_scan - time.monotonic())
+            if self._frozen:
+                wait = min(wait, max(0.0, self._frozen_until
+                                     - time.monotonic()))
             try:
                 ready, _, _ = select.select(rl, [], [], wait)
             except (OSError, ValueError):
@@ -1366,6 +1472,8 @@ class InputHub:
                         self._read(byfd[fd])
                     elif fd in clones:
                         self._leds(clones[fd])
+                if self._frozen and time.monotonic() >= self._frozen_until:
+                    self._thaw_all()        # quem congelou não voltou a tempo
                 self._try_pending()
             if time.monotonic() >= self._next_scan:
                 self._next_scan = time.monotonic() + self.RESCAN_S
@@ -1381,6 +1489,8 @@ class InputHub:
             self._thread.join(timeout=1.0)
             self._thread = None
         with self.lock:
+            if self._frozen:
+                self._thaw_all()
             self.subs = []
             for d in list(self.devs.values()):
                 self._ungrab(d)
@@ -8462,6 +8572,45 @@ callDBus("%(svc)s", "%(path)s", "%(iface)s", "answer",
 """
 
 
+_X_HANDLER = None
+
+
+_X_THREADS = False
+
+
+def _x_threads(x):
+    """XInitThreads antes da primeira conexão: a lista de janelas (thread da
+    UI) e o enviador (thread dele) usam o X ao mesmo tempo, cada um com a
+    sua conexão. O libX11 1.8 já faz isso sozinho; o 1.7 (Ubuntu 22.04)
+    não."""
+    global _X_THREADS
+    if _X_THREADS:
+        return
+    _X_THREADS = True
+    try:
+        x.XInitThreads.restype = ctypes.c_int
+        x.XInitThreads()
+    except AttributeError:
+        pass
+
+
+def _x_quiet(x):
+    """Um erro do X (BadWindow de uma janela que fechou entre a lista e o
+    envio) não pode derrubar o app: o tratador padrão da Xlib chama exit().
+    Este ignora; quem envia confere a lista de janelas antes."""
+    global _X_HANDLER
+    if _X_HANDLER is not None:
+        return
+    proto = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    _X_HANDLER = proto(lambda _dpy, _err: 0)
+    try:
+        x.XSetErrorHandler.argtypes = [proto]
+        x.XSetErrorHandler.restype = ctypes.c_void_p
+        x.XSetErrorHandler(_X_HANDLER)
+    except (AttributeError, ctypes.ArgumentError):
+        pass
+
+
 class XInject:
     """Injeção de tecla numa janela X11 específica, via XSendEvent.
 
@@ -8494,6 +8643,8 @@ class XInject:
             self.error = "libX11 not found"
             return
         self._declare()
+        _x_threads(self.x)
+        _x_quiet(self.x)
         self.dpy = self.x.XOpenDisplay(None)
         if not self.dpy:
             self.error = "could not open the X11 display"
@@ -8501,10 +8652,23 @@ class XInject:
         self.root = self.x.XDefaultRootWindow(self.dpy)
         self.ok = True
 
+    def close(self):
+        """Fecha a conexão com o X (cada thread tem a sua)."""
+        if self.dpy:
+            try:
+                self.x.XCloseDisplay(self.dpy)
+            except (AttributeError, ctypes.ArgumentError):
+                pass
+        self.dpy = None
+        self.ok = False
+
     def _declare(self):
         """ctypes sem argtypes trunca ponteiro para int e derruba o processo."""
         x, D, W = self.x, ctypes.c_void_p, ctypes.c_ulong
         x.XOpenDisplay.argtypes = [ctypes.c_char_p]; x.XOpenDisplay.restype = D
+        # sem argtypes o ctypes passa o ponteiro como int de 32 bits, e o
+        # XCloseDisplay cai com SIGSEGV
+        x.XCloseDisplay.argtypes = [D]; x.XCloseDisplay.restype = ctypes.c_int
         x.XDefaultRootWindow.argtypes = [D]; x.XDefaultRootWindow.restype = W
         x.XInternAtom.argtypes = [D, ctypes.c_char_p, ctypes.c_int]
         x.XInternAtom.restype = W
@@ -8549,6 +8713,19 @@ class XInject:
         if r != 0 or not data:
             return None, 0
         return data, nitems.value
+
+    def title(self, win):
+        """O título da janela (_NET_WM_NAME, senão WM_NAME), ou ""."""
+        if not self.ok:
+            return ""
+        for name in ("_NET_WM_NAME", "WM_NAME"):
+            data, n = self._prop(win, name, 0)          # AnyPropertyType
+            if data:
+                raw = ctypes.string_at(data, n)
+                self.x.XFree(data)
+                if raw:
+                    return raw.decode(errors="replace")
+        return ""
 
     def windows(self):
         """[(xid, pid, classe)] das janelas X11 gerenciadas agora."""
@@ -8815,6 +8992,193 @@ class KeyRow(QWidget):
         self.catcher.setToolTip(_("Click, then press the key you want"))
 
 
+def target_way(data):
+    """Por onde a tecla chega a uma janela da lista: "x11" (endereçada, sem
+    foco), "dock" (o teclado da Doca) ou "focus" (foco por um instante)."""
+    data = data or {}
+    if data.get("where") == "dock":
+        return "dock"
+    return "x11" if data.get("xid") else "focus"
+
+
+WAY_MARK = {"x11": "⌨", "dock": "▣", "focus": "◐"}
+WAY_TIPS = {
+    "x11": "X11 window: the key goes straight to it, without focus, even "
+           "minimized or on another desktop.",
+    "dock": "A window inside the Dock: the key goes through the Dock's own "
+            "keyboard, your desktop sees nothing.",
+    "focus": "Wayland window: it gets the focus for an instant (about a "
+             "tenth of a second, invisible when it was covered or "
+             "minimized) and the focus comes back. What you type meanwhile "
+             "is held and arrives right after, in your window."}
+
+
+class TargetRow(QWidget):
+    """Uma janela da lista do Mandar tecla: qual, que tecla, de quanto em
+    quanto. A janela é guardada pelo nome do app e pelo título (o id do
+    KWin muda a cada vez que ela abre), e uma lista vazia de janelas não
+    apaga a escolha: ela volta quando a janela aparece."""
+    removed = Signal(object)
+    changed = Signal()
+    # larguras fixas, as mesmas do cabeçalho da lista; a da janela estica,
+    # e o mínimo dela é pequeno para a página não alargar a WayClick
+    KEY_W, EVERY_W, STATE_W, MINUS_W = 96, 86, 50, 30
+    WIN_CHARS = 4
+
+    def __init__(self, spec=None):
+        super().__init__()
+        spec = spec or {}
+        self.want = {"cls": str(spec.get("cls") or ""),
+                     "title": str(spec.get("title") or ""),
+                     "where": "dock" if spec.get("where") == "dock"
+                     else "desk"}
+        self.win = QComboBox()
+        self.win.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.win.setMinimumContentsLength(self.WIN_CHARS)
+        self.win.currentIndexChanged.connect(self._picked)
+        self.catcher = KeyCatcher(int(spec.get("code") or KEYS["Space"]),
+                                  str(spec.get("key") or "Space"))
+        self.catcher.setFixedWidth(self.KEY_W)
+        self.every = QDoubleSpinBox()
+        self.every.setRange(0.1, 3600.0)
+        self.every.setDecimals(1)
+        self.every.setSingleStep(1.0)
+        self.every.setSuffix(" s")
+        try:
+            every = float(spec.get("every", 60))
+        except (TypeError, ValueError):
+            every = 60.0
+        self.every.setValue(every)
+        self.every.setFixedWidth(self.EVERY_W)
+        self.mark = ""                  # ⌨ ▣ ◐, também no texto da janela
+        self.state = QLabel("")
+        self.state.setFixedWidth(self.STATE_W)
+        self.state.setStyleSheet("font-size:11px;")
+        self.minus = QPushButton("−")
+        self.minus.setFixedWidth(self.MINUS_W)
+        self.minus.setToolTip(_("Remove this window"))
+        self.minus.clicked.connect(lambda: self.removed.emit(self))
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.win, 1)
+        row.addWidget(self.catcher)
+        row.addWidget(self.every)
+        row.addWidget(self.state)
+        row.addWidget(self.minus)
+        self.catcher.changed.connect(self.changed)
+        self.every.valueChanged.connect(lambda _v: self.changed.emit())
+        self._fill_empty()
+
+    # ------------------------------------------------------------ lista --
+    def _fill_empty(self):
+        self.win.blockSignals(True)
+        self.win.clear()
+        if self.want["cls"]:
+            # a janela guardada, fechada agora: fica escolhida mesmo assim
+            self.win.addItem("✕ " + (self.want["title"] or self.want["cls"])
+                             [:36] + "  —  " + self.want["cls"],
+                             dict(self.want, id="", xid=None, gone=True))
+        else:
+            self.win.addItem(_("no window found"), None)
+        self.win.blockSignals(False)
+        self._paint_way()
+
+    def match(self, items, taken=()):
+        """(índice, regra) da janela de antes em items: o mesmo id, ou o
+        mesmo app e título ("exact"), ou o único do mesmo app entre os que
+        nenhuma outra linha achou pelo título ("cls"). (-1, "") se nada."""
+        keep = self.win.currentData() or {}
+        cls, title = self.want["cls"].lower(), self.want["title"]
+        where = self.want["where"]
+
+        def same(d):
+            return d.get("where", "desk") == where and \
+                d.get("cls", "").lower() == cls
+        if keep.get("id"):
+            for i, (_ic, _l, d) in enumerate(items):
+                if d["id"] == keep["id"]:
+                    return i, "id"
+        if not cls:
+            return -1, ""
+        for i, (_ic, _l, d) in enumerate(items):
+            if same(d) and d.get("title") == title:
+                return i, "exact"
+        free = [i for i, (_ic, _l, d) in enumerate(items)
+                if same(d) and d["id"] not in taken]
+        return (free[0], "cls") if len(free) == 1 else (-1, "")
+
+    def fill(self, items, pick=None):
+        """items: [(ícone, rótulo, dados)], os mesmos para todas as linhas;
+        pick: o índice escolhido (App.refresh_windows decide entre as
+        linhas), senão match(). Sem a janela guardada, ela fica na lista
+        marcada ✕ e segue escolhida."""
+        if pick is None:
+            pick = self.match(items)[0]
+        cls, title = self.want["cls"], self.want["title"]
+        self.win.blockSignals(True)
+        self.win.clear()
+        for icon, label, d in items:
+            self.win.addItem(icon, label, d)
+        if pick < 0 and cls:
+            self.win.addItem("✕ " + (title or cls)[:36] + "  —  " + cls,
+                             dict(self.want, id="", xid=None, gone=True))
+            pick = self.win.count() - 1
+        if not self.win.count():
+            self.win.addItem(_("no window found"), None)
+        self.win.setCurrentIndex(max(0, pick))
+        self.win.blockSignals(False)
+        self._picked(self.win.currentIndex(), quiet=True)
+
+    def _picked(self, _i=0, quiet=False):
+        d = self.win.currentData() or {}
+        if d and not d.get("gone"):
+            self.want = {"cls": d.get("cls", ""), "title": d.get("title", ""),
+                         "where": d.get("where", "desk")}
+        self._paint_way()
+        if not quiet:
+            self.changed.emit()
+
+    def _paint_way(self):
+        d = self.win.currentData()
+        way = target_way(d) if d and not d.get("gone") else ""
+        self.mark = WAY_MARK.get(way, "")
+        self.win.setToolTip(_(WAY_TIPS[way]) if way else "")
+
+    # ------------------------------------------------------------ dados --
+    def data(self):
+        """A janela escolhida, aberta agora, ou None."""
+        d = self.win.currentData()
+        return d if d and not d.get("gone") else None
+
+    def spec(self):
+        return dict(self.want, key=self.catcher.name, code=self.catcher.code,
+                    every=round(self.every.value(), 1))
+
+    def show_state(self, t):
+        """t: o alvo do WindowSender (hits, ms, error) ou None."""
+        if not t:
+            self.state.setText("")
+            self.state.setToolTip("")
+            self.state.setStyleSheet("font-size:11px;")
+            return
+        if t.get("error"):
+            self.state.setText("⚠ ×" + str(t.get("hits", 0)))
+            self.state.setToolTip(t["error"])
+            self.state.setStyleSheet("font-size:11px;color:#d04030;")
+            return
+        self.state.setText(f"×{t.get('hits', 0)}")
+        self.state.setToolTip(_("{n} keys sent, the last took {ms} ms",
+                                n=t.get("hits", 0),
+                                ms=f"{t.get('ms', 0):.0f}"))
+        self.state.setStyleSheet("font-size:11px;")
+
+    def retranslate(self):
+        self.minus.setToolTip(_("Remove this window"))
+        self.catcher.setToolTip(_("Click, then press the key you want"))
+        self._paint_way()
+
+
 # nomes de keysym do X para as teclas que a macro oferece
 X_KEYSYM = {"Space": "space", "Enter": "Return", "Tab": "Tab", "Esc": "Escape",
             "Backspace": "BackSpace", "Delete": "Delete", "Insert": "Insert",
@@ -9020,28 +9384,22 @@ class KWinBridge(QObject):
         name = f"wayclick-{token}"
         path = f"{self.script[:-3]}-{token}.js"
 
-        def gdbus(*args):
-            try:
-                return subprocess.run(
-                    ("gdbus", "call") + self._bus_args
-                    + ("-d", "org.kde.KWin") + args,
-                    capture_output=True, text=True, timeout=5)
-            except (OSError, subprocess.SubprocessError):
-                return None
         loaded = False
         try:
             with open(path, "w") as fh:
                 fh.write(js % dict(fields, svc=self.service, path=self.path,
                                    iface=self.IFACE, token=token))
-            r = gdbus("-o", "/Scripting", "-m",
-                      "org.kde.kwin.Scripting.loadScript", path, name)
-            m = re.search(r"-?\d+", r.stdout) if r is not None else None
-            sid = int(m.group()) if m else -1
+            r = self._kcall("/Scripting", "org.kde.kwin.Scripting",
+                            "loadScript", path, name)
+            try:
+                sid = int(r[0]) if r else -1
+            except (TypeError, ValueError):
+                sid = -1
             if sid < 0:
                 return None
             loaded = True
-            gdbus("-o", f"/Scripting/Script{sid}", "-m",
-                  "org.kde.kwin.Script.run")
+            self._kcall(f"/Scripting/Script{sid}", "org.kde.kwin.Script",
+                        "run")
             app = QApplication.instance()
             if app is not None and \
                     threading.current_thread() is threading.main_thread():
@@ -9057,14 +9415,39 @@ class KWinBridge(QObject):
             return None
         finally:
             if loaded:
-                gdbus("-o", "/Scripting", "-m",
-                      "org.kde.kwin.Scripting.unloadScript", name)
+                self._kcall("/Scripting", "org.kde.kwin.Scripting",
+                            "unloadScript", name)
             with self._calls_lock:
                 self._calls.pop(token, None)
             try:
                 os.remove(path)
             except OSError:
                 pass
+
+    _qt_calls = True
+
+    def _kcall(self, obj, iface, method, *args):
+        """Um método do KWin, pela conexão D-Bus que o app já tem (de 0,2 a
+        1 ms) em vez de um gdbus por chamada (uns 10 ms de processo novo
+        cada): o foco emprestado faz três por janela. Se o QtDBus falhar, o
+        gdbus de antes. Devolve os valores da resposta, ou None."""
+        if self._qt_calls:
+            try:
+                from PySide6.QtDBus import QDBus, QDBusMessage
+                msg = QDBusMessage.createMethodCall("org.kde.KWin", obj,
+                                                    iface, method)
+                if args:
+                    msg.setArguments(list(args))
+                r = self.bus.call(msg, QDBus.Block, 5000)
+                if r.type() == QDBusMessage.ReplyMessage:
+                    return list(r.arguments())
+                return None
+            except Exception:                      # noqa: BLE001
+                self._qt_calls = False
+        r = self._gdbus("-o", obj, "-m", f"{iface}.{method}", *args)
+        if r is None or r.returncode != 0:
+            return None
+        return re.findall(r"-?\d+", r.stdout)[:1] or [True]
 
     def find(self, match, focus=False):
         """A janela cujo nome do app contém o texto, ou cujo título é ele:
@@ -9158,6 +9541,477 @@ def KWIN():
     if _KWIN is None:
         _KWIN = KWinBridge()
     return _KWIN
+
+
+# ---------------------------------------------- tecla para várias janelas --
+# Cada janela da lista recebe a tecla dela a cada N segundos, por um de três
+# caminhos, escolhido pela janela:
+#   x11   janela X11 (Xwayland): XSendEvent endereçado a ela. Sem foco, mesmo
+#         minimizada ou em outra área de trabalho (medido nas três).
+#   dock  janela dentro da Doca: o fake_input do KWin dela. O desktop não vê
+#         nada; com mais de uma janela lá dentro, o foco muda lá dentro.
+#   focus janela Wayland do desktop. O Wayland não endereça tecla a janela,
+#         então ela recebe o foco por um instante, a tecla vai pelo teclado
+#         virtual e o foco volta. Para isso não atrapalhar quem usa o
+#         computador: o hub segura os teclados no meio (o que se digita
+#         chega depois, na janela de volta); a janela fica com opacidade 0
+#         se estava coberta, minimizada ou em outra área (medido: a tela fica
+#         idêntica, 0 pixels mudam); minimizada volta a minimizar; de outra
+#         área de trabalho fica em todas por um instante, então a área atual
+#         não troca; e a ordem das janelas volta a ser a de antes.
+WIN_TARGETS_MAX = 8
+
+KWIN_FLASH_JS = """
+var want = %(want)s;
+var ws = workspace.windowList ? workspace.windowList() : workspace.clientList();
+function wid(w) { return w ? String(w.internalId) : ""; }
+function byId(id) {
+  if (!id) return null;
+  for (var i = 0; i < ws.length; i++) if (wid(ws[i]) === id) return ws[i];
+  return null;
+}
+function deskIds(w) {
+  var o = [], d = w.desktops || [];
+  for (var i = 0; i < d.length; i++) o.push(String(d[i].id));
+  return o;
+}
+function here(w) {
+  var cur = workspace.currentDesktop, d = w.desktops || [];
+  if (w.onAllDesktops || !cur) return true;
+  for (var i = 0; i < d.length; i++)
+    if (String(d[i].id) === String(cur.id)) return true;
+  return false;
+}
+function cut(a, b) {
+  return a.x < b.x + b.width && b.x < a.x + a.width &&
+         a.y < b.y + b.height && b.y < a.y + a.height;
+}
+function stackIds() {
+  var st = workspace.stackingOrder || [], o = [];
+  for (var i = 0; i < st.length; i++)
+    if (st[i].normalWindow || st[i].dialog) o.push(wid(st[i]));
+  return o;
+}
+function covered(t) {
+  var st = workspace.stackingOrder || [], seen = false;
+  for (var i = 0; i < st.length; i++) {
+    var w = st[i];
+    if (wid(w) === wid(t)) { seen = true; continue; }
+    if (!seen || !(w.normalWindow || w.dialog) || w.minimized || !here(w))
+      continue;
+    if (cut(w.frameGeometry, t.frameGeometry)) return true;
+  }
+  return false;
+}
+function find() {
+  var t = byId(want.id);
+  if (t || !want.cls) return t;
+  var same = [], exact = null, taken = want.taken || [];
+  for (var i = 0; i < ws.length; i++) {
+    var w = ws[i];
+    if (!w.normalWindow || String(w.resourceClass) !== want.cls) continue;
+    if (taken.indexOf(wid(w)) >= 0) continue;
+    same.push(w);
+    if (!exact && String(w.caption) === want.title) exact = w;
+  }
+  return exact || (same.length === 1 ? same[0] : null);
+}
+function undo(u) {
+  var w = byId(u.id);
+  if (!w) return;
+  if (!u.all && w.onAllDesktops) {
+    w.onAllDesktops = false;
+    var ds = [], all = workspace.desktops || [];
+    for (var i = 0; i < all.length; i++)
+      if (u.desk.indexOf(String(all[i].id)) >= 0) ds.push(all[i]);
+    if (ds.length) w.desktops = ds;
+  }
+  if (u.min && !w.minimized && !w.active) w.minimized = true;
+  // a opacidade não volta aqui: a janela ainda está na frente das outras.
+  // Volta no "back", depois da ordem de antes (items), ou, minimizada,
+  // depois da animação (op unhide)
+}
+var out = {active: wid(workspace.activeWindow)};
+if (want.stack === true) out.stack = stackIds();
+if (want.op === "go") {
+  var t = find();
+  out.found = t !== null;
+  if (t) {
+    out.id = wid(t);
+    out.title = String(t.caption);
+    var st = {id: out.id, min: t.minimized === true,
+              all: t.onAllDesktops === true, desk: deskIds(t),
+              opa: t.opacity, hid: false, moved: false};
+    if (!t.active) {
+      var off = !here(t);
+      if (want.hide && (st.min || off || covered(t))) {
+        st.hid = true;
+        t.opacity = 0;
+      }
+      if (off) t.onAllDesktops = true;
+      workspace.activeWindow = t;
+      st.moved = true;
+    }
+    out.state = st;
+    out.now = t.active === true;
+  }
+}
+if (want.op === "back") {
+  // a ordem das janelas volta a ser a de antes, sempre: uma janela coberta
+  // que veio para a frente não pode ficar lá
+  var now = stackIds(), keep = want.stack || [];
+  if (workspace.raiseWindow && JSON.stringify(now) !== JSON.stringify(keep))
+    for (var i = 0; i < keep.length; i++) {
+      var r = byId(keep[i]);
+      if (r) workspace.raiseWindow(r);
+    }
+  if (want.expect && out.active === want.expect) {
+    // quem usa o computador não clicou em outra janela no meio: o foco volta
+    var p = byId(want.id);
+    if (p) { if (!p.active) workspace.activeWindow = p; }
+    else if (!want.id) { try { workspace.activeWindow = null; } catch (e) {} }
+    out.back = p ? p.active === true : !want.id;
+  } else if (workspace.activeWindow && workspace.raiseWindow) {
+    // clicou: a janela que ele escolheu fica na frente, com o foco
+    workspace.raiseWindow(workspace.activeWindow);
+    out.back = false;
+  }
+}
+if (want.undo) undo(want.undo);
+var items = want.items || [];
+for (var i = 0; i < items.length; i++) {
+  var h = byId(items[i].id);
+  if (h && h.opacity === 0) h.opacity = items[i].opa || 1;
+}
+callDBus("%(svc)s", "%(path)s", "%(iface)s", "answer",
+         "%(token)s " + JSON.stringify(out));
+"""
+
+
+class KeyboardGuard:
+    """Inscrito do hub enquanto a lista tem janela Wayland do desktop: pede
+    a captura dos teclados (o hub só captura com todas as teclas soltas),
+    para ele poder segurar o que se digita durante o foco emprestado. Não
+    bloqueia tecla nenhuma."""
+    mice = None
+    grab_now = False
+
+    def wants_grab(self, d):
+        return d.kbd
+
+    def on_key(self, d, code, value):
+        return False
+
+
+def flash_recover_path():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR")
+                        or tempfile.gettempdir(), "wayclick-flash.json")
+
+
+class WindowSender(threading.Thread):
+    """Manda a tecla de cada janela da lista a cada N segundos, da thread
+    dele (os passos acima, em KWIN_FLASH_JS). Alvos que vencem juntos vão
+    numa rodada só: um foco emprestado para todas as janelas Wayland, uma
+    janela por vez, e um só retorno. A thread da UI precisa seguir andando:
+    a resposta do KWin chega por ela (KWinBridge.call)."""
+    SETTLE_S = 0.03      # o alvo já tem o foco quando a tecla chega
+    HOLD_S = 0.05        # quem lê o teclado por quadro vê a tecla
+    GAP_S = 0.02         # o release chega antes de o foco voltar
+    WAIT_FREE_S = 3.0    # tecla presa num teclado que o hub não segura
+    UNHIDE_S = 0.4       # a animação de minimizar acaba antes de reaparecer
+
+    def __init__(self, targets, keyboard=None, bridge=None, dock=None,
+                 hub=None, on_change=None, after=None):
+        """after: o enviador de antes (a lista mudou), que termina a rodada
+        dele antes de este começar."""
+        super().__init__(daemon=True, name="wayclick-windows")
+        self.targets = targets
+        self.keyboard, self.bridge, self.dock = keyboard, bridge, dock
+        self.hub, self.on_change = hub, on_change
+        self.after = after
+        # not "_stop": up to Python 3.12 that is a Thread method join() calls
+        self._halt = threading.Event()
+        self._x = None
+        self.flash_ms = 0.0
+        self.rounds = 0
+        self.round_log = collections.deque(maxlen=200)  # (via, janelas, ms)
+        self._count = threading.Lock()
+        now = time.monotonic()
+        for t in targets:
+            t.setdefault("hits", 0)
+            t.setdefault("ms", 0.0)
+            t.setdefault("error", "")
+            t.setdefault("next", now)
+
+    def stop(self):
+        self._halt.set()
+
+    # -------------------------------------------------------------- laço --
+    def run(self):
+        """Uma thread por via: a tecla X11 e a da Doca não esperam o foco
+        emprestado das janelas do desktop, nem uma a outra."""
+        if self.after is not None:
+            self.after.join(10.0)
+            self.after = None
+        self._recover()
+        lanes = {}
+        for t in self.targets:
+            lanes.setdefault(t["kind"], []).append(t)
+        ths = [threading.Thread(target=self._lane, args=(ts,), daemon=True,
+                                name="wayclick-windows-" + k)
+               for k, ts in lanes.items()]
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join()
+        if self._x is not None:
+            self._x.close()
+
+    def _lane(self, ts):
+        while not self._halt.is_set():
+            now = time.monotonic()
+            due = [t for t in ts if t["next"] <= now]
+            if not due:
+                nxt = min((t["next"] for t in ts), default=now + 1)
+                self._halt.wait(min(1.0, max(0.005, nxt - now)))
+                continue
+            t0 = time.perf_counter()
+            try:
+                self._round(due)
+            except Exception as e:          # noqa: BLE001
+                for t in due:               # um alvo com problema não para
+                    t["error"] = str(e)     # os outros
+            done = time.monotonic()
+            self.round_log.append((due[0]["kind"], len(due),
+                                   (time.perf_counter() - t0) * 1000))
+            for t in due:
+                t["next"] += t["every"]
+                if t["next"] <= done:
+                    t["next"] = done + t["every"]
+            with self._count:
+                self.rounds += 1
+            self._tell()
+
+    def _tell(self):
+        if self.on_change is not None:
+            try:
+                self.on_change()
+            except RuntimeError:            # a janela já fechou
+                pass
+
+    def _round(self, due):
+        for t in due:
+            if t["kind"] == "x11":
+                self._x11(t)
+        dock = [t for t in due if t["kind"] == "dock"]
+        if dock:
+            d = self.dock
+            ok = d is not None and d.alive() and d.input is not None
+            self._flash(dock, d.windows if ok else None, self._dock_key,
+                        hide=False, hold=False)
+        desk = [t for t in due if t["kind"] == "focus"]
+        if desk:
+            self._flash(desk, self.bridge, self._desk_key, hide=True,
+                        hold=True)
+
+    # --------------------------------------------------------------- X11 --
+    def _xi(self):
+        if self._x is None:
+            self._x = XInject()             # um Display só desta thread
+        return self._x
+
+    def _x11(self, t):
+        x = self._xi()
+        if not x.ok:
+            t["error"] = x.error or "X11"
+            return
+        wins = x.windows()
+        if t.get("xid") not in {w[0] for w in wins}:
+            cls = (t.get("cls") or "").lower()
+            same = [w[0] for w in wins if cls and w[2].lower() == cls]
+            t["xid"] = same[0] if len(same) == 1 else None
+        if not t.get("xid") or not t.get("keysym"):
+            t["error"] = _("The window is closed.") if not t.get("xid") \
+                else _("That key has no X11 equivalent.")
+            return
+        t0 = time.perf_counter()
+        if x.send_key(t["xid"], t["keysym"], self.HOLD_S):
+            t["hits"] += 1
+            t["ms"] = (time.perf_counter() - t0) * 1000
+            t["error"] = ""
+        else:
+            t["error"] = _("X11 did not take the key.")
+
+    # ---------------------------------------------------- foco emprestado --
+    def _desk_key(self, code):
+        self.keyboard.tap(code, self.HOLD_S)
+
+    def _dock_key(self, code):
+        inp = self.dock.input
+        inp.key(code, True)
+        time.sleep(self.HOLD_S)
+        inp.key(code, False)
+
+    @staticmethod
+    def _js(bridge, want):
+        raw = bridge.call(KWIN_FLASH_JS, want=json.dumps(want))
+        try:
+            v = json.loads(raw) if raw else None
+        except ValueError:
+            return None
+        return v if isinstance(v, dict) else None
+
+    def _flash(self, ts, bridge, press, hide, hold):
+        if bridge is None or not bridge.ok:
+            for t in ts:
+                t["error"] = _("KWin is not answering.")
+            return
+        if hold and self.keyboard is None:
+            for t in ts:
+                t["error"] = _("The virtual keyboard is not open.")
+            return
+        if hide and os.path.exists(flash_recover_path()):
+            recover_flash(bridge)       # uma rodada que o KWin não respondeu
+        # a mesma janela em duas linhas: um foco só, as teclas em seguida
+        order, by = [], {}
+        for t in ts:
+            k = t.get("id") or "?" + t.get("cls", "") + "\n" + t.get("title", "")
+            if k not in by:
+                by[k] = []
+                order.append(k)
+            by[k].append(t)
+        frozen = 0
+        if hold and self.hub is not None:
+            # tecla apertada num teclado que o hub não repassa ficaria com a
+            # janela que perde o foco: espera soltar, um tempo
+            end = time.monotonic() + self.WAIT_FREE_S
+            while self.hub.keyboards()[1] and time.monotonic() < end \
+                    and not self._halt.is_set():
+                time.sleep(0.02)
+            frozen = self.hub.freeze(0.6 + 0.3 * len(order))
+        t0 = time.perf_counter()
+        first = expect = undo = stack = None
+        taken, unsure, later, restore = [], [], [], []
+        try:
+            for k in order:
+                group = by[k]
+                t = group[0]
+                ans = self._js(bridge, {
+                    "op": "go", "id": t.get("id") or "",
+                    "cls": t.get("cls", ""), "title": t.get("title", ""),
+                    "hide": hide, "undo": undo, "stack": stack is None,
+                    "taken": taken})
+                undo = None
+                if ans is None:
+                    if t.get("id"):
+                        unsure.append({"id": t["id"], "opa": 1})
+                    for g in group:
+                        g["error"] = _("KWin did not answer.")
+                    continue
+                if first is None:
+                    first = ans.get("active", "")
+                if stack is None:
+                    stack = ans.get("stack") or []
+                if not ans.get("found"):
+                    for g in group:
+                        g["error"] = _("The window is closed.")
+                    continue
+                for g in group:
+                    g["id"] = ans["id"]
+                    g["title"] = ans.get("title") or g.get("title", "")
+                taken.append(ans["id"])
+                st = ans.get("state") or {}
+                if st.get("moved"):
+                    undo = st
+                    if st.get("hid"):
+                        self._remember(st)
+                        (later if st.get("min") else restore).append(
+                            {"id": st["id"], "opa": st.get("opa") or 1})
+                if not ans.get("now"):
+                    for g in group:
+                        g["error"] = _("KWin did not give it the focus.")
+                    continue
+                expect = ans["id"]
+                time.sleep(self.SETTLE_S)
+                for g in group:
+                    press(g["code"])
+                    g["hits"] += 1
+                    g["error"] = ""
+                time.sleep(self.GAP_S)
+        finally:
+            back_ok = True
+            if first is not None or undo is not None or unsure:
+                back = {"op": "back", "id": first or "",
+                        "expect": expect or "", "undo": undo,
+                        "stack": stack or [], "items": restore + unsure}
+                back_ok = self._js(bridge, back) is not None or \
+                    self._js(bridge, back) is not None
+            if frozen:
+                self.hub.thaw()
+        ms = (time.perf_counter() - t0) * 1000
+        self.flash_ms = ms
+        for t in ts:
+            t["ms"] = ms
+        if later:
+            # a animação de minimizar desenha a janela: com opacidade 0 ela
+            # some sem ninguém ver, e só depois a opacidade volta
+            self._halt.wait(self.UNHIDE_S)
+            back_ok = self._js(bridge, {"op": "unhide", "items": later}) \
+                is not None and back_ok
+        if hide and back_ok:
+            # sem resposta do KWin o arquivo fica, e a próxima rodada (ou o
+            # próximo WayClick) devolve a opacidade
+            self._forget()
+
+    # ------------------------------------------- opacidade, se o app cair --
+    def _remember(self, st):
+        """Uma janela ficou com opacidade 0: se o WayClick cair antes de
+        devolver, o próximo que abrir devolve (_recover)."""
+        path = flash_recover_path()
+        try:
+            with open(path) as fh:
+                items = json.load(fh)
+        except (OSError, ValueError):
+            items = []
+        if not isinstance(items, list):
+            items = []
+        items.append({"id": st["id"], "opa": st.get("opa") or 1})
+        try:
+            with open(path + ".tmp", "w") as fh:
+                json.dump(items[-16:], fh)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _forget():
+        try:
+            os.remove(flash_recover_path())
+        except OSError:
+            pass
+
+    def _recover(self):
+        recover_flash(self.bridge)
+
+
+def recover_flash(bridge):
+    """Devolve a opacidade de janelas que um WayClick anterior deixou com 0
+    no meio de um foco emprestado (caiu, foi morto)."""
+    path = flash_recover_path()
+    try:
+        with open(path) as fh:
+            items = json.load(fh)
+    except (OSError, ValueError):
+        return
+    if bridge is not None and bridge.ok and isinstance(items, list):
+        good = [i for i in items if isinstance(i, dict) and i.get("id")]
+        if good:
+            bridge.call(KWIN_FLASH_JS, want=json.dumps(
+                {"op": "unhide", "items": good}))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # ------------------------------------------------------------- a Doca --
@@ -11940,6 +12794,47 @@ TRANSLATIONS = {
         "Click, then press the key you want":
             "Clique e depois aperte a tecla que quiser",
         "Send key to a window": "Mandar tecla para uma janela",
+        "+ Add window": "+ Adicionar janela",
+        "Rescan windows": "Procurar as janelas de novo",
+        "Remove this window": "Tirar esta janela",
+        "{n} keys sent, the last took {ms} ms":
+            "{n} teclas mandadas, a última levou {ms} ms",
+        "X11 window: the key goes straight to it, without focus, even "
+        "minimized or on another desktop.":
+            "Janela X11: a tecla vai direto para ela, sem foco, mesmo "
+            "minimizada ou em outra área de trabalho.",
+        "A window inside the Dock: the key goes through the Dock's own "
+        "keyboard, your desktop sees nothing.":
+            "Janela dentro da Doca: a tecla vai pelo teclado da própria "
+            "Doca, o seu desktop não vê nada.",
+        "Wayland window: it gets the focus for an instant (about a tenth of "
+        "a second, invisible when it was covered or minimized) and the focus "
+        "comes back. What you type meanwhile is held and arrives right "
+        "after, in your window.":
+            "Janela Wayland: ela recebe o foco por um instante (cerca de um "
+            "décimo de segundo, invisível se estava coberta ou minimizada) e "
+            "o foco volta. O que você digita no meio fica guardado e chega "
+            "logo depois, na sua janela.",
+        "◐ Wayland windows get the focus for about a tenth of a second and "
+        "give it back. What you type meanwhile is held and arrives right "
+        "after, in your window. A window that is covered, minimized or on "
+        "another desktop stays invisible meanwhile. A program opened in X11 "
+        "mode (⌨) takes the key with no focus at all: SDL_VIDEODRIVER=x11, "
+        "GDK_BACKEND=x11 or QT_QPA_PLATFORM=xcb.":
+            "◐ Janelas Wayland recebem o foco por cerca de um décimo de "
+            "segundo e devolvem. O que você digita no meio fica guardado e "
+            "chega logo depois, na sua janela. Uma janela coberta, "
+            "minimizada ou em outra área de trabalho continua invisível "
+            "nesse meio tempo. Um programa aberto em modo X11 (⌨) recebe a "
+            "tecla sem foco nenhum: SDL_VIDEODRIVER=x11, GDK_BACKEND=x11 ou "
+            "QT_QPA_PLATFORM=xcb.",
+        "The window is closed.": "A janela está fechada.",
+        "X11 did not take the key.": "O X11 não aceitou a tecla.",
+        "KWin is not answering.": "O KWin não está respondendo.",
+        "KWin did not answer.": "O KWin não respondeu.",
+        "KWin did not give it the focus.": "O KWin não deu o foco a ela.",
+        "The virtual keyboard is not open.":
+            "O teclado virtual não está aberto.",
         "Window:": "Janela:", "Every:": "A cada:",
         "no window found": "nenhuma janela encontrada",
         "Targeted key unavailable: {msg}": "Tecla direcionada indisponível: {msg}",
@@ -18762,34 +19657,48 @@ class App(QWidget):
         macro_form.addWidget(self.macro_clash)
         macro_form.addWidget(self.macro_state)
 
-        # --- injeção direcionada a uma janela (beta) ---
-        self.win_sel = QComboBox()
-        self.win_sel.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.win_sel.setMinimumContentsLength(22)
-        self._scrollable(self.win_sel)
+        # --- tecla para janelas: até WIN_TARGETS_MAX, cada uma com a dela ---
+        self.win_rows = []
+        self.win_list = QVBoxLayout()
+        self.win_list.setContentsMargins(0, 0, 0, 0)
+        self.win_add = QPushButton(_("+ Add window"))
+        self.win_add.clicked.connect(lambda: self._add_win_row())
         self.win_refresh = QPushButton("↻")
         self.win_refresh.setFixedWidth(30)
+        self.win_refresh.setToolTip(_("Rescan windows"))
         self.win_refresh.clicked.connect(self.refresh_windows)
-        win_row = QHBoxLayout()
-        win_row.addWidget(self.win_sel, 1)
-        win_row.addWidget(self.win_refresh)
-        self.win_key = KeyCatcher(cfg.get("target_key_code", KEYS["Space"]),
-                                  cfg.get("target_key", "Space"))
-        self.win_sel.currentIndexChanged.connect(self._update_win_warn)
-        self.win_secs = QSpinBox(); self.win_secs.setRange(1, 3600)
-        self.win_secs.setValue(cfg.get("target_seconds", 60))
-        self.win_secs.setSuffix(" s")
-        self.win_secs.valueChanged.connect(self._target_restart)
+        self._win_items = None          # a última lista de janelas
+        for spec in self._win_specs(cfg):
+            self._add_win_row(spec, fill=False)
 
         self.win_warn = QLabel("")
         self.win_warn.setWordWrap(True)
-        self.win_warn.setStyleSheet("color:#d04030;font-size:11px;")
+        self.win_warn.setStyleSheet("color:#c86000;font-size:11px;")
         self.win_warn.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        target_form = QFormLayout()
-        self._row(target_form, "Window:", win_row)
-        self._row(target_form, "Key:", self.win_key)
-        self._row(target_form, "Every:", self.win_secs)
+        target_form = QVBoxLayout()
+        target_form.setContentsMargins(0, 0, 0, 0)
+        whead = QHBoxLayout()
+        for text, width in (("Window:", 0), ("Key:", TargetRow.KEY_W),
+                            ("Every:", TargetRow.EVERY_W)):
+            lbl = QLabel(_(text))
+            self._labels.append((lbl, text))
+            if width:
+                lbl.setFixedWidth(width)
+                whead.addWidget(lbl)
+            else:
+                whead.addWidget(lbl, 1)
+        # o estado e o botão de remover, com o espaço entre eles
+        whead.addSpacing(TargetRow.STATE_W + TargetRow.MINUS_W
+                         + 2 * whead.spacing() if whead.spacing() > 0
+                         else TargetRow.STATE_W + TargetRow.MINUS_W + 12)
+        target_form.addLayout(whead)
+        target_form.addLayout(self.win_list)
+        wadd = QHBoxLayout()
+        wadd.addWidget(self.win_add)
+        wadd.addWidget(self.win_refresh)
+        wadd.addStretch()
+        target_form.addLayout(wadd)
         # o aviso fica fora do form: QLabel com quebra de linha dentro de
         # QFormLayout não calcula a altura e sai cortado
         self.target_box = QCheckBox(_("Enable sending the key"))
@@ -19040,10 +19949,17 @@ class App(QWidget):
         self.trig_watcher = None  # HotkeyWatcher, quando o gatilho é tecla
         self.bridge = None      # KWinBridge, criado sob demanda
         self.xinject = None     # XInject, para janelas X11
-        self.target_hits = 0
-        self.target_ms = 0.0
-        self.target_timer = QTimer(self)
-        self.target_timer.timeout.connect(self._target_tick)
+        self.win_sender = None    # WindowSender, com o envio ligado
+        self.win_guard = None     # KeyboardGuard, com janela Wayland na lista
+        self._win_dying = []      # enviadores parados terminando a rodada
+        self._win_rounds = 0
+        self.win_poll = QTimer(self)
+        self.win_poll.setInterval(250)
+        self.win_poll.timeout.connect(self._win_tick)
+        if os.path.exists(flash_recover_path()):
+            # um WayClick anterior caiu no meio de um foco emprestado, com
+            # uma janela ainda invisível: ela volta já, não só no próximo envio
+            QTimer.singleShot(300, self._recover_flash)
         self._build_tray()
 
         # cria o mouse virtual já no início: o UI_DEV_CREATE precisa de ~0,4 s
@@ -19166,6 +20082,11 @@ class App(QWidget):
             size, self._small_size = self._small_size, None
             if not big:
                 self.resize(size)
+        if self.tabs.currentIndex() == self._tab_names.index("Window") \
+                and self._win_items is None:
+            # a lista de janelas só na primeira visita: ela roda um script
+            # no KWin, e quem não usa a aba não precisa disso
+            QTimer.singleShot(0, self.refresh_windows)
         self._bottom()
 
     def _bottom(self):
@@ -19486,6 +20407,10 @@ class App(QWidget):
         for row in self.key_rows:
             row.retranslate()
         self.key_add.setText(_("+ Add key"))
+        for row in self.win_rows:
+            row.retranslate()
+        self.win_add.setText(_("+ Add window"))
+        self.win_refresh.setToolTip(_("Rescan windows"))
         self.m_file.setTitle(_("File"))
         self.m_set.setTitle(_("Settings"))
         self.m_theme.setTitle(_("Theme"))
@@ -19963,7 +20888,7 @@ class App(QWidget):
             self.clicker.start()
         if "key" in names and not self.keymacros:
             self._start_key_macros()
-        if "window" in names and not self.target_timer.isActive():
+        if "window" in names and self.win_sender is None:
             self._target_start()
         self._state = "run"
         self._show_status()
@@ -19971,7 +20896,7 @@ class App(QWidget):
 
     def _stop_engines(self, names):
         if "window" in names:
-            self.target_timer.stop()
+            self._target_stop()
         if "click" in names and self.clicker:
             self.clicker.stop()
             self.clicker = None
@@ -20209,39 +21134,141 @@ class App(QWidget):
                 self.keyboard = None
         self._show_status()
 
-    # ------------------------------------------ janela alvo (beta) --------
+    # ------------------------------------------- tecla para janelas -----
+    @staticmethod
+    def _win_specs(cfg):
+        """As janelas da lista guardada; a config de antes dela tinha só a
+        tecla e o intervalo (a janela não era guardada)."""
+        ts = cfg.get("targets")
+        out = [t for t in ts[:WIN_TARGETS_MAX] if isinstance(t, dict)] \
+            if isinstance(ts, list) else []
+        return out or [{"key": cfg.get("target_key", "Space"),
+                        "code": cfg.get("target_key_code", KEYS["Space"]),
+                        "every": cfg.get("target_seconds", 60)}]
+
+    def _add_win_row(self, spec=None, fill=True):
+        if len(self.win_rows) >= WIN_TARGETS_MAX:
+            return None
+        row = TargetRow(spec)
+        row.removed.connect(self._remove_win_row)
+        row.changed.connect(self._wins_changed)
+        self.win_rows.append(row)
+        self.win_list.addWidget(row)
+        if fill:
+            if self._win_items is None:
+                self.refresh_windows()
+            else:
+                items, taken = self._win_items, self._win_taken(row)
+                i = row.match(items, taken)[0]
+                if i < 0 and not row.want["cls"]:
+                    # uma linha nova começa numa janela que ainda não está
+                    # na lista
+                    i = next((k for k, it in enumerate(items)
+                              if it[2]["id"] not in taken), 0)
+                row.fill(items, i)
+        self._sync_win_rows()
+        if fill:
+            self._wins_changed()
+        return row
+
+    def _win_taken(self, but=None):
+        return {(r.data() or {}).get("id") for r in self.win_rows
+                if r is not but and r.data()}
+
+    def _remove_win_row(self, row):
+        if len(self.win_rows) <= 1:
+            return                      # a lista sempre tem uma linha
+        self.win_rows.remove(row)
+        self.win_list.removeWidget(row)
+        row.setParent(None)
+        row.deleteLater()
+        self._sync_win_rows()
+        self._wins_changed()
+
+    def _sync_win_rows(self):
+        alone = len(self.win_rows) <= 1
+        for r in self.win_rows:
+            r.minus.setEnabled(not alone)
+        self.win_add.setEnabled(len(self.win_rows) < WIN_TARGETS_MAX)
+
+    def _wins_changed(self):
+        """Mexer na lista com o envio ligado vale na hora: um enviador novo
+        espera o de agora terminar a rodada dele e segue de onde parou."""
+        if not hasattr(self, "warn"):
+            return                      # ainda montando a janela
+        self._update_win_warn()
+        if self.win_sender is not None:
+            self._target_start(again=True)
+        self._show_status()
+
     def refresh_windows(self):
-        """Lista as janelas abertas, com ícone, mantendo a seleção se possível."""
+        """As janelas abertas do desktop e as da Doca, para todas as linhas.
+        Uma janela X11 é achada no X pelo processo e pelo app (o KWin não diz
+        o id X dela aos scripts), e pelo título quando o mesmo processo tem
+        mais de uma."""
         if self.bridge is None:
             self.bridge = KWIN()
-        keep = (self.win_sel.currentData() or {}).get("id")
-        self.win_sel.blockSignals(True)
-        self.win_sel.clear()
         wins = self.bridge.windows() if self.bridge.ok else []
-        if self.xinject is None:
-            self.xinject = XInject()
-        xs = self.xinject.windows() if self.xinject.ok else []
-        by_pid = {pid: xid for xid, pid, _cls in xs if pid}
-        by_cls = {cls.lower(): xid for xid, _pid, cls in xs if cls}
+        x = self._ensure_xinject()
+        xs = x.windows() if x.ok else []
+        titles = {}
+        items = []
+        me = os.getpid()
         for w in wins:
-            xid = by_pid.get(w["pid"]) or by_cls.get(w["cls"].lower())
-            w["xid"] = xid
-            mark = "⌨ " if xid else "◐ "     # injeção real x precisa de foco
-            label = f"{mark}{w['title'][:36]}  —  {w['cls']}"
-            self.win_sel.addItem(app_icon(w["cls"]), label,
-                                 {"id": w["id"], "xid": xid})
-        if not wins:
-            self.win_sel.addItem(_("no window found"), None)
-        idx = next((i for i in range(self.win_sel.count())
-                    if (self.win_sel.itemData(i) or {}).get("id") == keep), -1)
-        self.win_sel.setCurrentIndex(idx if idx >= 0 else 0)
-        self.win_sel.blockSignals(False)
-        self.win_sel.setEnabled(bool(wins))
+            if w.get("pid") == me:
+                continue                # o próprio WayClick
+            cls = str(w.get("cls") or "")
+            same = [xid for xid, pid, xc in xs if xc.lower() == cls.lower()
+                    and (not pid or not w.get("pid") or pid == w["pid"])]
+            if len(same) > 1:
+                for xid in same:
+                    if xid not in titles:
+                        titles[xid] = x.title(xid)
+                same = [xid for xid in same
+                        if titles[xid] == w.get("title")][:1]
+            d = {"id": w["id"], "cls": cls, "title": str(w.get("title") or ""),
+                 "xid": same[0] if same else None, "where": "desk"}
+            items.append((app_icon(cls), WAY_MARK[target_way(d)] + " "
+                          + d["title"][:36] + "  —  " + cls, d))
+        dock = getattr(self, "dock", None)
+        kw = dock.windows if dock is not None and dock.alive() else None
+        if kw is not None and kw.ok:
+            for w in kw.windows():
+                cls = str(w.get("cls") or "")
+                d = {"id": w["id"], "cls": cls,
+                     "title": str(w.get("title") or ""), "xid": None,
+                     "where": "dock"}
+                items.append((app_icon(cls), WAY_MARK["dock"] + " "
+                              + _("Dock") + ": " + d["title"][:30]
+                              + "  —  " + cls, d))
+        self._win_items = items
+        self._fill_win_rows()
         self._update_win_warn()
         if not self.bridge.ok:
             self.warn.setText(_("Targeted key unavailable: {msg}",
                                 msg=self.bridge.error or "?"))
         return wins
+
+    def _fill_win_rows(self):
+        """Cada linha acha a janela dela. Pelo id ou pelo título primeiro,
+        em todas; só depois o "único do mesmo app", entre as janelas que
+        sobraram: duas linhas de duas janelas do mesmo jogo, uma fechada,
+        não vão as duas para a que ficou aberta."""
+        items = self._win_items or []
+        strong, taken = {}, set()
+        for row in self.win_rows:
+            i, rule = row.match(items)
+            if rule in ("id", "exact"):
+                strong[row] = i
+                taken.add(items[i][2]["id"])
+        for row in self.win_rows:
+            if row in strong:
+                row.fill(items, strong[row])
+                continue
+            i, _rule = row.match(items, taken)
+            row.fill(items, i)
+            if i >= 0:
+                taken.add(items[i][2]["id"])
 
     def _ensure_xinject(self):
         if self.xinject is None:
@@ -20249,19 +21276,22 @@ class App(QWidget):
         return self.xinject
 
     def _update_win_warn(self):
-        """Wayland puro não tem como receber tecla endereçada: avisa e ensina
-        a reabrir o programa como cliente X11, que aí entra na injeção real."""
+        """Diz o que acontece com as janelas Wayland do desktop, as que só
+        recebem a tecla com o foco por um instante."""
         if not hasattr(self, "win_warn"):
             return
-        sel = self.win_sel.currentData() or {}
-        if not self.win_sel.isEnabled() or not sel or sel.get("xid"):
-            self._set_win_warn("")
-        else:
-            self._set_win_warn(_(
-                "⚠ Pure Wayland: reachable only by stealing focus for an "
-                "instant. Reopen this program in X11 mode and it takes the key "
-                "directly, even minimized — SDL_VIDEODRIVER=x11, "
-                "GDK_BACKEND=x11 or QT_QPA_PLATFORM=xcb."))
+        ways = {target_way(r.data()) for r in self.win_rows if r.data()}
+        text = ""
+        if "focus" in ways:
+            text = _("◐ Wayland windows get the focus for about a tenth of a "
+                     "second and give it back. What you type meanwhile is "
+                     "held and arrives right after, in your window. A window "
+                     "that is covered, minimized or on another desktop stays "
+                     "invisible meanwhile. A program opened in X11 mode "
+                     "(⌨) takes the key with no focus at all: "
+                     "SDL_VIDEODRIVER=x11, GDK_BACKEND=x11 or "
+                     "QT_QPA_PLATFORM=xcb.")
+        self._set_win_warn(text)
 
     def _set_win_warn(self, text):
         """Reserva a altura de verdade do texto: QLabel com quebra de linha
@@ -20275,80 +21305,131 @@ class App(QWidget):
             0, 0, width, 0, Qt.TextWordWrap, text)
         self.win_warn.setMinimumHeight(rect.height() + 6)
 
-    def _target_ready(self):
-        """Janela escolhida pronta. Só janela Wayland precisa do teclado
-        virtual: a X11 recebe a tecla endereçada, sem passar pelo seat."""
-        if not self.win_sel.count() or self.win_sel.currentData() is None:
-            self.refresh_windows()
-        sel = self.win_sel.currentData()
-        if not sel:
-            self.warn.setText(_("Pick a window first (↻ to rescan)."))
-            return False
-        if sel.get("xid"):
-            if not ((self._ensure_xinject().keysym_name(self.win_key.code))
-                    or x_keysym(self.win_key.name)):
-                self.warn.setText(_("That key has no X11 equivalent."))
-                return False
-            return True
-        return self.ensure_keyboard()
+    def _win_targets(self):
+        """Os alvos do WindowSender, um por linha com janela aberta."""
+        out = []
+        for i, row in enumerate(self.win_rows):
+            d = row.data()
+            if d is None:
+                continue
+            way = target_way(d)
+            t = {"row": i, "kind": way, "id": d.get("id") or "",
+                 "cls": d.get("cls", ""), "title": d.get("title", ""),
+                 "code": row.catcher.code, "key": row.catcher.name,
+                 "every": max(0.1, row.every.value())}
+            if way == "x11":
+                x = self._ensure_xinject()
+                t["xid"] = d["xid"]
+                t["keysym"] = (x.keysym_name(row.catcher.code)
+                               if x.ok else None) or x_keysym(row.catcher.name)
+            out.append(t)
+        return out
 
-    def _target_start(self):
-        """Manda a tecla na hora e depois a cada N segundos — esperar o
-        intervalo inteiro para o primeiro envio parecia que não funcionava."""
-        if not self._target_ready():
+    def _target_start(self, again=False):
+        """Manda as teclas na hora e depois cada uma no intervalo dela:
+        esperar o intervalo inteiro para o primeiro envio parecia que não
+        funcionava. again: a lista mudou com o envio ligado."""
+        if self._win_items is None or not any(r.data()
+                                              for r in self.win_rows):
+            self.refresh_windows()
+        targets = self._win_targets()
+        if not targets:
+            self.warn.setText(_("Pick a window first (↻ to rescan)."))
+            self._target_stop()
             return False
-        self._target_tick()
-        self.target_timer.start(self.win_secs.value() * 1000)
+        ways = {t["kind"] for t in targets}
+        if "x11" in ways and any(not t.get("keysym") for t in targets
+                                 if t["kind"] == "x11"):
+            self.warn.setText(_("That key has no X11 equivalent."))
+        if "focus" in ways and not self.ensure_keyboard():
+            return False
+        old = self.win_sender
+        if old is not None:
+            # quem já ia mandar segue a mesma conta, linha a linha
+            prev = {t["row"]: t for t in old.targets}
+            for t in targets:
+                p = prev.get(t["row"])
+                if p is not None and p.get("id") == t["id"] \
+                        and p.get("code") == t["code"]:
+                    t["hits"] = p.get("hits", 0)
+                    t["next"] = p["next"] - p["every"] + t["every"]
+            old.stop()
+        hub = self.watcher.hub
+        if "focus" in ways:
+            if self.win_guard is None:
+                self.win_guard = KeyboardGuard()
+                hub.add(self.win_guard)
+        elif self.win_guard is not None:
+            hub.remove(self.win_guard)
+            self.win_guard = None
+        dock = getattr(self, "dock", None)
+        self.win_sender = WindowSender(
+            targets, keyboard=self.keyboard, bridge=self.bridge, dock=dock,
+            hub=hub, after=old)
+        self.win_sender.start()
+        self.win_poll.start()
+        self._show_status()
         return True
+
+    def _target_stop(self):
+        s = self.win_sender
+        self.win_sender = None
+        if s is not None:
+            s.stop()
+            self._win_dying.append(s)
+        if self.win_guard is not None:
+            self.watcher.hub.remove(self.win_guard)
+            self.win_guard = None
+        self.win_poll.stop()
+        for row in self.win_rows:
+            row.show_state(None)
 
     def _target_toggled(self, on):
         if not on:
-            self.target_timer.stop()
+            self._target_stop()
         elif self.running and self._state == "run":
             self._target_start()
         else:
             self.refresh_windows()
-            self.ensure_keyboard()   # 0,4 s de settle: paga agora, não no Start
+            if any(target_way(r.data()) == "focus" for r in self.win_rows
+                   if r.data()):
+                self.ensure_keyboard()  # 0,4 s de settle: agora, não no Start
         self._show_status()
 
-    def _target_restart(self, _v=None):
-        if self.target_timer.isActive():
-            self.target_timer.start(self.win_secs.value() * 1000)
+    def _win_tick(self):
+        """4 vezes por segundo, com o envio ligado: o estado de cada linha."""
+        self._win_dying = [s for s in self._win_dying if s.is_alive()]
+        s = self.win_sender
+        if s is None:
+            return
+        by = {t["row"]: t for t in s.targets}
+        for i, row in enumerate(self.win_rows):
+            row.show_state(by.get(i))
+        if s.rounds != self._win_rounds:
+            self._win_rounds = s.rounds
+            self._show_status()
 
-    def _target_tick(self):
-        """Janela X11: injeta direto, sem tocar no foco nem precisar dela
-        visível. Janela Wayland: não há como endereçar, então cai no truque de
-        dar foco por um instante e devolver."""
-        sel = self.win_sel.currentData() or {}
-        wid, xid = sel.get("id"), sel.get("xid")
-        if not wid:
-            return
-        if xid:
-            keysym = (self._ensure_xinject().keysym_name(self.win_key.code)
-                      or x_keysym(self.win_key.name))
-            if keysym and self.xinject and self.xinject.ok:
-                t0 = time.perf_counter()
-                if self.xinject.send_key(xid, keysym):
-                    self.target_hits += 1
-                    self.target_ms = (time.perf_counter() - t0) * 1000
-                    self._show_status()
-                    return
-        if not self.keyboard:
-            return
-        t0 = time.perf_counter()
-        prev = self.bridge.activate(wid)
-        if prev is None:
-            self.warn.setText(_("Lost the target window."))
-            self.target_box.setChecked(False)
-            return
-        # o hold do tap já é a folga para a tecla chegar antes de devolver foco
-        self.keyboard.tap(self.win_key.code)
-        self.target_hits += 1
-        if prev and prev != wid:
-            self.bridge.activate(prev)
-        # quanto tempo o foco do usuário ficou roubado neste ciclo
-        self.target_ms = (time.perf_counter() - t0) * 1000
-        self._show_status()
+    def _win_hits(self):
+        s = self.win_sender
+        return sum(t.get("hits", 0) for t in s.targets) if s else 0
+
+    def _recover_flash(self):
+        if self.bridge is None:
+            self.bridge = KWIN()
+        recover_flash(self.bridge)
+
+    def _win_finish(self, seconds=3.0):
+        """Ao sair: o enviador acaba a rodada (o foco e a opacidade voltam)
+        com a thread da UI andando, porque a resposta do KWin chega por
+        ela."""
+        end = time.monotonic() + seconds
+        app = QApplication.instance()
+        for s in self._win_dying:
+            while s.is_alive() and time.monotonic() < end:
+                if app is not None:
+                    app.processEvents()
+                s.join(0.01)
+        self._win_dying = []
 
     # ---------------------------------------------------------- anti-afk --
     def _afk_toggled(self, on):
@@ -20381,19 +21462,24 @@ class App(QWidget):
             if free:                    # o que o gatilho não segura já roda
                 txt += "  (" + " + ".join(free) + ")"
         elif state == "run":
-            txt = ("● " + _("RUNNING") + "  ("
-                   + " + ".join(self._running_parts() or [_("nothing enabled")])
-                   + ")")
+            parts = self._running_parts()
+            txt = "● " + _("RUNNING")
+            if parts or getattr(self, "win_sender", None) is None:
+                txt += "  (" + " + ".join(parts or [_("nothing enabled")]) \
+                    + ")"
         else:
             txt = _("Stopped")
         if self._remain:
             txt += "  —  " + _("stops in {n}s", n=self._remain)
         if self.antiafk:
             txt += "   ⟲ " + _("anti-AFK")
-        if self.target_timer.isActive():
-            txt += ("   ⌨ " + self.win_key.name
-                    + f" ×{self.target_hits}"
-                    + (f" ({self.target_ms:.0f} ms)" if self.target_ms else ""))
+        s = getattr(self, "win_sender", None)
+        if s is not None:
+            keys = sorted({t["key"] for t in s.targets})
+            txt += ("   ⌨ " + ", ".join(keys[:3])
+                    + (f" +{len(keys) - 3}" if len(keys) > 3 else "")
+                    + f" ×{self._win_hits()}"
+                    + (f" ({s.flash_ms:.0f} ms)" if s.flash_ms else ""))
         running = self.engine.running() if hasattr(self, "engine") else []
         if running:
             txt += "   ⚡ " + ", ".join(m.name for m in running[:3])
@@ -20863,9 +21949,13 @@ class App(QWidget):
                 "trigger_scope": {n: b.isChecked() for n, b
                                   in self.trig_boxes.items()},
                 "afk_seconds": self.afk_secs.value(),
-                "target_key": self.win_key.name,
-                "target_key_code": self.win_key.code,
-                "target_seconds": self.win_secs.value(),
+                "targets": [r.spec() for r in self.win_rows],
+                # a primeira linha também nos campos antigos: uma versão
+                # anterior ainda lê a config sem se perder
+                "target_key": self.win_rows[0].catcher.name,
+                "target_key_code": self.win_rows[0].catcher.code,
+                "target_seconds": max(1, int(round(
+                    self.win_rows[0].every.value()))),
                 "hotkey_block": self.hk_block.isChecked(),
                 "macros": self.macros,
                 "macros_enabled": self.macro_box.isChecked(),
@@ -20911,7 +22001,8 @@ class App(QWidget):
         if self.antiafk:
             self.antiafk.stop()
             self.antiafk = None
-        self.target_timer.stop()
+        self._target_stop()
+        self._win_finish()
         if self.bridge or _KWIN:
             (self.bridge or _KWIN).cleanup()
         self._save_timer.stop()

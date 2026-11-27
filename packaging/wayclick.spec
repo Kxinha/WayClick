@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.13.0
+Version:        1.14.0
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -77,6 +77,21 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Fri Nov 27 2026 gabrielmf1998 <noreply@github.com> - 1.14.0-1
+- Send key to a window takes a list: up to 8 windows, each with its own
+  key and interval, and the same window can take two keys
+- Wayland windows get the focus for about a tenth of a second; what you
+  type meanwhile is held and arrives right after, in your window
+- A window that is covered, minimized or on another desktop stays
+  invisible during that instant, comes back minimized, and the desktop,
+  the focus and the order of the windows are the ones from before
+- X11 windows and windows in the Dock never take the focus, each kind on
+  its own lane, so they do not wait for the Wayland ones
+- KWin calls go through the D-Bus connection WayClick already has,
+  instead of one gdbus process per call, so window steps answer faster
+- If WayClick stops in the middle of that instant, the window it hid is
+  shown again as soon as WayClick opens
+
 * Fri Nov 27 2026 gabrielmf1998 <noreply@github.com> - 1.13.0-1
 - An AutoHotkey interpreter inside WayClick: a Run AutoHotkey code step
   runs v1 or v2 code with variables, math, functions, loops and timers,
