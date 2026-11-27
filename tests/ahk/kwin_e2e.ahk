@@ -25,3 +25,18 @@ PixelSearch, Px, Py, 0, 0, A_ScreenWidth, A_ScreenHeight, 0x0000FF, 10
 if !ErrorLevel
     Click %Px% %Py%
 return
+
+#IfWinActive Alvo AHK
+F2::
+total := 0
+Loop, 3
+    total += A_Index * 2
+Send %total%
+return
+#IfWinActive
+
+#IfWinNotActive Alvo AHK
+F3::Send x
+#IfWinActive
+
+::btw::by the way

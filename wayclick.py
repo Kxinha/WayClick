@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """WayClick — autoclicker para Wayland via /dev/uinput (kernel), sem X11."""
-import base64, binascii, ctypes, fcntl, glob, grp, json, math, os, pwd
+import base64, binascii, ctypes, fcntl, glob, grp, hashlib, json, math, os, pwd
 import random, re, select
 import shlex, shutil, socket, struct
 import signal, subprocess, sys, tempfile, threading, time, unicodedata
@@ -9,7 +9,8 @@ import urllib.request, wave
 try:
     from PySide6.QtCore import (Qt, QEvent, QObject, QPointF, QRectF, QSize,
                                 QTimer, QUrl, Signal, Slot)
-    from PySide6.QtGui import (QAction, QBrush, QColor, QDesktopServices, QIcon,
+    from PySide6.QtGui import (QAction, QBrush, QColor, QDesktopServices,
+                               QFontDatabase, QIcon,
                                QImage, QLinearGradient,
                                QKeySequence, QPainter, QPainterPath, QPalette,
                                QPen, QPixmap,
@@ -37,7 +38,7 @@ except ImportError:
              "python3-pyside6.qtmultimedia\n"
              "  any distro:    pip install --user PySide6")
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 HOMEPAGE = "https://github.com/gabrielmf1998/WayClick"
 
 # ------------------------------------------------------------ updates ----
@@ -2513,13 +2514,14 @@ MACRO_MODE_SHORT = {"toggle": "toggle", "hold": "while held",
                     "once": "once", "always": "always"}
 STEP_OPS = ("tap", "down", "up", "wait", "text", "wheel", "move",
             "point", "image", "pixel", "notify", "open", "watch", "count",
-            "window")
+            "window", "script")
 POINT_CLICKS = ("none", "left", "right", "middle", "double")
 SEEN_ACTS = ("none", "move", "left", "right", "middle", "double")
 WATCH_KINDS = ("image", "pixel", "window")
 WINDOW_ACTS = ("check", "focus")
 FLOWS = ("next", "stop", "restart", "jump")
 COORD = 100000                   # |x|, |y| máximos de uma posição na tela
+AHK_SCRIPT_MAX_CFG = 200000      # código do AutoHotkey guardado num passo
 
 
 def _whole_screen(region):
@@ -2530,6 +2532,29 @@ def _whole_screen(region):
 
 
 MAX_MACROS = 50
+# hotstrings: as opções que o motor entende (R, T e X viram passos na
+# importação), o tamanho do texto, e o que termina uma palavra (o EndChars
+# de fábrica do AutoHotkey)
+HS_OPTS = ("*", "?", "C", "C1", "B0", "O", "Z")
+HS_MAX = 40
+HS_END = set("-()[]{}':;\"/\\,.?!\n \t")
+HS_PRESS_MS = 8.0
+HS_OPT_LABELS = (("*", "Without waiting for a space or Enter (*)"),
+                 ("?", "Also in the middle of a word (?)"),
+                 ("C", "Match upper and lower case (C)"),
+                 ("C1", "Do not copy the capitals typed (C1)"),
+                 ("B0", "Keep what was typed (B0)"),
+                 ("O", "Leave out the space or Enter that ended it (O)"))
+AHK_USES_POINTER = re.compile(r"(?i)\b(?:click|mouseclick|mousemove|"
+                              r"mouseclickdrag)\b")
+AHK_USES_SCREEN = re.compile(r"(?i)\b(?:pixelgetcolor|pixelsearch|"
+                             r"imagesearch)\b")
+AHK_USES_WINDOWS = re.compile(r"(?i)\b(?:winactive|winexist|winactivate|"
+                              r"winwaitactive|ifwin\w*)\b")
+AHK_USES_ACTIVE = re.compile(r"(?i)\b(?:winactive|winwaitactive|"
+                             r"ifwin(?:not)?active)\b")
+AHK_USES_BUTTONS = re.compile(r"(?i)\b(?:[lrm]button|xbutton[12])\b")
+AHK_USES_TIMER = re.compile(r"(?i)\bsettimer\b")
 MAX_STEPS = 2000
 MAX_RUNS = 1000000               # "parar depois de N" e "a cada N"
 # campos que todo texto de aviso entende; contadores entram com o nome deles
@@ -2552,6 +2577,8 @@ for _plain, _shifted, _code in (("-", "_", 12), ("=", "+", 13), ("[", "{", 26),
                                 (".", ">", 52), ("/", "?", 53)):
     CHAR_KEYS[_plain] = (_code, False)
     CHAR_KEYS[_shifted] = (_code, True)
+# o contrário, para as hotstrings: (tecla, com Shift) -> caractere
+CHAR_OF = {v: k for k, v in CHAR_KEYS.items()}
 
 
 def _num(value, default, lo, hi, kind=float):
@@ -2671,6 +2698,29 @@ def normalize_step(s):
         if s.get("shot"):
             step["shot"] = True
         return step if text or step.get("shot") else None
+    if op == "script":
+        src = str(s.get("src") or "")[:AHK_SCRIPT_MAX_CFG]
+        if not src.strip():
+            return None
+        step = {"op": "script", "src": src}
+        line = _num(s.get("line", 0), 0, 0, 10 ** 7, int)
+        if line:
+            step["line"] = line
+        label = str(s.get("label") or "")[:64]
+        if re.fullmatch(r"[A-Za-z_]\w*", label):
+            step["label"] = label
+        if s.get("v2"):
+            step["v2"] = True
+        hk = str(s.get("hotkey") or "")[:80]
+        if hk:
+            step["hotkey"] = hk
+        folder = str(s.get("dir") or "")[:4096]
+        if folder:
+            step["dir"] = folder
+        threads = _num(s.get("threads", 1), 1, 1, 20, int)
+        if threads > 1:
+            step["threads"] = threads
+        return step
     url = str(s.get("url") or "").strip()[:2000]
     return {"op": "open", "url": url} if url and not url.startswith("-") \
         else None
@@ -2772,10 +2822,37 @@ def normalize_macro(m):
     # de antes ficam iguais byte a byte
     if m.get("dock") is True:
         out["dock"] = True
+    # o som de ligar e desligar: de fábrica só no liga/desliga; a chave só
+    # existe quando foge disso
+    if "beep" in m and bool(m["beep"]) != (mode == "toggle"):
+        out["beep"] = bool(m["beep"])
+    # #IfWinActive: o atalho só vale com esta janela ativa (ou fora dela)
+    w = m.get("window")
+    if isinstance(w, dict):
+        match = " ".join(str(w.get("match") or "").split())[:200]
+        if match:
+            out["window"] = {"match": match}
+            if w.get("not"):
+                out["window"]["not"] = True
+    # hotstring: dispara ao digitar o texto, sem tecla de atalho
+    hs = m.get("hotstring")
+    if isinstance(hs, dict):
+        abbr = str(hs.get("abbr") or "").replace("\n", "")[:HS_MAX]
+        if abbr.strip():
+            opts = hs.get("opts") or []
+            out["hotstring"] = {"abbr": abbr,
+                                "opts": [o for o in HS_OPTS if o in opts]}
+            out.update(code=0, key="", mods=[], mode="once", repeat=False)
+            out.pop("beep", None)
+            if m.get("beep"):
+                out["beep"] = True
     return out
 
 
 def hotkey_label(m):
+    hs = m.get("hotstring")
+    if hs:
+        return "::" + hs["abbr"]
     if not m.get("code"):
         return _("no hotkey")
     mods = "+".join(MOD_LABEL[x] for x in ("ctrl", "shift", "alt", "super")
@@ -2790,8 +2867,25 @@ def _ms(v):
     return f"{v:g}"
 
 
+def _script_head(src, n=40):
+    """A primeira linha de código de um script, para a lista de passos."""
+    for line in src.splitlines():
+        t = line.strip()
+        if t and not t.startswith((";", "#", "/*", "*/")):
+            return t if len(t) <= n else t[:n - 1] + "…"
+    return "…"
+
+
 def step_label(s):
     op = s["op"]
+    if op == "script":
+        if s.get("line") and s.get("hotkey"):
+            what = s["hotkey"] + "::"
+        elif s.get("label"):
+            what = s["label"]
+        else:
+            what = _script_head(s["src"])
+        return _("AutoHotkey code: {what}", what=what)
     if op in ("tap", "down", "up"):
         code = s["code"]
         if is_button(code):
@@ -2934,7 +3028,12 @@ def flow_label(s, key):
 
 def macro_summary(m, limit=4):
     """'F1, toggle, every 1 ms: Tap E' para a lista e o relatório."""
-    parts = [hotkey_label(m), _(MACRO_MODE_SHORT[m["mode"]])]
+    parts = [hotkey_label(m), _("when typed") if m.get("hotstring")
+             else _(MACRO_MODE_SHORT[m["mode"]])]
+    w = m.get("window")
+    if w:
+        parts.append(_("not in {win}", win=w["match"]) if w.get("not")
+                     else _("only in {win}", win=w["match"]))
     if m["mode"] != "once":
         if not m["repeat"]:
             parts.append(_("no repeat"))
@@ -2991,6 +3090,31 @@ class CompiledMacro:
         self.counters = tuple(dict.fromkeys(
             st["name"] for st in self.steps if st["op"] == "count"))
         self.dock = bool(m.get("dock"))
+        # código do AutoHotkey: o que ele pode usar só se sabe pelo texto
+        scripts = [st["src"] for st in self.steps if st["op"] == "script"]
+        src = "\n".join(scripts)
+        self.uses_script = bool(scripts)
+        if scripts:
+            self.uses_keys = True
+            self.uses_pointer = self.uses_pointer or bool(
+                AHK_USES_POINTER.search(src))
+            self.uses_screen = self.uses_screen or bool(
+                AHK_USES_SCREEN.search(src))
+            self.uses_windows = self.uses_windows or bool(
+                AHK_USES_WINDOWS.search(src))
+        self.button_state = bool(scripts) and bool(AHK_USES_BUTTONS.search(src))
+        self.threads = max([st.get("threads", 1) for st in self.steps
+                            if st["op"] == "script"] or [1])
+        self.window = m.get("window")
+        self.hotstring = m.get("hotstring")
+        self.uses_active = bool(self.window) or (
+            bool(scripts) and bool(AHK_USES_ACTIVE.search(src)))
+        self.beep = bool(m.get("beep", m["mode"] == "toggle"))
+        # um "uma vez" que só liga ou desliga um SetTimer: quem bipa é o
+        # timer (sobe ao ligar, desce ao parar), não o atalho
+        self.timer_switch = m["mode"] == "once" and bool(scripts) and bool(
+            AHK_USES_TIMER.search(src))
+        self.source = m
 
 
 def _sees(st):
@@ -3044,6 +3168,7 @@ class MacroRunner(threading.Thread):
         self.watches = {}    # índice do passo Vigiar -> [passo, a cada, vence]
         self.counters = dict.fromkeys(macro.counters, 0)
         self.began = time.perf_counter()
+        self.press_override = None   # SetKeyDelay de um script
 
     def stop(self):
         self.stopping = True
@@ -3069,14 +3194,15 @@ class MacroRunner(threading.Thread):
             self.held.remove(code)
 
     def _tap(self, code, times=1):
+        press = self.press_override or self.m.press
         for i in range(times):
             if i and self._halt.is_set():
                 return
             self._set(code, True)
-            self._sleep(self.m.press)
+            self._sleep(press)
             self._set(code, False)
             if i + 1 < times:
-                self._rest(self.m.press)
+                self._rest(press)
 
     def _wheel(self, direction, times):
         if self.mouse is None:
@@ -3443,12 +3569,17 @@ class MacroRunner(threading.Thread):
                 return self._flow(st, True)
         elif op == "window":
             return self._flow(st, self._window(st))
+        elif op == "script":
+            return ahk_run_step(self, st)
         return None
 
     def run(self):
         clock = time.perf_counter
         steps = self.m.steps
         try:
+            first = getattr(self, "delay_first", 0.0)
+            if first:
+                self._sleep(first)
             nxt = clock()
             while not self._halt.is_set():
                 began = clock()
@@ -3513,6 +3644,9 @@ class MacroEngine(QObject):
     toggled = Signal(bool)
     message = Signal(str, str)      # (título, texto) de um passo Notificar
     problem = Signal(str)           # algo impediu um passo de acontecer
+    beep = Signal(str)              # "mon"/"moff": um macro ligou/desligou;
+    #                                 "script": o SoundBeep de um script
+    suspend_req = Signal(str)       # o Suspend de um script (on/off/toggle)
 
     def __init__(self, outputs, hub=None):
         super().__init__()
@@ -3534,12 +3668,17 @@ class MacroEngine(QObject):
         # macro com a mesma tecla não roda junto (se rodasse, desligar os
         # macros ligaria esse no mesmo aperto)
         self.exempt = None
+        self.hotstrings = ()
+        self.hs_buf = ""                # o que foi digitado, para as hotstrings
+        self.extra = set()              # SetTimer dos scripts, 2ª thread
+        self._win_told = False
         self.hub.add(self)
 
     def configure(self, macros, active):
         compiled = tuple(CompiledMacro(m) for m in macros
                          if m.get("enabled") and m.get("steps")
-                         and (m.get("code") or m.get("mode") == "always"))
+                         and (m.get("code") or m.get("mode") == "always"
+                              or m.get("hotstring")))
         new = {c.id: c for c in compiled}
         with self.lock:
             stop = [r for mid, r in self.runners.items()
@@ -3552,12 +3691,20 @@ class MacroEngine(QObject):
                 if c.code and c.mode != "always":
                     by_code.setdefault(c.code, []).append(c)
             self.by_code = by_code
-            self.mice = "all" if self.active and any(
-                is_button(code) for code in by_code) else None
+            self.hotstrings = tuple(c for c in compiled if c.hotstring) \
+                if self.active else ()
+            self.hs_buf = ""
+            self.mice = "all" if self.active and (any(
+                is_button(code) for code in by_code) or any(
+                c.button_state for c in compiled)) else None
             always = [c for c in compiled if c.mode == "always"] \
                 if self.active else []
+            if not self.active:
+                stop += list(self.extra)
         for r in stop:
             r.stop()
+        if not self.active:
+            ahk_stop_all()
         for c in always:
             self._start(c, only_if_idle=True)
         self.hub.changed()
@@ -3575,7 +3722,7 @@ class MacroEngine(QObject):
         if not ms or (self.exempt and self.exempt(code)):
             return False
         mods = self.hub.mods_active()
-        return any(m.mods <= mods for m in ms)
+        return any(m.mods <= mods and self._win_ok(m, quiet=True) for m in ms)
 
     # chamados das threads dos macros; os sinais chegam na da UI
     def report(self, text):
@@ -3587,6 +3734,8 @@ class MacroEngine(QObject):
     def wants_grab(self, d):
         if not self.active:
             return False
+        if self.hotstrings and d.kbd:
+            return True                 # para engolir o fim da palavra
         for code, ms in self.by_code.items():
             if d.has(code) and any(m.block for m in ms):
                 if is_button(code) or d.kbd:
@@ -3596,6 +3745,15 @@ class MacroEngine(QObject):
     def on_key(self, d, code, value):
         if not self.active:
             return False
+        hit = self._hotkey_key(d, code, value)
+        if self.hotstrings and d.kbd and value == 1:
+            if hit:
+                self.hs_buf = ""
+            elif self._hs_feed(d, code):
+                return True
+        return hit
+
+    def _hotkey_key(self, d, code, value):
         ms = self.by_code.get(code)
         if not ms:
             return False
@@ -3603,9 +3761,12 @@ class MacroEngine(QObject):
             if CAPTURE.is_set() or (self.exempt and self.exempt(code)):
                 return False
             mods = self.hub.mods_active()
-            hit = [m for m in ms if m.mods <= mods]
+            hit = [m for m in ms if m.mods <= mods and self._win_ok(m)]
             # Ctrl+F1 e F1 no mesmo teclado: com Ctrl, vale só o mais específico
             hit = [m for m in hit if not any(m.mods < o.mods for o in hit)]
+            # #IfWinActive: o atalho da janela passa na frente do de sempre
+            if any(m.window for m in hit):
+                hit = [m for m in hit if m.window]
             if not hit:
                 return False
             lift = set()
@@ -3641,8 +3802,172 @@ class MacroEngine(QObject):
                 self.toggled.emit(True)
         elif not r:
             self._start(m)
+        elif m.threads > 1:
+            # #MaxThreadsPerHotkey 2: o segundo aperto roda junto (é o que
+            # desliga o "while toggle" do primeiro)
+            self._start(m, extra=True)
 
-    def _start(self, m, only_if_idle=False):
+    # ------------------------------------------------ #IfWinActive --
+    def _win_ok(self, m, quiet=False):
+        """A condição de janela do macro vale agora. Sem saber a janela
+        ativa (fora do KDE), o atalho vale em todas, com um aviso só."""
+        w = m.window
+        if not w:
+            return True
+        info = self.active_window(fast=True)
+        if info is None:
+            if not quiet and not self._win_told:
+                self._win_told = True
+                self.report(f"{m.name}: " + _(
+                    "the active window is not known (that needs KDE Plasma), "
+                    "so this hotkey works in every window."))
+            return True
+        return window_matches(info, w) != bool(w.get("not"))
+
+    def active_window(self, fast=False):
+        """{"cls", "name", "title"} da janela ativa, {} sem nenhuma, ou None
+        sem como saber. fast: só o que o KWin já contou (thread do hub)."""
+        kw = self.windows
+        if kw is None:
+            return None
+        info = getattr(kw, "active_info", None)
+        if info is not None or fast:
+            return info
+        try:
+            return kw.active_now()
+        except Exception:                          # noqa: BLE001
+            return None
+
+    # ------------------------------------------------ hotstrings --
+    def _hs_feed(self, d, code):
+        """Uma tecla digitada vai para o texto das hotstrings; True quando
+        ela disparou uma e some (o fim da palavra, ou a última letra com *)."""
+        if CAPTURE.is_set() or code in MOD_OF or code == KEYS["Caps Lock"]:
+            return False
+        if code == KEYS["Backspace"]:
+            self.hs_buf = self.hs_buf[:-1]
+            return False
+        mods = self.hub.mods_active()
+        if mods & {"ctrl", "alt", "super"}:
+            self.hs_buf = ""
+            return False
+        ch = CHAR_OF.get((code, "shift" in mods))
+        if ch is None:                  # seta, Esc, clique: outra palavra
+            self.hs_buf = ""
+            return False
+        buf = self.hs_buf
+        if ch in HS_END:
+            for m in self.hotstrings:
+                if "*" not in m.hotstring["opts"] and \
+                        self._hs_match(m, buf) and self._win_ok(m):
+                    return self._hs_fire(d, m, buf, ch)
+        buf = (buf + ch)[-HS_MAX * 2:]
+        self.hs_buf = buf
+        for m in self.hotstrings:
+            if "*" in m.hotstring["opts"] and self._hs_match(m, buf) \
+                    and self._win_ok(m):
+                return self._hs_fire(d, m, buf, None)
+        return False
+
+    @staticmethod
+    def _hs_match(m, buf):
+        abbr, opts = m.hotstring["abbr"], m.hotstring["opts"]
+        if len(buf) < len(abbr):
+            return False
+        tail = buf[-len(abbr):]
+        if not (tail == abbr if "C" in opts else
+                tail.lower() == abbr.lower()):
+            return False
+        before = buf[:-len(abbr)]
+        return "?" in opts or not before or before[-1] in HS_END
+
+    def _hs_fire(self, d, m, buf, end):
+        """Apaga o que foi digitado, digita a troca (com as maiúsculas de
+        quem digitou) e o fim da palavra, como o AutoHotkey."""
+        opts, abbr = m.hotstring["opts"], m.hotstring["abbr"]
+        typed = buf[-len(abbr):]
+        self.hs_buf = ""
+        with self.lock:
+            if self._alive(m.id):
+                return False
+        b0 = "B0" in opts
+        swallow = d.grabbed and not b0
+        if b0:
+            n = 0
+        elif end is None:
+            n = len(abbr) - (1 if swallow else 0)
+        else:
+            n = len(abbr) + (0 if swallow else 1)
+        steps = [dict(st) for st in m.steps]
+        if "C" not in opts and "C1" not in opts:
+            letters = [c for c in typed if c.isalpha()]
+            if letters and letters[0].isupper():
+                upper = len(letters) > 1 and all(c.isupper() for c in letters)
+                for st in steps:
+                    if st["op"] != "text":
+                        continue
+                    t = st["text"]
+                    if upper:
+                        st["text"] = t.upper()
+                    else:
+                        k = next((i for i, c in enumerate(t) if c.isalpha()),
+                                 None)
+                        if k is not None:
+                            st["text"] = t[:k] + t[k].upper() + t[k + 1:]
+                        break
+        pre = [{"op": "tap", "code": KEYS["Backspace"], "times": n}] if n \
+            else []
+        post = [{"op": "text", "text": end}] if end is not None and \
+            "O" not in opts and not b0 else []
+        c = CompiledMacro(normalize_macro(dict(m.source,
+                                               steps=pre + steps + post)))
+        self._start(c)
+        return swallow
+
+    # ------------------------------- o que os scripts pedem ao motor --
+    def key_down(self, code):
+        """A tecla (ou botão) está fisicamente apertada agora."""
+        with self.hub.lock:
+            return any(code in d.down for d in self.hub.devs.values()
+                       if not d.dead)
+
+    def beep_now(self, which):
+        self.beep.emit("script")
+
+    def suspend(self, mode):
+        self.suspend_req.emit(mode)
+
+    def start_timer(self, run, label, period_ms, quiet=False):
+        """SetTimer: o rótulo do script roda num MacroRunner próprio, a
+        cada período (negativo: uma vez só, depois dele). Para com
+        SetTimer Off, ao desligar os macros, ou ao fechar."""
+        parent = run.r.m
+        once = period_ms < 0
+        p = max(abs(period_ms), AHK_TICK_MS)
+        st = dict(run.st, label=label)
+        for k in ("line", "threads", "hotkey"):
+            st.pop(k, None)
+        c = CompiledMacro(normalize_macro({
+            "id": new_macro_id(), "name": f"{parent.name}: {label}",
+            "mode": "toggle", "repeat": not once, "period_ms": p,
+            "press_ms": parent.press * 1000.0, "steps": [st]}))
+        kb, mouse = self.outputs()
+        r = MacroRunner(c, kb, mouse, not once, False, self._done, env=self)
+        r.delay_first = p / 1000.0      # como no AutoHotkey: depois do período
+        r.timer_host, r.timer_name = run.host, label
+        r.timer_beep = parent.beep and not once
+        with run.host.lock:
+            busy = any(t.is_alive() and not t.stopping
+                       for t in run.host.timers.values())
+        with self.lock:
+            self.extra.add(r)
+        if r.timer_beep and not quiet and not busy:
+            self.beep.emit("mon")
+        r.start()
+        self.changed.emit()
+        return r
+
+    def _start(self, m, only_if_idle=False, extra=False):
         dock = self.dock if m.dock else None
         if m.dock and (dock is None or not dock.alive()):
             # o "sempre" tenta de novo sozinho quando a Doca abre; o atalho
@@ -3663,7 +3988,14 @@ class MacroEngine(QObject):
             else:
                 r = MacroRunner(m, kb, mouse, loop, keep, self._done,
                                 env=self)
-            self.runners[m.id] = r
+            if extra:
+                self.extra.add(r)
+            else:
+                self.runners[m.id] = r
+        r.beeped = m.beep and m.mode != "always" and not extra \
+            and not only_if_idle and not m.timer_switch
+        if r.beeped:
+            self.beep.emit("mon")
         r.start()
         self.changed.emit()
         return r
@@ -3681,16 +4013,36 @@ class MacroEngine(QObject):
         with self.lock:
             if self.runners.get(r.m.id) is r:
                 del self.runners[r.m.id]
+            self.extra.discard(r)
+        host = getattr(r, "timer_host", None)
+        if host is not None:
+            with host.lock:
+                if host.timers.get(r.timer_name) is r:
+                    del host.timers[r.timer_name]
+                left = any(t.is_alive() and not t.stopping and t is not r
+                           for t in host.timers.values())
+            if r.timer_beep and not left and not getattr(r, "replaced",
+                                                         False):
+                self.beep.emit("moff")
+        elif getattr(r, "beeped", False) and not r.m.hotstring and (
+                r.m.mode != "once"
+                or time.perf_counter() - r.began >= self.LONG_ONCE_S):
+            self.beep.emit("moff")
         self.changed.emit()
+
+    # um "uma vez" que demorou isto avisa também quando acaba (um script
+    # com "while toggle", por exemplo); um rápido só bipa ao começar
+    LONG_ONCE_S = 0.5
 
     def running(self):
         with self.lock:
-            return [r.m for r in self.runners.values()
-                    if r.is_alive() and not r.stopping]
+            return [r.m for r in list(self.runners.values())
+                    + list(self.extra) if r.is_alive() and not r.stopping]
 
     def stop_all(self, join=True):
         with self.lock:
-            runners = list(self.runners.values())
+            runners = list(self.runners.values()) + list(self.extra)
+        ahk_stop_all()
         for r in runners:
             r.stop()
         if join:
@@ -4288,6 +4640,8 @@ def _strip_comment(line):
     return line
 
 
+AHK_LITERAL = re.compile(r'"(?:[^"`]|`.|"")*"|\'(?:[^\'`]|`.|\'\')*\'')
+HOTSTRING_RE = re.compile(r"^:([^:\s]*):([^\n]+?)::(.*)$")
 HOTKEY_RE = re.compile(
     r"^([#!^+<>*~$]*(?:[^\s:\"'(){}]+\s+&\s+[^\s:\"'(){}]+|[^\s\"'(){}]+?|.)"
     r"(?:\s+up)?)::(.*)$", re.I)
@@ -4392,6 +4746,14 @@ class AhkImport:
         self.send_mode = "input"
         self._ifwin_noted = False
         self._tick_noted = False
+        self.src = text
+        # #IfWinActive/#HotIf, #MaxThreadsPerHotkey e #Hotstring valem para
+        # o que vem abaixo deles: cada atalho guarda os de onde estava
+        self._win = None
+        self._threads = 1
+        self._hs_default = ""
+        self.hk_ctx = {}            # linha -> (janela, threads)
+        self.hotstrings = []        # (linha, opções, texto, troca, corpo)
         # Click X, Y e MouseMove X, Y contam da janela ativa no AutoHotkey,
         # a não ser com CoordMode Mouse, Screen
         self.screen_coords = bool(re.search(
@@ -4425,8 +4787,10 @@ class AhkImport:
         do último, como no AutoHotkey."""
         for sln, sspec in stack:
             self.hotkeys.append((sln, sspec, body, remap))
+            self.hk_ctx[sln] = (self._win, self._threads)
         stack.clear()
         self.hotkeys.append((ln, spec, body, remap))
+        self.hk_ctx[ln] = (self._win, self._threads)
 
     def _parse_top(self):
         toks, i = self.toks, 0
@@ -4437,9 +4801,21 @@ class AhkImport:
                 self._directive(ln, t)
                 i += 1
                 continue
-            if t.startswith(":") and "::" in t[1:]:
-                self.note(ln, "hotstrings are not supported")
-                i += 1
+            hs = HOTSTRING_RE.match(t) if t.startswith(":") else None
+            if hs:
+                opts, abbr, repl = hs.group(1), hs.group(2), hs.group(3)
+                self.hk_ctx[ln] = (self._win, self._threads)
+                opts = self._hs_default + opts
+                if repl.strip() and "x" not in opts.lower():
+                    self.hotstrings.append((ln, opts, abbr, repl, None))
+                    i += 1
+                elif repl.strip():
+                    node, _j = self._stmt_from([(ln, repl.strip())], 0)
+                    self.hotstrings.append((ln, opts, abbr, None, [node]))
+                    i += 1
+                else:
+                    body, i = self._until_return(i + 1)
+                    self.hotstrings.append((ln, opts, abbr, None, body))
                 continue
             m = HOTKEY_RE.match(t)
             if m and not t.lower().startswith(("if", "while")):
@@ -4481,12 +4857,66 @@ class AhkImport:
             self.auto.append(node)
 
     def _directive(self, ln, t):
-        low = t.lower()
-        if low.startswith(("#if", "#hotif")) and len(low.split()) > 1:
-            if not self._ifwin_noted:
-                self._ifwin_noted = True
-                self.note(ln, "window-specific hotkeys (#If) work in every "
-                              "window here")
+        m = re.match(r"^#(\w+)\s*,?\s*(.*)$", t)
+        if not m:
+            return
+        name, arg = m.group(1).lower(), m.group(2).strip()
+        if name in ("ifwinactive", "ifwinnotactive", "ifwinexist",
+                    "ifwinnotexist"):
+            self._win = None
+            if not arg:
+                return
+            if "exist" in name:
+                self.note(ln, "#{what}: the hotkeys below work in every "
+                              "window here", what=m.group(1))
+                return
+            title = _unquote(_split_args(arg)[0])
+            self._win = self._win_ctx(ln, title, name == "ifwinnotactive")
+        elif name in ("if", "hotif"):
+            self._win = None
+            if not arg:
+                return
+            w = re.fullmatch(r"(!|not\s+)?\s*WinActive\s*\(\s*(.*?)\s*\)",
+                             arg, re.I)
+            if w and w.group(2):
+                title = _unquote(_split_args(w.group(2))[0])
+                self._win = self._win_ctx(ln, title, bool(w.group(1)))
+            else:
+                self.note(ln, "#{what} {expr}: only WinActive is understood, "
+                              "the hotkeys below work in every window",
+                          what=m.group(1), expr=arg[:60])
+        elif name == "maxthreadsperhotkey":
+            n = _num(arg, 1, 1, 20, int)
+            self._threads = n
+        elif name == "hotstring":
+            if re.match(r"(?i)(endchars|nomouse|reset)\b", arg):
+                self.note(ln, "#Hotstring {what}: the usual end characters "
+                              "are used", what=arg.split()[0])
+            else:
+                self._hs_default += arg.replace(" ", "")
+
+    def _win_ctx(self, ln, title, neg):
+        """O texto de janela de um #IfWinActive para o campo do macro."""
+        w = ahk_win_match(title)
+        if w is None:
+            self.note(ln, "{what}: windows by id, process or group are not "
+                          "supported, the hotkeys below work in every window",
+                      what=title[:60])
+            return None
+        if w["how"] == "exe":
+            base = re.sub(r"(?i)\.exe$", "", w["src"])
+            if base.lower() != w["match"].lower():
+                self.note(ln, "ahk_exe {exe} is a Windows program; here the "
+                              "hotkeys below need the {name} window",
+                          exe=w["src"], name=w["match"])
+        elif w["how"] == "class":
+            self.note(ln, "ahk_class {cls}: here the hotkeys below need a "
+                          "window whose app name or title contains {cls}",
+                      cls=w["match"])
+        out = {"match": w["match"]}
+        if neg:
+            out["not"] = True
+        return out
 
     def _remap_target(self, rest):
         """'a::b' remapeia; 'a::Send b' não. O alvo é um nome de tecla só,
@@ -4678,7 +5108,14 @@ class AhkImport:
             if low == "controlsend":
                 args = args[1:] if len(args) > 1 else args
             text = _unquote(args[0]) if args else ""
-            return ("send", text, low in ("sendraw", "sendtext"))
+            a0 = args[0].strip() if args else ""
+            if a0.startswith("% "):
+                dyn = not AHK_LITERAL.fullmatch(a0[2:].strip())
+            elif a0[:1] in "\"'" or (self.v2 or called) and a0:
+                dyn = not AHK_LITERAL.fullmatch(a0)
+            else:
+                dyn = bool(re.search(r"%\w+%", a0))
+            return ("send", text, low in ("sendraw", "sendtext"), dyn)
         if low in ("click", "mouseclick"):
             return (low, [_unquote(a) for a in args])
         if low == "sleep":
@@ -4777,6 +5214,10 @@ class AhkImport:
             m = self._hotkey(ln, spec, body, remap)
             if m:
                 self.macros.append(normalize_macro(m))
+        for item in self.hotstrings:
+            m = self._hotstring(*item)
+            if m:
+                self.macros.append(normalize_macro(m))
         for n in self._flat(self.auto):
             if n[0] == "cmd" and n[1][0] == "settimer":
                 m = self._timer_macro(n[2], n[1], startup=True)
@@ -4863,8 +5304,10 @@ class AhkImport:
             steps.append({"op": "down", "code": code})
             target = hotkey_label({"code": code, "mods": mods,
                                    "key": key_label(code)})
-            return dict(base, mode="hold", repeat=False, block=True,
-                        steps=steps, name=f"{hotkey_label(hk)} → {target}")
+            return self._in_window(ln, dict(
+                base, mode="hold", repeat=False, block=True, steps=steps,
+                name=f"{hotkey_label(hk)} → {target}"))
+        n0 = len(self.notes)
         nodes = self._flat(body)
         flips = {n[1][1] for n in self._walk(nodes)
                  if n[0] == "cmd" and n[1][0] == "flip"}
@@ -4882,6 +5325,14 @@ class AhkImport:
             m = dict(base, mode="once", repeat=False, steps=steps)
         if m.get("steps"):
             m["steps"] = self._resolve(m["steps"])
+        dyn = self._dynamic(nodes)
+        if not m.get("steps") or self._lossy(n0) or dyn:
+            # o que os passos não expressam roda no interpretador, inteiro
+            sm = self._script_macro(ln, spec, base, n0, nodes)
+            if sm is not None:
+                return self._in_window(ln, sm)
+            if dyn and m.get("steps") and self._no_script(ln, spec):
+                return None
         if not m.get("steps"):
             self.note(ln, "{hk}: nothing WayClick can do", hk=spec)
             return None
@@ -4892,7 +5343,147 @@ class AhkImport:
             self.note(ln, "{hk} clicks its own button, so it is hidden from "
                           "the app even with ~ (otherwise the clicks would be "
                           "lost)", hk=spec)
+        return self._in_window(ln, m)
+
+    # ------------------------------------- interpretador e hotstrings --
+    LOSSY = ("{what} is not supported, skipped",
+             "a condition inside the actions was skipped",
+             "Sleep {a} is not a number", "MouseMove without a position",
+             "{name} was not found", "SetTimer: {name} was not found",
+             "{hk}: what runs before the loop was left out",
+             "the position found is used only by a click",
+             "while {c} is not understood",
+             "{what}: the position is not a number",
+             "{what}: the area is not made of numbers",
+             "{what}: the color is not a number",
+             "{what}: the image file is not a plain name",
+             "the offset added to the position found")
+
+    def _lossy(self, n0):
+        """Desde a nota n0, a conversão em passos deixou algo de fora."""
+        return any(x[1].startswith(self.LOSSY) for x in self.notes[n0:])
+
+    def _dynamic(self, nodes):
+        """Contas e variáveis que os passos levariam ao pé da letra: um
+        Send %x% digitaria "%x%", e um x := y + 1 sumiria."""
+        for n in self._walk(nodes):
+            if n[0] != "cmd":
+                continue
+            c = n[1]
+            if c[0] == "send" and len(c) > 3 and c[3]:
+                return True
+            if c[0] == "assign" and not re.fullmatch(
+                    r"-?\d+(?:\.\d+)?|(?i:true|false)|" + AHK_LITERAL.pattern,
+                    c[2].strip()):
+                return True
+        return False
+
+    def _in_window(self, ln, m):
+        ctx = self.hk_ctx.get(ln)
+        if ctx and ctx[0]:
+            m["window"] = dict(ctx[0])
         return m
+
+    def _script_step(self, ln, spec):
+        st = {"op": "script", "src": self.src, "line": ln, "hotkey": spec}
+        if self.v2:
+            st["v2"] = True
+        if self.folder:
+            st["dir"] = self.folder
+        threads = self.hk_ctx.get(ln, (None, 1))[1]
+        if threads > 1:
+            st["threads"] = threads
+        return st
+
+    def _script_macro(self, ln, spec, base, n0, nodes):
+        """O atalho inteiro como um passo de código, se o interpretador
+        consegue rodá-lo. As notas da conversão em passos saem."""
+        if len(self.src) > AHK_SCRIPT_MAX_CFG:
+            return None
+        # só Pause, Reload, ExitApp e afins: não há o que rodar
+        if all(n[0] == "noop" or n[0] == "cmd" and n[1][0] in (
+                "control", "ignore") for n in self._walk(nodes)):
+            return None
+        if ahk_check(self.src, self.v2, line=ln) is not None:
+            return None
+        keep = [x for x in self.notes[n0:]
+                if x[1].startswith("positions are used as screen")]
+        del self.notes[n0:]
+        self.notes.extend(keep)
+        self.note(ln, "{hk}: runs as AutoHotkey code, on the interpreter "
+                      "inside WayClick", hk=spec)
+        m = dict(base, mode="once", repeat=False,
+                 steps=[self._script_step(ln, spec)])
+        # liga e desliga algo (um laço, um SetTimer): avisa com som
+        if any(n[0] in ("while", "loop") or n[0] == "cmd"
+               and n[1][0] == "settimer" for n in self._walk(nodes)):
+            m["beep"] = True
+        return m
+
+    def _no_script(self, ln, spec):
+        """Variáveis e contas que o interpretador não conseguiu rodar: os
+        passos levariam o texto ao pé da letra (Send % x[1] digitaria
+        "x[1]"), então o atalho sai, com o motivo."""
+        if len(self.src) > AHK_SCRIPT_MAX_CFG:
+            self.note(ln, "{hk}: uses variables, and the script is too big "
+                          "for the interpreter, skipped", hk=spec)
+            return True
+        err = ahk_check(self.src, self.v2, line=ln)
+        if err is None:
+            return False
+        self.note(err.ln or ln, "{hk}: {why}, so it was skipped", hk=spec,
+                  why=_(err.text, **err.fmt))
+        return True
+
+    @staticmethod
+    def _hs_flags(opts):
+        flags = {}
+        for mo in re.finditer(r"(?i)([*?bcortxz])(-?\d*)|k-?\d+|p\d+|s[ipe]",
+                              opts):
+            if not mo.group(1):
+                continue
+            k, n = mo.group(1).upper(), mo.group(2)
+            if k == "B":
+                flags["B0"] = n == "0"
+            elif k == "C":
+                flags["C"], flags["C1"] = n == "", n == "1"
+            else:
+                flags[k] = n != "0"
+        return flags
+
+    def _hotstring(self, ln, opts, abbr, repl, body):
+        name = f":{opts}:{abbr}"
+        if len(abbr) > HS_MAX:
+            self.note(ln, "{hk}: the text is longer than {n} characters, "
+                          "skipped", hk=name, n=HS_MAX)
+            return None
+        flags = self._hs_flags(opts)
+        base = {"name": "", "code": 0, "mode": "once", "repeat": False,
+                "press_ms": HS_PRESS_MS,
+                "hotstring": {"abbr": abbr,
+                              "opts": [o for o in HS_OPTS if flags.get(o)]}}
+        if body is None:
+            text = repl.strip(" \t")
+            steps = self._resolve(self._send(text, bool(
+                flags.get("R") or flags.get("T")), ln))
+        else:
+            n0 = len(self.notes)
+            nodes = self._flat(body)
+            steps = self._resolve(self._steps(nodes, ln))
+            dyn = self._dynamic(nodes)
+            if not steps or self._lossy(n0) or dyn:
+                if len(self.src) <= AHK_SCRIPT_MAX_CFG and ahk_check(
+                        self.src, self.v2, line=ln) is None:
+                    del self.notes[n0:]
+                    self.note(ln, "{hk}: runs as AutoHotkey code, on the "
+                                  "interpreter inside WayClick", hk=name)
+                    steps = [self._script_step(ln, name)]
+                elif dyn and steps and self._no_script(ln, name):
+                    return None
+        if not steps:
+            self.note(ln, "{hk}: nothing WayClick can do", hk=name)
+            return None
+        return self._in_window(ln, dict(base, steps=steps))
 
     def _timer_macro(self, ln, cmd, startup=False):
         _kind, label, period = cmd
@@ -5713,6 +6304,1941 @@ class AhkImport:
         return [{"op": "tap", "code": code, "times": n}]
 
 
+# ------------------------------------------- o interpretador do AutoHotkey --
+# O importador converte o que reconhece em passos; o que ele não consegue
+# expressar (contas, variáveis, funções, condições quaisquer) roda aqui, num
+# interpretador de um pedaço do AutoHotkey v1 e v2: expressões com a
+# precedência dele, variáveis globais que duram entre um aperto e outro,
+# funções e rótulos, if/else, Loop, while, until, break, continue, return,
+# try, e os comandos de jogo (Send, Click, MouseMove, Sleep, KeyWait,
+# GetKeyState, PixelGetColor, PixelSearch, ImageSearch, Random, SetTimer,
+# WinActive...). Ele roda dentro de um MacroRunner, então parar o macro, o
+# Suspend e fechar o WayClick o interrompem como a qualquer passo.
+AHK_DEPTH_MAX = 60               # funções chamando funções
+AHK_SPIN = 2000                  # voltas de laço sem esperar antes de ceder
+AHK_HOSTS_MAX = 32               # scripts lidos guardados de uma vez
+
+AHK_IGNORED = {
+    "sendmode", "coordmode", "setmousedelay", "settitlematchmode",
+    "setbatchlines", "setworkingdir", "critical", "thread", "blockinput",
+    "setcapslockstate", "setnumlockstate", "setscrolllockstate", "sendlevel",
+    "listlines", "keyhistory", "installkeybdhook", "installmousehook",
+    "persistent", "detecthiddenwindows", "setdefaultmousespeed",
+    "processsetpriority", "process", "menu", "tooltip", "setcontroldelay",
+    "setwindelay", "#singleinstance", "a_traymenu", "traysetstate",
+    "setstorecapslockmode", "onexit", "fileencoding", "autotrim",
+    "stringcasesense", "setformat"}
+AHK_COMMANDS = {
+    # nome: tipos dos argumentos do v1 (t texto, n número, o variável de
+    # saída, * o resto todo junto)
+    "send": "t", "sendinput": "t", "sendevent": "t", "sendplay": "t",
+    "sendraw": "t", "sendtext": "t", "controlsend": "tt", "sleep": "n",
+    "click": "*", "mouseclick": "tnnnntt", "mousemove": "nnnt",
+    "keywait": "tt", "getkeystate": "ott", "pixelgetcolor": "onnt",
+    "pixelsearch": "oonnnnnnt", "imagesearch": "oonnnnt", "random": "onn",
+    "settimer": "ttn", "gosub": "t", "goto": "t", "traytip": "tt",
+    "msgbox": "*", "soundbeep": "nn", "setkeydelay": "nn",
+    "winactivate": "t", "winwaitactive": "ttn", "suspend": "t",
+    "pause": "t", "exitapp": "", "exit": "", "reload": "",
+    "stringupper": "ot", "stringlower": "ot", "envadd": "on",
+    "envsub": "on", "envmult": "on", "envdiv": "on"}
+
+
+_AHK_GLOBAL_ONLY = {"errorlevel", "clipboard", "a_clipboard"}
+
+
+class AhkError(Exception):
+    """Algo que o interpretador não faz, ou um erro do script: a linha e o
+    texto (em inglês, traduzido só na hora de mostrar)."""
+
+    def __init__(self, ln, text, **fmt):
+        super().__init__(text)
+        self.ln, self.text, self.fmt = ln, text, fmt
+
+    def message(self):
+        body = _(self.text, **self.fmt)
+        return _("line {n}: {what}", n=self.ln, what=body) if self.ln \
+            else body
+
+
+class _AhkReturn(Exception):
+    def __init__(self, value=""):
+        super().__init__()
+        self.value = value
+
+
+class _AhkBreak(Exception):
+    pass
+
+
+class _AhkContinue(Exception):
+    pass
+
+
+class _AhkExit(Exception):
+    """Exit, ExitApp, Reload, ou o macro parou."""
+
+    def __init__(self, app=False):
+        super().__init__()
+        self.app = app
+
+
+class _Ref:
+    """&var do v2: a função escreve na variável de quem chamou."""
+
+    def __init__(self, run, name):
+        self.run, self.name = run, name
+
+    def set(self, value):
+        self.run.set_var(self.name, value)
+
+
+_AHK_TOK = re.compile(r"""
+ (?P<ws>\s+)
+|(?P<num>0[xX][0-9a-fA-F]+|(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?)
+|(?P<str>"(?:[^"`]|`.|"")*"|'(?:[^'`]|`.|'')*')
+|(?P<id>[A-Za-z_À-￿][\wÀ-￿]*)
+|(?P<op>\*\*=|//=|<<=|>>=|!==|\.=|:=|\+=|-=|\*=|/=|\|=|&=|\^=|\+\+|--|\*\*
+   |//|<<|>>|&&|\|\||==|!=|<>|<=|>=|~=|\?\?|=>|[-+*/!~&|^<>=?:.,()%\[\]{}])
+""", re.X)
+_AHK_ASSIGN = (":=", "+=", "-=", "*=", "/=", "//=", ".=", "|=", "&=", "^=",
+               "<<=", ">>=")
+_AHK_BIN = {  # operador: (força, associa à direita)
+    "or": (5, False), "||": (5, False), "and": (6, False), "&&": (6, False),
+    "=": (8, False), "==": (8, False), "!=": (8, False), "!==": (8, False),
+    "<>": (8, False), "<": (9, False), ">": (9, False), "<=": (9, False),
+    ">=": (9, False), "~=": (10, False), ".": (11, False), "|": (12, False),
+    "^": (13, False), "&": (14, False), "<<": (15, False), ">>": (15, False),
+    "+": (16, False), "-": (16, False), "*": (17, False), "/": (17, False),
+    "//": (17, False), "**": (19, True)}
+
+
+def _ahk_unescape(body, quote):
+    out, i = [], 0
+    esc = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "a": "\a", "f": "\f",
+           "v": "\v", "s": " "}
+    while i < len(body):
+        ch = body[i]
+        if ch == "`" and i + 1 < len(body):
+            nxt = body[i + 1]
+            out.append(esc.get(nxt, nxt))
+            i += 2
+            continue
+        if ch == quote and body[i + 1:i + 2] == quote:
+            out.append(quote)
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _ahk_lex(text, ln):
+    """Tokens de uma expressão: (tipo, valor, espaço antes)."""
+    toks, pos, space = [], 0, False
+    while pos < len(text):
+        m = _AHK_TOK.match(text, pos)
+        if not m:
+            raise AhkError(ln, "cannot read {what}", what=text[pos:pos + 20])
+        pos = m.end()
+        kind = m.lastgroup
+        val = m.group(kind)
+        if kind == "ws":
+            space = True
+            continue
+        if kind == "op":
+            val = val.strip()
+        if kind == "id" and val.lower() in ("and", "or", "not"):
+            kind, val = "op", val.lower()
+        toks.append((kind, val, space))
+        space = False
+    return toks
+
+
+class _AhkExpr:
+    """Pratt parser: texto -> árvore de tuplas."""
+
+    def __init__(self, text, ln):
+        self.t = _ahk_lex(text, ln)
+        self.i, self.ln = 0, ln
+
+    def peek(self, k=0):
+        j = self.i + k
+        return self.t[j] if j < len(self.t) else (None, None, False)
+
+    def take(self):
+        tok = self.peek()
+        self.i += 1
+        return tok
+
+    def want(self, val):
+        tok = self.take()
+        if tok[1] != val:
+            raise AhkError(self.ln, "expected {what}", what=val)
+
+    def parse(self):
+        if not self.t:
+            return ("str", "")
+        node = self.seq()
+        if self.i < len(self.t):
+            raise AhkError(self.ln, "cannot read {what}",
+                           what=" ".join(str(x[1]) for x in self.t[self.i:])
+                           [:30])
+        return node
+
+    def seq(self):
+        items = [self.expr(0)]
+        while self.peek()[1] == ",":
+            self.take()
+            items.append(self.expr(0))
+        return items[0] if len(items) == 1 else ("seq", items)
+
+    def expr(self, rbp):
+        left = self.prefix()
+        while True:
+            kind, val, sp = self.peek()
+            if kind is None:
+                break
+            if kind == "op" and val in _AHK_ASSIGN and rbp <= 2:
+                if left[0] != "var":
+                    raise AhkError(self.ln, "only a variable can take {op}",
+                                   op=val)
+                self.take()
+                left = ("assign", val, left[1], self.expr(2))
+                continue
+            if kind == "op" and val == "?" and rbp <= 3:
+                self.take()
+                a = self.expr(3)
+                self.want(":")
+                left = ("tern", left, a, self.expr(3))
+                continue
+            if kind == "op" and val == "??" and rbp <= 4:
+                self.take()
+                left = ("bin", "??", left, self.expr(5))
+                continue
+            if kind == "op" and val in ("++", "--") and left[0] == "var" \
+                    and not sp:
+                self.take()
+                left = ("post", val, left[1])
+                continue
+            if kind == "op" and val == "." and not sp:
+                raise AhkError(self.ln, "objects are not supported")
+            if kind == "op" and val in _AHK_BIN:
+                bp, right = _AHK_BIN[val]
+                if bp <= rbp:
+                    break
+                self.take()
+                rhs = self.expr(bp - 1 if right else bp)
+                if val in ("and", "&&"):
+                    left = ("and", left, rhs)
+                elif val in ("or", "||"):
+                    left = ("or", left, rhs)
+                else:
+                    left = ("bin", val, left, rhs)
+                continue
+            # dois valores lado a lado, com espaço: concatenação implícita
+            if sp and 11 > rbp and (kind in ("num", "str", "id")
+                                    or val == "("):
+                if kind == "id" and val.lower() in ("is", "in", "contains"):
+                    raise AhkError(self.ln, "{what} is not supported",
+                                   what=val)
+                left = ("bin", ".", left, self.expr(11))
+                continue
+            break
+        return left
+
+    def prefix(self):
+        kind, val, _sp = self.take()
+        if kind is None:
+            raise AhkError(self.ln, "the expression ends too early")
+        if kind == "num":
+            v = val.lower()
+            if v.startswith("0x"):
+                return ("num", int(v, 16))
+            if re.fullmatch(r"\d+", v):
+                return ("num", int(v))
+            return ("num", float(v))
+        if kind == "str":
+            return ("str", _ahk_unescape(val[1:-1], val[0]))
+        if kind == "id":
+            low = val.lower()
+            nxt = self.peek()
+            if nxt[1] == "(" and not nxt[2]:
+                self.take()
+                args = []
+                if self.peek()[1] != ")":
+                    args.append(self._arg())
+                    while self.peek()[1] == ",":
+                        self.take()
+                        args.append(self._arg())
+                self.want(")")
+                return ("call", low, args)
+            if nxt[1] in ("[",) and not nxt[2]:
+                raise AhkError(self.ln, "arrays are not supported")
+            return ("var", low)
+        if val == "(":
+            node = self.seq()
+            self.want(")")
+            return node
+        if val in ("-", "+", "!", "~", "not"):
+            return ("un", val, self.expr(7 if val == "not" else 18))
+        if val in ("++", "--"):
+            k2, v2, _s = self.take()
+            if k2 != "id":
+                raise AhkError(self.ln, "only a variable can take {op}",
+                               op=val)
+            return ("pre", val, v2.lower())
+        if val == "&":
+            k2, v2, _s = self.take()
+            if k2 != "id":
+                raise AhkError(self.ln, "cannot read {what}", what="&")
+            return ("ref", v2.lower())
+        if val == "%":
+            raise AhkError(self.ln, "dynamic variables (%name%) inside an "
+                                    "expression are not supported")
+        if val in ("[", "{"):
+            raise AhkError(self.ln, "arrays and objects are not supported")
+        raise AhkError(self.ln, "cannot read {what}", what=val)
+
+    def _arg(self):
+        if self.peek()[1] in (",", ")"):
+            return ("str", "")              # argumento omitido
+        return self.expr(0)
+
+
+def ahk_expr(text, ln=0):
+    return _AhkExpr(text, ln).parse()
+
+
+# ----------------------------------------------------------- comandos --
+class _AhkProgram:
+    """Um script lido: atalhos (pela linha), rótulos, funções, hotstrings e
+    a seção de auto execução."""
+
+    def __init__(self, src, v2=None):
+        self.v2 = bool(re.search(r"^\s*#Requires\s+AutoHotkey\s+v?2", src,
+                                 re.I | re.M)) if v2 is None else bool(v2)
+        self.toks = _ahk_tokens(src)
+        self.hotkeys = {}           # linha -> (atalho, corpo)
+        self.labels = {}            # nome -> corpo
+        self.funcs = {}             # nome -> (parâmetros, corpo, linha)
+        self.auto = []
+        self.i = 0
+        self._top()
+
+    # ---- topo
+    def _top(self):
+        """Lê definição por definição. Uma que o interpretador não entende
+        (um objeto, um for) fica marcada como quebrada e o resto segue: o
+        atalho que não passa por ela roda do mesmo jeito."""
+        toks = self.toks
+        while self.i < len(toks):
+            start = self.i
+            ln, t = toks[start]
+            if t.startswith("#"):
+                self.i += 1
+                continue
+            try:
+                self._item(ln, t)
+            except AhkError as e:
+                self.i = self._skip(start + 1)
+                self._broken(ln, t, ("bad", e))
+
+    def _is_def(self, i):
+        t = self.toks[i][1]
+        return bool(t.startswith(":") and HOTSTRING_RE.match(t)
+                    or HOTKEY_RE.match(t) and not re.match(
+                        r"(?i)(if|while|else)\b", t)
+                    or LABEL_RE.match(t)
+                    or FUNC_RE.match(t) and i + 1 < len(self.toks)
+                    and self.toks[i + 1][1] == "{")
+
+    def _skip(self, i):
+        """Depois de um erro: a próxima definição fora de qualquer bloco."""
+        depth = 0
+        while i < len(self.toks):
+            t = self.toks[i][1]
+            if t == "{":
+                depth += 1
+            elif t == "}":
+                depth = max(0, depth - 1)
+            elif depth == 0 and self._is_def(i):
+                return i
+            i += 1
+        return i
+
+    def _broken(self, ln, t, bad):
+        hs = HOTSTRING_RE.match(t)
+        m = HOTKEY_RE.match(t)
+        if hs:
+            self.hotkeys[ln] = (f":{hs.group(1)}:{hs.group(2)}", [bad])
+        elif m and not re.match(r"(?i)(if|while|else)\b", t):
+            self.hotkeys[ln] = (m.group(1).strip(), [bad])
+            self._unstack([bad])
+        elif LABEL_RE.match(t):
+            self.labels[LABEL_RE.match(t).group(1).lower()] = [bad]
+        elif FUNC_RE.match(t):
+            self.funcs[FUNC_RE.match(t).group(1).lower()] = ([], [bad], ln)
+        else:
+            self.auto.append(bad)
+
+    def _unstack(self, body):
+        for k in sorted(self.hotkeys):
+            if self.hotkeys[k][1] is None:
+                self.hotkeys[k] = (self.hotkeys[k][0], body)
+
+    def _item(self, ln, t):
+        toks = self.toks
+        hs = HOTSTRING_RE.match(t)
+        if hs:
+            opts, abbr, repl = hs.group(1), hs.group(2), hs.group(3)
+            self.i += 1
+            if repl.strip() and "x" not in opts.lower():
+                return                          # troca de texto, sem código
+            if repl.strip():
+                body = [self._line_stmt(ln, repl.strip())]
+            else:
+                body = self._until_return()
+            self.hotkeys[ln] = (f":{opts}:{abbr}", body)
+            return
+        m = HOTKEY_RE.match(t)
+        if m and not re.match(r"(?i)(if|while|else)\b", t):
+            spec, rest = m.group(1).strip(), m.group(2).strip()
+            self.i += 1
+            if not rest and self.i < len(toks) and toks[self.i][1] == "{":
+                body = [self._block()]
+                if self.i < len(toks) and toks[self.i][1].lower() == "return":
+                    self.i += 1
+            elif not rest:
+                if self.i < len(toks) and HOTKEY_RE.match(toks[self.i][1]):
+                    # empilhado: divide o corpo do de baixo
+                    self.hotkeys[ln] = (spec, None)
+                    return
+                body = self._until_return()
+            else:
+                body = [self._line_stmt(ln, rest)]
+            self.hotkeys[ln] = (spec, body)
+            self._unstack(body)
+            return
+        m = LABEL_RE.match(t)
+        if m:
+            self.i += 1
+            self.labels[m.group(1).lower()] = self._until_return()
+            return
+        m = FUNC_RE.match(t)
+        if m and self.i + 1 < len(toks) and toks[self.i + 1][1] == "{":
+            self.i += 1
+            params = self._params(m.group(2), ln)
+            self.funcs[m.group(1).lower()] = (params, [self._block()], ln)
+            return
+        self.auto.append(self._stmt())
+
+    def _params(self, text, ln):
+        out = []
+        for p in _split_args(text):
+            p = p.strip()
+            if not p:
+                continue
+            byref = p.lower().startswith("byref ") or p.startswith("&")
+            p = re.sub(r"(?i)^byref\s+|^&", "", p).strip()
+            m = re.fullmatch(r"([A-Za-z_]\w*)\s*(?::=|=)\s*(.+)", p)
+            if m:
+                out.append((m.group(1).lower(), ahk_expr(m.group(2), ln),
+                            byref))
+            elif re.fullmatch(r"[A-Za-z_]\w*\*?", p):
+                out.append((p.rstrip("*").lower(), None, byref))
+            else:
+                raise AhkError(ln, "cannot read {what}", what=p)
+        return out
+
+    def _until_return(self):
+        body = []
+        while self.i < len(self.toks):
+            if self._is_def(self.i):
+                break
+            node = self._stmt()
+            if node[0] == "return" and node[2] is None:
+                break
+            body.append(node)
+            if node[0] == "return":
+                break
+        return body
+
+    # ---- instruções
+    def _block(self):
+        ln = self.toks[self.i][0]
+        self.i += 1                             # o "{"
+        nodes = []
+        while self.i < len(self.toks) and self.toks[self.i][1] != "}":
+            nodes.append(self._stmt())
+        if self.i >= len(self.toks):
+            raise AhkError(ln, "a block is not closed")
+        self.i += 1
+        return ("block", nodes)
+
+    def _sub(self, ln):
+        if self.i >= len(self.toks):
+            raise AhkError(ln, "the script ends too early")
+        return self._stmt()
+
+    def _stmt(self):
+        ln, t = self.toks[self.i]
+        if t == "{":
+            return self._block()
+        if t == "}":
+            raise AhkError(ln, "a } without its {")
+        m = re.match(r"(?i)^(if|while)\b\s*(.*)$", t) \
+            or re.match(r"(?i)^(if|while)(\(.*)$", t)
+        if m:
+            kind, cond = m.group(1).lower(), m.group(2).strip()
+            if not cond:
+                raise AhkError(ln, "{what} without a condition", what=kind)
+            self.i += 1
+            test = self._cond(cond, ln)
+            body = self._sub(ln)
+            if kind == "while":
+                return ("while", ln, test, body)
+            other = None
+            if self.i < len(self.toks) and re.match(
+                    r"(?i)^else\b", self.toks[self.i][1]):
+                eln, et = self.toks[self.i]
+                rest = et[4:].strip().lstrip(",").strip()
+                if rest:
+                    self.toks[self.i] = (eln, rest)
+                    other = self._stmt()
+                else:
+                    self.i += 1
+                    other = self._sub(eln)
+            return ("if", ln, test, body, other)
+        m = re.match(r"(?i)^ifwin(not)?active\b\s*,?\s*(.*)$", t)
+        if m:
+            self.i += 1
+            test = ("call", "winactive", [("str", self._v1text(
+                _split_args(m.group(2))[0] if m.group(2) else ""))])
+            if m.group(1):
+                test = ("un", "!", test)
+            body = self._sub(ln)
+            other = None
+            if self.i < len(self.toks) and re.match(
+                    r"(?i)^else\b", self.toks[self.i][1]):
+                self.i += 1
+                other = self._sub(ln)
+            return ("if", ln, test, body, other)
+        m = re.match(r"(?i)^loop\b\s*,?\s*(.*)$", t)
+        if m:
+            arg = m.group(1).strip()
+            if re.match(r"(?i)(parse|read|files|reg)\b", arg) \
+                    or re.match(r"(?i)^,?\s*(parse|read|files|reg)\b", arg):
+                raise AhkError(ln, "{what} is not supported", what=t)
+            self.i += 1
+            count = None
+            if arg:
+                count = self._numarg(arg, ln)
+            body = self._sub(ln)
+            until = None
+            if self.i < len(self.toks) and re.match(
+                    r"(?i)^until\b", self.toks[self.i][1]):
+                uln, ut = self.toks[self.i]
+                self.i += 1
+                until = ahk_expr(ut[5:].strip(), uln)
+            return ("loop", ln, count, body, until)
+        if re.match(r"(?i)^for\b", t):
+            raise AhkError(ln, "{what} is not supported", what="for")
+        if re.match(r"(?i)^switch\b", t):
+            raise AhkError(ln, "{what} is not supported", what="switch")
+        m = re.match(r"(?i)^try\b\s*(.*)$", t)
+        if m:
+            rest = m.group(1).strip()
+            if rest:
+                self.toks[self.i] = (ln, rest)
+                body = self._stmt()
+            else:
+                self.i += 1
+                body = self._sub(ln)
+            handler = None
+            if self.i < len(self.toks) and re.match(
+                    r"(?i)^catch\b", self.toks[self.i][1]):
+                self.i += 1
+                handler = self._sub(ln)
+            if self.i < len(self.toks) and re.match(
+                    r"(?i)^finally\b", self.toks[self.i][1]):
+                self.i += 1
+                handler = ("block", [handler or ("block", []),
+                                     self._sub(ln)])
+            return ("try", ln, body, handler)
+        if re.match(r"(?i)^(catch|finally|else|until)\b", t):
+            raise AhkError(ln, "{what} without its start",
+                           what=t.split()[0])
+        self.i += 1
+        return self._line_stmt(ln, t)
+
+    def _line_stmt(self, ln, t):
+        low = t.lower()
+        if low in ("break", "continue"):
+            return (low, ln)
+        m = re.match(r"(?i)^return\b\s*,?\s*(.*)$", t)
+        if m:
+            rest = m.group(1).strip()
+            return ("return", ln, ahk_expr(rest, ln) if rest else None)
+        if low in ("exit", "exitapp", "reload"):
+            return ("exit", ln, low == "exitapp")
+        m = re.match(r"(?i)^(global|local|static)\b\s*(.*)$", t)
+        if m:
+            names, inits = [], []
+            for part in _split_args(m.group(2)):
+                part = part.strip()
+                if not part:
+                    continue
+                mm = re.fullmatch(r"([A-Za-z_]\w*)\s*(?::=\s*(.+))?", part)
+                if not mm:
+                    raise AhkError(ln, "cannot read {what}", what=part)
+                names.append(mm.group(1).lower())
+                inits.append(ahk_expr(mm.group(2), ln) if mm.group(2)
+                             else None)
+            return ("decl", ln, m.group(1).lower(), names, inits)
+        # atribuição e expressões: x := 1, x += 2, x++, ++x, Foo(1), (...)
+        m = re.match(r"^([A-Za-z_]\w*)\s*(:=|\+=|-=|\*=|/=|//=|\.=|\|=|&=|"
+                     r"\^=|<<=|>>=|\+\+|--)", t)
+        if m or t.startswith(("(", "++", "--")):
+            return ("expr", ln, ahk_expr(t, ln))
+        # v1: x = texto
+        m = re.fullmatch(r"([A-Za-z_]\w*)\s*=(?!=)\s*(.*)", t)
+        if m and not self.v2:
+            return ("expr", ln, ("assign", ":=", m.group(1).lower(),
+                                 self._v1text_node(m.group(2), ln)))
+        m = re.match(r"^([A-Za-z_]\w*)(.*)$", t)
+        if not m:
+            raise AhkError(ln, "cannot read {what}", what=t[:30])
+        name, rest = m.group(1), m.group(2)
+        low = name.lower()
+        if rest.startswith("(") and not rest.startswith("( "):
+            node = ahk_expr(t, ln)
+            return ("expr", ln, node)
+        rest = rest.strip()
+        comma = rest.startswith(",")
+        if comma:
+            rest = rest[1:].strip()
+        if low in AHK_IGNORED:
+            return ("noop", ln)
+        if low == "pause":
+            raise AhkError(ln, "{what} is not supported", what=name)
+        if low == "ifwinactive" or low == "ifwinnotactive":
+            raise AhkError(ln, "{what} is not supported", what=name)
+        expr_mode = self.v2 or (not comma and rest.startswith(("\"", "'"))
+                                and low not in AHK_COMMANDS)
+        if low in AHK_COMMANDS and not expr_mode:
+            return ("cmd", ln, low, self._v1args(low, rest, ln))
+        # v2 sem parênteses: Send "x", Sleep 100, MyFunc 1, 2
+        args = [ahk_expr(a, ln) if a.strip() else ("str", "")
+                for a in _split_args(rest)] if rest else []
+        return ("expr", ln, ("call", low, args))
+
+    # ---- argumentos do v1
+    def _v1args(self, cmd, rest, ln):
+        kinds = AHK_COMMANDS[cmd]
+        if kinds == "*" or kinds in ("t",) or cmd in ("send", "sendinput",
+                                                      "sendevent",
+                                                      "sendplay", "sendraw",
+                                                      "sendtext"):
+            if rest.startswith("% "):
+                return [ahk_expr(rest[2:], ln)]
+            return [self._v1text_node(rest, ln)]
+        parts = _split_args(rest) if rest else []
+        out = []
+        for k, a in enumerate(parts):
+            kind = kinds[k] if k < len(kinds) else "t"
+            a = a.strip()
+            if kind == "o":
+                out.append(("out", a.strip("%").strip().lower()))
+            elif a.startswith("% "):
+                out.append(ahk_expr(a[2:], ln))
+            elif kind == "n" and a:
+                out.append(self._numarg(a, ln))
+            else:
+                out.append(self._v1text_node(a, ln))
+        return out
+
+    def _numarg(self, a, ln):
+        """Argumento numérico do v1: número, %var%, ou uma expressão."""
+        a = a.strip()
+        if a.startswith("% "):
+            return ahk_expr(a[2:], ln)
+        if "%" in a:
+            return self._v1text_node(a, ln)
+        return ahk_expr(a, ln)
+
+    def _v1text(self, a):
+        return _ahk_unescape(a, "\x00")
+
+    def _v1text_node(self, a, ln):
+        """Texto do v1 com %var% trocado pelo valor: vira uma concatenação."""
+        parts = re.split(r"%([A-Za-z_]\w*)%", a)
+        node = None
+        for k, p in enumerate(parts):
+            item = ("var", p.lower()) if k % 2 else \
+                ("str", _ahk_unescape(p, "\x00")) if p else None
+            if item is None:
+                continue
+            node = item if node is None else ("bin", ".", node, item)
+        return node or ("str", "")
+
+    def _cond(self, cond, ln):
+        """if de expressão, ou o if legado do v1 (if x = texto)."""
+        if not self.v2 and not cond.startswith("("):
+            m = re.fullmatch(r"([A-Za-z_]\w*)\s*(=|<>|!=|>=|<=|>|<)\s*(.*)",
+                             cond)
+            if m and m.group(2) != "=" or m and not m.group(3).startswith(
+                    "="):
+                return ("bin", "!=" if m.group(2) == "<>" else m.group(2),
+                        ("var", m.group(1).lower()),
+                        self._v1text_node(m.group(3).strip(), ln))
+            m = re.fullmatch(r"(?i)([A-Za-z_]\w*)\s+(not\s+)?(between|in|"
+                             r"contains|is)\s+(.*)", cond)
+            if m:
+                raise AhkError(ln, "{what} is not supported",
+                               what="if ... " + m.group(3))
+        return ahk_expr(cond, ln)
+
+
+
+def _ahk_num(v):
+    """Número de um valor do AutoHotkey, ou None."""
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)):
+        return v
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        if re.fullmatch(r"[-+]?0[xX][0-9a-fA-F]+", s):
+            return int(s, 16)
+        if re.fullmatch(r"[-+]?\d+", s):
+            return int(s)
+        return float(s) if re.fullmatch(
+            r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", s) else None
+    except ValueError:
+        return None
+
+
+def _ahk_str(v):
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float):
+        if v.is_integer() and abs(v) < 1e15:
+            return f"{v:.1f}"
+        return repr(v)
+    return str(v)
+
+
+def _ahk_true(v):
+    if isinstance(v, (int, float)):
+        return v != 0
+    n = _ahk_num(v)
+    if n is not None:
+        return n != 0
+    return v != ""
+
+
+class _AhkHost:
+    """Um script em uso: o programa lido, as variáveis globais (que duram
+    de um aperto ao outro, como num script aberto) e os SetTimer."""
+
+    def __init__(self, src, v2, folder):
+        self.prog = _AhkProgram(src, v2)
+        self.src, self.folder = src, folder
+        self.globals = {}
+        self.timers = {}            # rótulo -> MacroRunner
+        self.lock = threading.Lock()
+        self.started = False
+
+    def start(self, run):
+        """A seção de auto execução, uma vez: só as atribuições e
+        declarações (o resto dela, como laços sem fim, ficaria preso)."""
+        with self.lock:
+            if self.started:
+                return
+            self.started = True
+        for node in self.prog.auto:
+            if node[0] in ("expr", "decl") and (
+                    node[0] == "decl" or node[2][0] in ("assign", "seq")):
+                try:
+                    run.exec(node)
+                except AhkError:
+                    pass
+
+    def stop_timers(self):
+        with self.lock:
+            timers, self.timers = list(self.timers.values()), {}
+        for r in timers:
+            r.stop()
+
+
+_AHK_HOSTS = {}
+_AHK_HOSTS_LOCK = threading.Lock()
+
+
+def ahk_host(src, v2=None, folder=None):
+    key = hashlib.sha1(f"{v2}\x00{folder}\x00{src}".encode(
+        "utf-8", "replace")).hexdigest()
+    with _AHK_HOSTS_LOCK:
+        h = _AHK_HOSTS.get(key)
+        if h is None:
+            old = None
+            if len(_AHK_HOSTS) >= AHK_HOSTS_MAX:
+                # o mais velho sai (editar o script deixa o de antes aqui)
+                old = _AHK_HOSTS.pop(next(iter(_AHK_HOSTS)))
+            h = _AHK_HOSTS[key] = _AhkHost(src, v2, folder)
+            if old is not None:
+                old.stop_timers()
+        return h
+
+
+# comandos que o AhkRun.command resolve sem um f_ próprio
+AHK_RUN_SPECIAL = {"send", "sendinput", "sendevent", "sendplay", "sendraw",
+                   "sendtext", "controlsend", "click", "msgbox",
+                   "getkeystate", "keywait", "pixelgetcolor", "pixelsearch",
+                   "imagesearch", "random", "settimer", "gosub", "goto",
+                   "stringupper", "stringlower", "envadd", "envsub",
+                   "envmult", "envdiv", "exitapp", "exit", "reload"}
+
+
+def _ahk_known(prog, name, cmd):
+    """O interpretador sabe rodar este comando ou função?"""
+    if name in AHK_IGNORED or (cmd and name in AHK_RUN_SPECIAL):
+        return True
+    if not cmd and (name in prog.funcs or name in prog.labels):
+        return True
+    return callable(getattr(AhkRun, "f_" + name, None))
+
+
+def _ahk_bad(prog, nodes, seen):
+    """O primeiro erro de leitura no caminho destes nós (entrando nas
+    funções e rótulos chamados pelo nome), ou None. Um comando ou função
+    que o interpretador não tem (Gui, por exemplo) também conta, para o
+    atalho ser avisado ao importar e não só quando rodar."""
+    stack = [(n, 0) for n in nodes]
+    while stack:
+        n, ln = stack.pop()
+        if isinstance(n, AhkError):
+            return n
+        if not isinstance(n, tuple) or not n:
+            continue
+        if len(n) > 1 and isinstance(n[1], int) and not isinstance(
+                n[1], bool):
+            ln = n[1]
+        if n[0] == "bad":
+            return n[1]
+        if n[0] == "call" and isinstance(n[1], str):
+            name = n[1]
+            if name and not _ahk_known(prog, name, False):
+                return AhkError(ln, "{name}() is not supported", name=name)
+            if name not in seen:
+                seen.add(name)
+                if name in prog.funcs:
+                    stack.extend((x, ln) for x in prog.funcs[name][1])
+                if name in prog.labels:
+                    stack.extend((x, ln) for x in prog.labels[name])
+        if n[0] == "cmd" and isinstance(n[2], str):
+            if not _ahk_known(prog, n[2], True):
+                return AhkError(ln, "{what} is not supported", what=n[2])
+            if n[2] in ("gosub", "goto", "settimer"):
+                for a in n[3][:1]:
+                    if a[0] == "str":
+                        name = a[1].strip().lower()
+                        if name not in seen:
+                            seen.add(name)
+                            stack.extend((x, ln) for x in
+                                         prog.labels.get(name, ()))
+                            if name in prog.funcs:
+                                stack.extend((x, ln) for x in
+                                             prog.funcs[name][1])
+        for x in n[1:]:
+            if isinstance(x, tuple):
+                stack.append((x, ln))
+            elif isinstance(x, list):
+                stack.extend((y, ln) for y in x if isinstance(y, tuple))
+    return None
+
+
+def ahk_check(src, v2=None, line=0, label=""):
+    """O interpretador consegue rodar este atalho (pela linha), ou o
+    rótulo? None, ou o AhkError."""
+    try:
+        prog = _AhkProgram(src, v2)
+    except AhkError as e:
+        return e
+    except RecursionError:
+        return AhkError(0, "the script is nested too deeply")
+    if line:
+        hk = prog.hotkeys.get(line)
+        if hk is None or hk[1] is None:
+            return AhkError(line, "this hotkey is not in the script")
+        return _ahk_bad(prog, hk[1], set())
+    if label:
+        name = label.lower()
+        if name not in prog.labels and name not in prog.funcs:
+            return AhkError(0, "{name} was not found", name=label)
+        body = prog.labels.get(name) or prog.funcs[name][1]
+        return _ahk_bad(prog, body, {name})
+    return _ahk_bad(prog, prog.auto, set())
+
+
+def ahk_stop_all():
+    with _AHK_HOSTS_LOCK:
+        hosts = list(_AHK_HOSTS.values())
+    for h in hosts:
+        h.stop_timers()
+
+
+class AhkRun:
+    """Uma execução (um aperto, um SetTimer): as variáveis locais, o
+    A_Index, e o MacroRunner que aperta as teclas."""
+
+    def __init__(self, host, runner, hotkey="", st=None):
+        self.host, self.r, self.prog = host, runner, host.prog
+        self.st = st or {}
+        self.frames = []            # pilha de funções: (locais, globais, estáticas)
+        self.index = [0]
+        self.hotkey = hotkey
+        self.spin = 0
+        self._imp = None
+
+    # ---------------------------------------------------- variáveis --
+    def _frame(self):
+        return self.frames[-1] if self.frames else None
+
+    def get_var(self, name):
+        """Local, global declarada, ou (como no v2) a global lida de dentro
+        da função sem declarar."""
+        f = self._frame()
+        g = self.host.globals
+        if f is not None and name not in _AHK_GLOBAL_ONLY:
+            loc, glob, _st, _all = f
+            if name in loc and name not in glob:
+                return loc[name]
+        if name in g:
+            return g[name]
+        return self.builtin_var(name)
+
+    def set_var(self, name, value):
+        f = self._frame()
+        if f is not None and name not in _AHK_GLOBAL_ONLY:
+            loc, glob, _st, all_global = f
+            if name not in glob and not (all_global and name not in loc):
+                loc[name] = value
+                return
+        self.host.globals[name] = value
+
+    def builtin_var(self, name):
+        if name == "a_index":
+            return self.index[-1]
+        if name in ("true",):
+            return 1
+        if name in ("false",):
+            return 0
+        if name == "a_tickcount":
+            return int(time.monotonic() * 1000)
+        if name in ("a_screenwidth", "a_screenheight"):
+            ws = getattr(self.r.env, "workspace", None)
+            if ws:
+                return int(ws[2] if name == "a_screenwidth" else ws[3])
+            return 1920 if name == "a_screenwidth" else 1080
+        if name == "a_space":
+            return " "
+        if name == "a_tab":
+            return "\t"
+        if name in ("a_thishotkey", "a_priorhotkey"):
+            return self.hotkey if name == "a_thishotkey" else ""
+        if name == "a_scriptdir":
+            return self.host.folder or ""
+        if name in ("a_now", "a_yyyy", "a_mm", "a_dd", "a_hour", "a_min",
+                    "a_sec", "a_msec", "a_year", "a_mon", "a_mday"):
+            t = time.localtime()
+            return {"a_now": time.strftime("%Y%m%d%H%M%S", t),
+                    "a_yyyy": time.strftime("%Y", t),
+                    "a_year": time.strftime("%Y", t),
+                    "a_mm": time.strftime("%m", t),
+                    "a_mon": time.strftime("%m", t),
+                    "a_dd": time.strftime("%d", t),
+                    "a_mday": time.strftime("%d", t),
+                    "a_hour": time.strftime("%H", t),
+                    "a_min": time.strftime("%M", t),
+                    "a_sec": time.strftime("%S", t),
+                    "a_msec": "%03d" % (int(time.time() * 1000) % 1000)}[name]
+        return ""
+
+    # ------------------------------------------------------ execução --
+    def _alive(self):
+        if self.r._halt.is_set():
+            raise _AhkExit()
+
+    def _spin(self):
+        """Um laço que não espera nada cede a vez de tempos em tempos: com o
+        teclado capturado, a thread do hub precisa da GIL."""
+        self.spin += 1
+        if self.spin >= AHK_SPIN:
+            self.spin = 0
+            self.r._sleep(0.001)
+        self._alive()
+
+    def run_body(self, nodes):
+        try:
+            for n in nodes:
+                self.exec(n)
+        except _AhkReturn:
+            pass
+        except (_AhkBreak, _AhkContinue):
+            pass
+
+    def exec(self, node):
+        kind = node[0]
+        if kind == "block":
+            for n in node[1]:
+                self.exec(n)
+        elif kind == "expr":
+            self.eval(node[2], node[1])
+        elif kind == "cmd":
+            self.command(node[2], node[3], node[1])
+        elif kind == "if":
+            if _ahk_true(self.eval(node[2], node[1])):
+                self.exec(node[3])
+            elif node[4] is not None:
+                self.exec(node[4])
+        elif kind == "while":
+            self.index.append(0)
+            try:
+                while _ahk_true(self.eval(node[2], node[1])):
+                    self.index[-1] += 1
+                    try:
+                        self.exec(node[3])
+                    except _AhkContinue:
+                        pass
+                    self._spin()
+            except _AhkBreak:
+                pass
+            finally:
+                self.index.pop()
+        elif kind == "loop":
+            count = None
+            if node[2] is not None:
+                n = _ahk_num(self.eval(node[2], node[1]))
+                count = max(0, int(n or 0))
+            self.index.append(0)
+            try:
+                while count is None or self.index[-1] < count:
+                    self.index[-1] += 1
+                    try:
+                        self.exec(node[3])
+                    except _AhkContinue:
+                        pass
+                    if node[4] is not None and _ahk_true(
+                            self.eval(node[4], node[1])):
+                        break
+                    self._spin()
+            except _AhkBreak:
+                pass
+            finally:
+                self.index.pop()
+        elif kind == "break":
+            raise _AhkBreak()
+        elif kind == "continue":
+            raise _AhkContinue()
+        elif kind == "return":
+            raise _AhkReturn("" if node[2] is None
+                             else self.eval(node[2], node[1]))
+        elif kind == "exit":
+            raise _AhkExit(app=node[2])
+        elif kind == "decl":
+            self._decl(node)
+        elif kind == "try":
+            try:
+                self.exec(node[2])
+            except AhkError:
+                if node[3] is not None:
+                    self.exec(node[3])
+        elif kind == "noop":
+            pass
+        elif kind == "bad":
+            raise node[1]
+
+    def _decl(self, node):
+        _k, ln, scope, names, inits = node
+        f = self._frame()
+        if scope == "global":
+            if f is not None:
+                if not names:
+                    self.frames[-1] = (f[0], f[1], f[2], True)
+                f[1].update(names)
+            for name, init in zip(names, inits):
+                if init is not None:
+                    self.host.globals[name] = self.eval(init, ln)
+        elif scope == "static" and f is not None:
+            st = f[2]
+            for name, init in zip(names, inits):
+                if name not in st:
+                    st[name] = self.eval(init, ln) if init is not None else ""
+                f[0][name] = st[name]
+                f[1].discard(name)
+                f[0].setdefault("\x00static", set()).add(name)
+        else:
+            for name, init in zip(names, inits):
+                if f is not None:
+                    f[1].discard(name)
+                    f[0][name] = self.eval(init, ln) if init is not None \
+                        else ""
+                elif init is not None:
+                    self.host.globals[name] = self.eval(init, ln)
+
+    # ---------------------------------------------------- expressões --
+    def eval(self, node, ln):
+        kind = node[0]
+        if kind == "num" or kind == "str":
+            return node[1]
+        if kind == "var":
+            return self.get_var(node[1])
+        if kind == "seq":
+            v = ""
+            for n in node[1]:
+                v = self.eval(n, ln)
+            return v
+        if kind == "assign":
+            _k, op, name, rhs = node
+            val = self.eval(rhs, ln)
+            if op != ":=":
+                val = self.binop(op[:-1], self.get_var(name), val, ln)
+            self.set_var(name, val)
+            return val
+        if kind in ("pre", "post"):
+            _k, op, name = node
+            old = _ahk_num(self.get_var(name)) or 0
+            new = old + (1 if op == "++" else -1)
+            self.set_var(name, new)
+            return new if kind == "pre" else old
+        if kind == "un":
+            op, v = node[1], self.eval(node[2], ln)
+            if op in ("!", "not"):
+                return 0 if _ahk_true(v) else 1
+            n = _ahk_num(v)
+            if n is None:
+                return ""
+            return -n if op == "-" else n if op == "+" else ~int(n)
+        if kind == "and":
+            return 1 if _ahk_true(self.eval(node[1], ln)) and _ahk_true(
+                self.eval(node[2], ln)) else 0
+        if kind == "or":
+            a = self.eval(node[1], ln)
+            if _ahk_true(a):
+                return a if self.prog.v2 else 1
+            b = self.eval(node[2], ln)
+            return (b if self.prog.v2 else (1 if _ahk_true(b) else 0))
+        if kind == "tern":
+            return self.eval(node[2] if _ahk_true(self.eval(node[1], ln))
+                             else node[3], ln)
+        if kind == "bin":
+            if node[1] == "??":
+                a = self.eval(node[2], ln)
+                return a if a != "" else self.eval(node[3], ln)
+            return self.binop(node[1], self.eval(node[2], ln),
+                              self.eval(node[3], ln), ln)
+        if kind == "ref":
+            return _Ref(self, node[1])
+        if kind == "out":
+            return _Ref(self, node[1])
+        if kind == "call":
+            return self.call(node[1], node[2], ln)
+        raise AhkError(ln, "cannot read {what}", what=kind)
+
+    def binop(self, op, a, b, ln):
+        if op == ".":
+            return _ahk_str(a) + _ahk_str(b)
+        if op in ("=", "==", "!=", "!==", "<>", "<", ">", "<=", ">="):
+            na, nb = _ahk_num(a), _ahk_num(b)
+            if na is not None and nb is not None and op not in ("==", "!=="):
+                x, y = na, nb
+            elif op in ("==", "!=="):
+                x, y = _ahk_str(a), _ahk_str(b)
+                if na is not None and nb is not None:
+                    x, y = na, nb
+            else:
+                x, y = _ahk_str(a).lower(), _ahk_str(b).lower()
+            res = {"=": x == y, "==": x == y, "!=": x != y, "!==": x != y,
+                   "<>": x != y, "<": x < y, ">": x > y, "<=": x <= y,
+                   ">=": x >= y}[op]
+            return 1 if res else 0
+        if op == "~=":
+            try:
+                m = re.search(_ahk_regex(_ahk_str(b)), _ahk_str(a))
+            except re.error:
+                raise AhkError(ln, "the regular expression is not valid") \
+                    from None
+            return m.start() + 1 if m else 0
+        x, y = _ahk_num(a), _ahk_num(b)
+        if x is None or y is None:
+            return ""
+        try:
+            if op == "+":
+                return x + y
+            if op == "-":
+                return x - y
+            if op == "*":
+                return x * y
+            if op == "/":
+                if isinstance(x, int) and isinstance(y, int) and y and \
+                        x % y == 0 and not self.prog.v2:
+                    return x // y
+                return x / y
+            if op == "//":
+                if isinstance(x, int) and isinstance(y, int):
+                    q = abs(x) // abs(y)
+                    return q if (x >= 0) == (y >= 0) else -q
+                return float(math.floor(x / y))
+            if op == "**":
+                return x ** y
+            if op in ("|", "&", "^", "<<", ">>"):
+                x, y = int(x), int(y)
+                return {"|": x | y, "&": x & y, "^": x ^ y,
+                        "<<": x << y, ">>": x >> y}[op]
+        except ZeroDivisionError:
+            raise AhkError(ln, "division by zero") from None
+        except OverflowError:
+            raise AhkError(ln, "the number is too big") from None
+        raise AhkError(ln, "cannot read {what}", what=op)
+
+    # ------------------------------------------------------ chamadas --
+    def call(self, name, args, ln):
+        if name in self.prog.funcs:
+            return self.call_user(name, args, ln)
+        fn = getattr(self, "f_" + name, None)
+        if fn is not None:
+            if name == "settimer":
+                return fn(args, ln)
+            vals = [self.eval(a, ln) for a in args]
+            return fn(ln, *vals)
+        if name in self.prog.labels:
+            self.gosub(name, ln)
+            return ""
+        if name in AHK_IGNORED:
+            return ""
+        raise AhkError(ln, "{name}() is not supported", name=name)
+
+    def call_user(self, name, args, ln):
+        params, body, _fln = self.prog.funcs[name]
+        if len(self.frames) >= AHK_DEPTH_MAX:
+            raise AhkError(ln, "functions call each other too deep")
+        loc, refs = {}, {}
+        statics = self.host.globals.setdefault("\x00static:" + name, {})
+        for k, (pname, default, byref) in enumerate(params):
+            if k < len(args) and not (args[k][0] == "str"
+                                      and args[k][1] == "" and default):
+                a = args[k]
+                if byref and a[0] in ("var", "ref"):
+                    refs[pname] = a[1]
+                    loc[pname] = self.get_var(a[1])
+                else:
+                    loc[pname] = self.eval(a, ln)
+            elif default is not None:
+                loc[pname] = self.eval(default, ln)
+            else:
+                loc[pname] = ""
+        loc.update(statics)
+        self.frames.append((loc, set(), statics, False))
+        self.index.append(self.index[-1])
+        value = ""
+        try:
+            for n in body:
+                self.exec(n)
+        except _AhkReturn as r:
+            value = r.value
+        finally:
+            self.index.pop()
+            loc, _g, st, _a = self.frames.pop()
+            for sname in loc.get("\x00static", ()):
+                st[sname] = loc.get(sname, "")
+        for pname, target in refs.items():
+            self.set_var(target, loc.get(pname, ""))
+        return value
+
+    def gosub(self, name, ln):
+        body = self.prog.labels.get(name)
+        if body is None:
+            if name in self.prog.funcs:
+                return self.call_user(name, [], ln)
+            raise AhkError(ln, "{name} was not found", name=name)
+        saved = self.frames
+        self.frames = []                     # rótulo roda no escopo global
+        try:
+            self.run_body(body)
+        finally:
+            self.frames = saved
+        return ""
+
+    # --------------------------------------------------- comandos v1 --
+    def command(self, name, args, ln):
+        vals = []
+        for a in args:
+            vals.append(_Ref(self, a[1]) if a[0] == "out"
+                        else self.eval(a, ln))
+        if name in ("send", "sendinput", "sendevent", "sendplay"):
+            return self.f_send(ln, *vals[:1])
+        if name in ("sendraw", "sendtext"):
+            return self.f_sendtext(ln, *vals[:1])
+        if name == "controlsend":
+            return self.f_send(ln, vals[1] if len(vals) > 1 else "")
+        if name == "click":
+            return self.f_click(ln, *vals)
+        if name == "msgbox":
+            return self.f_msgbox(ln, *vals)
+        if name == "getkeystate":
+            out = vals[0] if vals else None
+            v = self.f_getkeystate(ln, *vals[1:3])
+            if isinstance(out, _Ref):
+                out.set("D" if v else "U")
+            return ""
+        if name == "keywait":
+            ok = self.f_keywait(ln, *vals)
+            self.set_var("errorlevel", 0 if ok else 1)
+            return ""
+        if name == "pixelgetcolor":
+            out = vals[0]
+            mode = str(vals[3]).lower().split() if len(vals) > 3 else []
+            c = self._pixel(ln, vals[1], vals[2])
+            if c is None:
+                self.set_var("errorlevel", 1)
+                return ""
+            r, g, b = c
+            v = (r << 16 | g << 8 | b) if "rgb" in mode else \
+                (b << 16 | g << 8 | r)
+            out.set("0x%06X" % v)
+            self.set_var("errorlevel", 0)
+            return ""
+        if name == "pixelsearch":
+            mode = str(vals[8]).lower().split() if len(vals) > 8 else []
+            found = self._psearch(ln, vals[0], vals[1], vals[2:6],
+                                  vals[6] if len(vals) > 6 else 0,
+                                  vals[7] if len(vals) > 7 else 0,
+                                  bgr="rgb" not in mode,
+                                  cols="fast" not in mode)
+            self.set_var("errorlevel", 0 if found else 1)
+            return ""
+        if name == "imagesearch":
+            found = self._isearch(ln, vals[0], vals[1], vals[2:6],
+                                  vals[6] if len(vals) > 6 else "")
+            self.set_var("errorlevel", 0 if found else 1)
+            return ""
+        if name == "random":
+            if vals and isinstance(vals[0], _Ref):
+                vals[0].set(self.f_random(ln, *vals[1:3]))
+            return ""
+        if name == "settimer":
+            return self._settimer(ln, vals[0] if vals else "",
+                                  vals[1] if len(vals) > 1 else "")
+        if name in ("gosub", "goto"):
+            self.gosub(str(vals[0]).strip().lower() if vals else "", ln)
+            if name == "goto":
+                raise _AhkExit()
+            return ""
+        if name in ("stringupper", "stringlower"):
+            text = _ahk_str(vals[1]) if len(vals) > 1 else ""
+            vals[0].set(text.upper() if name == "stringupper"
+                        else text.lower())
+            return ""
+        if name in ("envadd", "envsub", "envmult", "envdiv"):
+            op = {"envadd": "+", "envsub": "-", "envmult": "*",
+                  "envdiv": "/"}[name]
+            vals[0].set(self.binop(op, self.get_var(vals[0].name),
+                                   vals[1] if len(vals) > 1 else 0, ln))
+            return ""
+        if name in ("exitapp", "exit", "reload"):
+            raise _AhkExit(app=name == "exitapp")
+        fn = getattr(self, "f_" + name, None)
+        if fn is not None:
+            return fn(ln, *vals)
+        raise AhkError(ln, "{what} is not supported", what=name)
+
+    # --------------------------------------------- teclado e mouse --
+    def _importer(self):
+        if self._imp is None:
+            self._imp = AhkImport("", folder=self.host.folder)
+            self._imp.screen_coords = True
+        return self._imp
+
+    def _steps(self, steps):
+        for st in steps:
+            self._alive()
+            st = normalize_step(st)
+            if st is not None:
+                self.r._step(st)
+        self._alive()
+
+    def f_send(self, ln, text=""):
+        # o texto já veio sem os escapes (`n): o _send não os lê de novo
+        self._steps(self._importer()._send(_ahk_str(text).replace("`", "``"),
+                                           False, ln))
+        return ""
+
+    f_sendinput = f_sendevent = f_sendplay = f_send
+
+    def f_sendtext(self, ln, text=""):
+        self._steps(self._importer()._send(_ahk_str(text).replace("`", "``"),
+                                           True, ln))
+        return ""
+
+    f_sendraw = f_sendtext
+
+    def f_controlsend(self, ln, keys="", *_rest):
+        return self.f_send(ln, keys)
+
+    def f_click(self, ln, *args):
+        text = " ".join(_ahk_str(a) for a in args if _ahk_str(a) != "")
+        self._steps(self._importer()._click([text], ln))
+        return ""
+
+    def f_mouseclick(self, ln, button="left", x="", y="", count="",
+                     _speed="", state="", rel=""):
+        parts = [_ahk_str(v) for v in (button, x, y, count, state, rel)]
+        self._steps(self._importer()._click(parts, ln, mouseclick=True))
+        return ""
+
+    def f_mousemove(self, ln, x=0, y=0, _speed="", rel=""):
+        nx, ny = _ahk_num(x), _ahk_num(y)
+        if nx is None or ny is None:
+            raise AhkError(ln, "MouseMove without a position")
+        if str(rel).strip().lower() in ("r", "rel", "relative"):
+            self._steps([{"op": "move", "dx": int(nx), "dy": int(ny)}])
+        else:
+            self._steps([{"op": "point", "x": int(nx), "y": int(ny)}])
+        return ""
+
+    def f_sleep(self, ln, ms=0):
+        n = _ahk_num(ms)
+        if n is None:
+            raise AhkError(ln, "Sleep {a} is not a number", a=ms)
+        if n > 0:
+            self.r._rest(max(n, AHK_TICK_MS) / 1000.0)
+        else:
+            self.r._sleep(0.0005)
+        self.spin = 0
+        self._alive()
+        return ""
+
+    def f_setkeydelay(self, ln, delay="", press=""):
+        p = _ahk_num(press)
+        if p is not None and p >= 0:
+            self.r.press_override = max(0.001, p / 1000.0)
+        return ""
+
+    def _code(self, ln, key):
+        code = ahk_key(_ahk_str(key))
+        if code is None:
+            raise AhkError(ln, "key {name} is unknown", name=key)
+        return code
+
+    def f_getkeystate(self, ln, key="", mode=""):
+        code = self._code(ln, key)
+        if str(mode).upper().startswith("T"):
+            leds = getattr(self.r.env, "key_toggled", None)
+            return 1 if leds and leds(code) else 0
+        down = getattr(self.r.env, "key_down", None)
+        if down is not None and str(mode).upper().startswith("P"):
+            return 1 if down(code) else 0
+        if code in self.r.held:
+            return 1
+        return 1 if down and down(code) else 0
+
+    def f_keywait(self, ln, key="", opts=""):
+        code = self._code(ln, key)
+        o = str(opts).upper()
+        want = "D" in o.replace("T", " ")
+        m = re.search(r"T\s*(\d+(?:\.\d+)?)", o)
+        end = time.perf_counter() + float(m.group(1)) if m else None
+        down = getattr(self.r.env, "key_down", None)
+        if down is None:
+            return 1
+        while bool(down(code)) != want:
+            self._alive()
+            if end is not None and time.perf_counter() >= end:
+                return 0
+            self.r._rest(0.01)
+        return 1
+
+    # ------------------------------------------------------- tela --
+    def _frames(self, ln):
+        cap = self.r._screen()
+        frames = cap.frames() if cap is not None else []
+        if not frames:
+            raise AhkError(ln, "the screen is not available")
+        return frames
+
+    def _pixel(self, ln, x, y):
+        nx, ny = _ahk_num(x), _ahk_num(y)
+        if nx is None or ny is None:
+            raise AhkError(ln, "{what}: the position is not a number",
+                           what="PixelGetColor")
+        return pixel_at(self._frames(ln), int(nx), int(ny))
+
+    def _rect(self, ln, coords):
+        nums = [_ahk_num(c) for c in coords]
+        if len(nums) < 4 or None in nums:
+            raise AhkError(ln, "the search area is not made of numbers")
+        x1, y1, x2, y2 = (int(v) for v in nums[:4])
+        return x1, y1, x2, y2, [min(x1, x2), min(y1, y2),
+                                min(COORD, abs(x2 - x1) + 1),
+                                min(COORD, abs(y2 - y1) + 1)]
+
+    def _psearch(self, ln, ox, oy, coords, color, var, bgr, cols):
+        x1, y1, x2, y2, region = self._rect(ln, coords)
+        c = _ahk_num(color)
+        if c is None or not 0 <= int(c) <= 0xFFFFFF:
+            raise AhkError(ln, "{what}: the color is not a number",
+                           what="PixelSearch")
+        c = int(c)
+        rgb = (c & 255, (c >> 8) & 255, c >> 16) if bgr else \
+            (c >> 16, (c >> 8) & 255, c & 255)
+        tol = max(0, min(255, int(_ahk_num(var) or 0)))
+        hit = pixel_search(self._frames(ln), region, rgb, tol, cols,
+                           x1 > x2, y1 > y2)
+        if hit is None:
+            return False
+        for ref, v in ((ox, hit[0]), (oy, hit[1])):
+            if isinstance(ref, _Ref):
+                ref.set(int(math.floor(v)))
+        return True
+
+    def _isearch(self, ln, ox, oy, coords, spec):
+        _x1, _y1, _x2, _y2, region = self._rect(ln, coords)
+        path, var = self._importer()._image_path(_ahk_str(spec), ln)
+        if path is None or not os.path.isfile(path):
+            raise AhkError(ln, "image {file} was not found",
+                           file=os.path.basename(_ahk_str(spec)))
+        tpl = load_image(path)
+        if tpl is None:
+            raise AhkError(ln, "image {file} was not found",
+                           file=os.path.basename(path))
+        conf = round(max(0.6, 0.95 - var / 255.0 * 0.5), 2)
+        whole = _whole_screen(region) or (region[0] <= 0 and region[1] <= 0
+                                          and region[2] >= COORD)
+        hit = locate(self._frames(ln), tpl, conf, None if whole else region)
+        if not hit:
+            return False
+        th, tw = tpl.shape[:2]
+        # o AutoHotkey dá o canto de cima à esquerda da imagem
+        for ref, v in ((ox, hit[0] - tw / 2.0), (oy, hit[1] - th / 2.0)):
+            if isinstance(ref, _Ref):
+                ref.set(int(math.floor(v + 0.5)))
+        return True
+
+    def f_pixelgetcolor(self, ln, x=0, y=0, _mode=""):
+        c = self._pixel(ln, x, y)
+        if c is None:
+            raise AhkError(ln, "the position is off the screen")
+        r, g, b = c
+        if not self.prog.v2 and "rgb" not in str(_mode).lower():
+            return "0x%06X" % (b << 16 | g << 8 | r)
+        return "0x%06X" % (r << 16 | g << 8 | b)
+
+    def f_pixelsearch(self, ln, ox=None, oy=None, x1=0, y1=0, x2=0, y2=0,
+                      color=0, var=0, mode=""):
+        v2 = self.prog.v2
+        return 1 if self._psearch(ln, ox, oy, (x1, y1, x2, y2), color, var,
+                                  bgr=not v2 and "rgb" not in str(mode)
+                                  .lower(), cols=not v2 and "fast" not in
+                                  str(mode).lower()) else 0
+
+    def f_imagesearch(self, ln, ox=None, oy=None, x1=0, y1=0, x2=0, y2=0,
+                      spec=""):
+        return 1 if self._isearch(ln, ox, oy, (x1, y1, x2, y2), spec) else 0
+
+    # --------------------------------------------------- janelas --
+    def _win(self, title):
+        return ahk_win_match(_ahk_str(title))
+
+    def f_winactive(self, ln, title="", *_rest):
+        want = self._win(title)
+        info = getattr(self.r.env, "active_window", lambda: None)()
+        if not want:
+            return 1 if info else 0
+        if not info:
+            return 0
+        return 1 if window_matches(info, want) else 0
+
+    def f_winexist(self, ln, title="", *_rest):
+        want = self._win(title)
+        kw = getattr(self.r.env, "windows", None)
+        if not want or kw is None:
+            return 0
+        info = kw.find(want["match"])
+        return 1 if info and info.get("found") else 0
+
+    def f_winactivate(self, ln, title="", *_rest):
+        want = self._win(title)
+        kw = getattr(self.r.env, "windows", None)
+        if want and kw is not None:
+            kw.find(want["match"], True)
+        return ""
+
+    def f_winwaitactive(self, ln, title="", _text="", timeout=""):
+        t = _ahk_num(timeout)
+        end = time.perf_counter() + t if t else None
+        while not self.f_winactive(ln, title):
+            self._alive()
+            if end is not None and time.perf_counter() >= end:
+                self.set_var("errorlevel", 1)
+                return 0
+            self.r._rest(0.1)
+        self.set_var("errorlevel", 0)
+        return 1
+
+    # ---------------------------------------------------- avisos --
+    def f_msgbox(self, ln, *args):
+        text = _ahk_str(args[0]) if args else ""
+        if len(args) >= 3 and not self.prog.v2 and _ahk_num(args[0]) \
+                is not None:
+            text = _ahk_str(args[2])            # MsgBox, opções, título, texto
+        say = getattr(self.r.env, "say", None)
+        if say:
+            say(self.r.m.name, text)
+        return "OK"
+
+    def f_traytip(self, ln, title="", text="", *_rest):
+        say = getattr(self.r.env, "say", None)
+        if say:
+            say(_ahk_str(title) or self.r.m.name, _ahk_str(text))
+        return ""
+
+    def f_tooltip(self, ln, *_args):
+        return ""
+
+    def f_soundbeep(self, ln, *_args):
+        beep = getattr(self.r.env, "beep_now", None)
+        if beep:
+            beep("on")
+        return ""
+
+    def f_suspend(self, ln, mode=""):
+        sw = getattr(self.r.env, "suspend", None)
+        if sw:
+            sw(_ahk_str(mode).strip().lower())
+        return ""
+
+    def f_pause(self, ln, *_args):
+        raise AhkError(ln, "{what} is not supported", what="Pause")
+
+    def f_exitapp(self, ln, *_args):
+        raise _AhkExit(app=True)
+
+    def f_reload(self, ln, *_args):
+        raise _AhkExit()
+
+    # -------------------------------------------------- SetTimer --
+    def f_settimer(self, args, ln):
+        if not args:
+            raise AhkError(ln, "SetTimer without a label")
+        first = args[0]
+        name = first[1] if first[0] in ("var", "str") else None
+        if name is None:
+            raise AhkError(ln, "SetTimer needs the name of a label or "
+                               "function")
+        period = self.eval(args[1], ln) if len(args) > 1 else ""
+        return self._settimer(ln, name, period)
+
+    def _settimer(self, ln, name, period):
+        name = _ahk_str(name).strip().lower()
+        if name not in self.prog.labels and name not in self.prog.funcs:
+            raise AhkError(ln, "SetTimer: {name} was not found", name=name)
+        p = _ahk_str(period).strip().lower()
+        host = self.host
+        with host.lock:
+            old = host.timers.pop(name, None)
+        if old is not None:
+            old.replaced = p not in ("off", "delete", "0")
+            old.stop()
+        if p in ("off", "delete", "0"):
+            return ""
+        n = _ahk_num(p) if p not in ("", "on") else 250
+        if n is None:
+            raise AhkError(ln, "SetTimer period {p} is not a number", p=p)
+        start = getattr(self.r.env, "start_timer", None)
+        if start is None:
+            raise AhkError(ln, "SetTimer is not available here")
+        r = start(self, name, float(n), quiet=old is not None
+                  and old.is_alive())
+        if r is not None:
+            with host.lock:
+                host.timers[name] = r
+        return ""
+
+    # --------------------------------------------------- funções --
+    def f_random(self, ln, lo=0, hi=None):
+        if hi is None or hi == "":
+            hi = 2147483647 if lo in (0, "") else lo
+            lo = 0 if hi == lo else lo
+        a, b = _ahk_num(lo) or 0, _ahk_num(hi) or 0
+        a, b = min(a, b), max(a, b)
+        if isinstance(a, float) or isinstance(b, float):
+            return random.uniform(a, b)
+        return random.randint(int(a), int(b))
+
+    def f_abs(self, ln, v=0):
+        return abs(_ahk_num(v) or 0)
+
+    def f_ceil(self, ln, v=0):
+        return int(math.ceil(_ahk_num(v) or 0))
+
+    def f_floor(self, ln, v=0):
+        return int(math.floor(_ahk_num(v) or 0))
+
+    def f_round(self, ln, v=0, n=0):
+        x, d = _ahk_num(v) or 0, int(_ahk_num(n) or 0)
+        q = math.floor(abs(x) * 10 ** d + 0.5) / 10 ** d
+        q = q if x >= 0 else -q
+        return int(q) if d <= 0 else q
+
+    def f_mod(self, ln, a=0, b=1):
+        x, y = _ahk_num(a) or 0, _ahk_num(b) or 0
+        if not y:
+            raise AhkError(ln, "division by zero")
+        return math.fmod(x, y) if isinstance(x, float) or \
+            isinstance(y, float) else int(math.fmod(x, y))
+
+    def f_max(self, ln, *v):
+        nums = [_ahk_num(x) for x in v]
+        return max(n for n in nums if n is not None) if any(
+            n is not None for n in nums) else ""
+
+    def f_min(self, ln, *v):
+        nums = [_ahk_num(x) for x in v]
+        return min(n for n in nums if n is not None) if any(
+            n is not None for n in nums) else ""
+
+    def f_sqrt(self, ln, v=0):
+        return math.sqrt(max(0, _ahk_num(v) or 0))
+
+    def f_exp(self, ln, v=0):
+        return math.exp(_ahk_num(v) or 0)
+
+    def f_ln(self, ln, v=1):
+        return math.log(_ahk_num(v) or 1)
+
+    def f_log(self, ln, v=1):
+        return math.log10(_ahk_num(v) or 1)
+
+    def f_sin(self, ln, v=0):
+        return math.sin(_ahk_num(v) or 0)
+
+    def f_cos(self, ln, v=0):
+        return math.cos(_ahk_num(v) or 0)
+
+    def f_tan(self, ln, v=0):
+        return math.tan(_ahk_num(v) or 0)
+
+    def f_integer(self, ln, v=0):
+        return int(_ahk_num(v) or 0)
+
+    def f_float(self, ln, v=0):
+        return float(_ahk_num(v) or 0)
+
+    def f_number(self, ln, v=0):
+        n = _ahk_num(v)
+        if n is None:
+            raise AhkError(ln, "{what} is not a number", what=v)
+        return n
+
+    def f_string(self, ln, v=""):
+        return _ahk_str(v)
+
+    def f_isnumber(self, ln, v=""):
+        return 1 if _ahk_num(v) is not None else 0
+
+    def f_isinteger(self, ln, v=""):
+        return 1 if isinstance(_ahk_num(v), int) else 0
+
+    def f_strlen(self, ln, s=""):
+        return len(_ahk_str(s))
+
+    def f_strupper(self, ln, s=""):
+        return _ahk_str(s).upper()
+
+    def f_strlower(self, ln, s=""):
+        return _ahk_str(s).lower()
+
+    def f_substr(self, ln, s="", start=1, length=None):
+        s = _ahk_str(s)
+        i = int(_ahk_num(start) or 1)
+        i = i - 1 if i > 0 else max(0, len(s) + i - (0 if self.prog.v2
+                                                     else 1))
+        if self.prog.v2 and _ahk_num(start) is not None and \
+                int(_ahk_num(start)) < 0:
+            i = max(0, len(s) + int(_ahk_num(start)))
+        out = s[i:]
+        n = _ahk_num(length) if length not in (None, "") else None
+        if n is not None:
+            out = out[:int(n)] if n >= 0 else out[:int(n)]
+        return out
+
+    def f_instr(self, ln, hay="", needle="", case=0, start=1, _occ=1):
+        h, n = _ahk_str(hay), _ahk_str(needle)
+        if not _ahk_true(case):
+            h, n = h.lower(), n.lower()
+        st = int(_ahk_num(start) or 1)
+        if st < 1:
+            return h.rfind(n) + 1
+        return h.find(n, st - 1) + 1
+
+    def f_strreplace(self, ln, s="", find="", repl="", *_rest):
+        if find == "":
+            return _ahk_str(s)
+        return re.sub(re.escape(_ahk_str(find)),
+                      _ahk_str(repl).replace("\\", "\\\\"), _ahk_str(s),
+                      flags=re.I)
+
+    def f_trim(self, ln, s="", chars=" \t"):
+        return _ahk_str(s).strip(_ahk_str(chars))
+
+    def f_ltrim(self, ln, s="", chars=" \t"):
+        return _ahk_str(s).lstrip(_ahk_str(chars))
+
+    def f_rtrim(self, ln, s="", chars=" \t"):
+        return _ahk_str(s).rstrip(_ahk_str(chars))
+
+    def f_chr(self, ln, n=0):
+        return chr(int(_ahk_num(n) or 0))
+
+    def f_ord(self, ln, s=""):
+        s = _ahk_str(s)
+        return ord(s[0]) if s else 0
+
+    def f_format(self, ln, fmt="", *vals):
+        k = [0]
+
+        def sub(m):
+            idx = m.group(1)
+            spec = m.group(2) or ""
+            if idx:
+                v = vals[int(idx) - 1] if 0 < int(idx) <= len(vals) else ""
+            else:
+                v = vals[k[0]] if k[0] < len(vals) else ""
+                k[0] += 1
+            if spec:
+                try:
+                    n = _ahk_num(v)
+                    sp = spec[1:]
+                    if sp and sp[-1] in "dixX" and n is not None:
+                        return ("%" + sp.replace("i", "d")) % int(n)
+                    if sp and sp[-1] in "feEgG" and n is not None:
+                        return ("%" + sp) % float(n)
+                    return ("%" + sp) % _ahk_str(v)
+                except (TypeError, ValueError):
+                    return _ahk_str(v)
+            return _ahk_str(v)
+        return re.sub(r"\{(\d*)(:[^}]*)?\}", sub, _ahk_str(fmt))
+
+    def f_regexmatch(self, ln, hay="", pat="", *_rest):
+        try:
+            m = re.search(_ahk_regex(_ahk_str(pat)), _ahk_str(hay))
+        except re.error:
+            raise AhkError(ln, "the regular expression is not valid") \
+                from None
+        return m.start() + 1 if m else 0
+
+    def f_regexreplace(self, ln, hay="", pat="", repl="", *_rest):
+        try:
+            return re.sub(_ahk_regex(_ahk_str(pat)),
+                          re.sub(r"\$(\d)", r"\\\1", _ahk_str(repl)),
+                          _ahk_str(hay))
+        except re.error:
+            raise AhkError(ln, "the regular expression is not valid") \
+                from None
+
+
+def _ahk_regex(pat):
+    """Opções do PCRE do AutoHotkey ("i)texto") para o re do Python."""
+    m = re.match(r"^([imsx]+)\)", pat)
+    if m:
+        return "(?" + m.group(1) + ")" + pat[m.end():]
+    return pat
+
+
+def ahk_run_step(runner, st):
+    """O passo "script": roda o atalho (pela linha), o rótulo, ou o código
+    inteiro. Problemas viram aviso e param o macro."""
+    try:
+        host = ahk_host(st["src"], st.get("v2"), st.get("dir"))
+    except AhkError as e:
+        runner._report(e.message())
+        return runner.STOP
+    run = AhkRun(host, runner, hotkey=st.get("hotkey", ""), st=st)
+    try:
+        if st.get("label"):
+            host.start(run)
+            run.gosub(st["label"].lower(), 0)
+        elif st.get("line"):
+            host.start(run)
+            hk = host.prog.hotkeys.get(st["line"])
+            if hk is None or hk[1] is None:
+                raise AhkError(st["line"], "this hotkey is not in the script")
+            run.hotkey = hk[0]
+            run.run_body(hk[1])
+        else:
+            run.run_body(host.prog.auto)
+    except _AhkExit as e:
+        if e.app:
+            host.stop_timers()
+            return runner.STOP
+    except AhkError as e:
+        runner._report(e.message())
+        return runner.STOP
+    except RecursionError:
+        runner._report(_("the script is nested too deeply"))
+        return runner.STOP
+    except OSError:
+        raise
+    except Exception as e:                         # noqa: BLE001
+        runner._report(_("the script stopped: {err}", err=repr(e)[:120]))
+        return runner.STOP
+    return None
+
+
+# o mesmo texto de janela do AutoHotkey, para #IfWinActive, WinActive e
+# afins: ahk_exe vira o nome do programa, ahk_class a classe, o resto é o
+# título. Programas do Windows que no Linux têm outro nome, pelo nome daqui.
+AHK_EXE_NAMES = {"robloxplayerbeta": "Sober", "robloxplayer": "Sober",
+                 "windows10universal": "Sober", "roblox": "Sober",
+                 "javaw": "java", "minecraft": "Minecraft"}
+
+
+def ahk_win_match(text):
+    """WinTitle do AutoHotkey -> {"match": texto, "how": "exe"|"class"|
+    "title"} ou None (vazio)."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = re.search(r"(?i)ahk_exe\s+(\S+)", t)
+    if m:
+        exe = os.path.basename(m.group(1).replace("\\", "/"))
+        name = re.sub(r"(?i)\.exe$", "", exe)
+        return {"match": AHK_EXE_NAMES.get(name.lower(), name),
+                "how": "exe", "src": exe}
+    m = re.search(r"(?i)ahk_class\s+(\S+)", t)
+    if m:
+        return {"match": m.group(1), "how": "class", "src": m.group(1)}
+    if re.search(r"(?i)ahk_(id|pid|group)\b", t):
+        return None
+    return {"match": t, "how": "title", "src": t}
+
+
+def window_matches(info, want):
+    """A janela ativa (cls, name, title) bate com o texto? Nome do app
+    contém, ou o título contém (como o SetTitleMatchMode 2)."""
+    w = " ".join(str(want.get("match", "")).lower().split())
+    if not w:
+        return True
+    cls = str(info.get("cls", "")).lower()
+    nm = str(info.get("name", "")).lower()
+    title = " ".join(str(info.get("title", "")).lower().split())
+    return w in cls or w in nm or w in title
+
+
 def import_ahk_file(path):
     folder = os.path.dirname(os.path.abspath(path))
     with open(path, "rb") as fh:
@@ -5746,10 +8272,14 @@ class Beeper:
                          or tempfile.gettempdir(), f"wayclick-{os.getuid()}")
         try:
             os.makedirs(d, exist_ok=True)
-            for name, freq in (("on", 1046.5), ("off", 622.25)):
+            # on/off: armar o clique. mon/moff: um macro ligou ou desligou,
+            # duas notas subindo ou descendo, para não confundir com o outro
+            for name, freqs in (("on", (1046.5,)), ("off", (622.25,)),
+                                ("mon", (783.99, 1174.66)),
+                                ("moff", (1174.66, 783.99))):
                 path = os.path.join(d, f"{name}.wav")
                 if not os.path.exists(path):
-                    self._write_wav(path, freq)
+                    self._write_wav(path, freqs)
                 self.paths[name] = path
         except OSError:
             return
@@ -5767,14 +8297,20 @@ class Beeper:
             self.effects[name] = eff
 
     @classmethod
-    def _write_wav(cls, path, freq, ms=70):
+    def _write_wav(cls, path, freqs, ms=70):
+        if isinstance(freqs, (int, float)):
+            freqs = (freqs,)
+        if len(freqs) > 1:
+            ms = 55
         n = int(cls.RATE * ms / 1000)
         fade = int(cls.RATE * 0.006)      # rampa: sem ela o blip estala
         frames = bytearray()
-        for i in range(n):
-            amp = min(1.0, i / fade, (n - i) / fade)
-            v = int(20000 * amp * math.sin(2 * math.pi * freq * i / cls.RATE))
-            frames += struct.pack("<h", v)
+        for freq in freqs:
+            for i in range(n):
+                amp = min(1.0, i / fade, (n - i) / fade)
+                v = int(20000 * amp * math.sin(2 * math.pi * freq * i
+                                               / cls.RATE))
+                frames += struct.pack("<h", v)
         with wave.open(path, "wb") as w:
             w.setnchannels(1); w.setsampwidth(2); w.setframerate(cls.RATE)
             w.writeframes(bytes(frames))
@@ -5879,6 +8415,43 @@ if (best) {
 }
 callDBus("%(svc)s", "%(path)s", "%(iface)s", "answer",
          "%(token)s " + JSON.stringify(out));
+"""
+
+# A janela ativa, de uma vez (WinActive de um script, sem o vigia abaixo).
+KWIN_ACTIVE_JS = """
+var w = workspace.activeWindow || workspace.activeClient;
+var o = w ? {cls: String(w.resourceClass), name: String(w.resourceName),
+             title: String(w.caption)} : {};
+callDBus("%(svc)s", "%(path)s", "%(iface)s", "answer",
+         "%(token)s " + JSON.stringify(o));
+"""
+
+# #IfWinActive: um script que fica carregado e conta cada troca de janela
+# ativa (e de título dela), para o atalho decidir na hora, sem perguntar.
+KWIN_TRACK_JS = """
+var wcSeen = {};
+function wcTell(w) {
+  var o = w ? {cls: String(w.resourceClass), name: String(w.resourceName),
+               title: String(w.caption)} : {};
+  callDBus("%(svc)s", "%(path)s", "%(iface)s", "active", JSON.stringify(o));
+}
+function wcActive(w) {
+  if (w) {
+    var id = String(w.internalId);
+    if (!wcSeen[id] && w.captionChanged) {
+      wcSeen[id] = true;
+      w.captionChanged.connect(function () { if (w.active) wcTell(w); });
+    }
+  }
+  wcTell(w);
+}
+if (workspace.windowRemoved)
+  workspace.windowRemoved.connect(function (w) {
+    delete wcSeen[String(w.internalId)];
+  });
+if (workspace.windowActivated) workspace.windowActivated.connect(wcActive);
+else workspace.clientActivated.connect(wcActive);
+wcActive(workspace.activeWindow || workspace.activeClient);
 """
 
 # Onde está o cursor: o gravador pergunta a cada clique.
@@ -6293,6 +8866,9 @@ class KWinBridge(QObject):
         self.address = address
         self._bus_args = ("--address", address) if address else ("--session",)
         self._conn_name = None
+        self.active_info = None         # a janela ativa, contada pelo vigia
+        self._track = None              # (nome, arquivo) do vigia carregado
+        self._track_failed = False
         try:
             from PySide6.QtDBus import QDBusConnection
         except ImportError:
@@ -6344,6 +8920,80 @@ class KWinBridge(QObject):
     @Slot(str)
     def reply(self, payload):
         self._reply = payload
+
+    @Slot(str)
+    def active(self, payload):
+        """O vigia de janela ativa contou uma troca."""
+        try:
+            info = json.loads(payload)
+        except ValueError:
+            return
+        self.active_info = info if isinstance(info, dict) else {}
+
+    def _gdbus(self, *args):
+        try:
+            return subprocess.run(
+                ("gdbus", "call") + self._bus_args
+                + ("-d", "org.kde.KWin") + args,
+                capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def track(self):
+        """Carrega o vigia de janela ativa (fica até untrack). True se o
+        KWin aceitou."""
+        if not self.ok or self._track_failed:
+            return False
+        if self._track:
+            return True
+        name = f"wayclick-track-{os.getpid()}"
+        path = f"{self.script[:-3]}-track.js"
+        try:
+            with open(path, "w") as fh:
+                fh.write(KWIN_TRACK_JS % {"svc": self.service,
+                                          "path": self.path,
+                                          "iface": self.IFACE})
+        except OSError:
+            return False
+        self._gdbus("-o", "/Scripting", "-m",
+                    "org.kde.kwin.Scripting.unloadScript", name)
+        r = self._gdbus("-o", "/Scripting", "-m",
+                        "org.kde.kwin.Scripting.loadScript", path, name)
+        m = re.search(r"-?\d+", r.stdout) if r is not None else None
+        sid = int(m.group()) if m else -1
+        if sid < 0:
+            self._track_failed = True      # sem KWin: não tenta a cada mudança
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return False
+        self._track = (name, path)
+        self._gdbus("-o", f"/Scripting/Script{sid}", "-m",
+                    "org.kde.kwin.Script.run")
+        return True
+
+    def untrack(self):
+        if not self._track:
+            return
+        name, path = self._track
+        self._track = None
+        self.active_info = None
+        self._gdbus("-o", "/Scripting", "-m",
+                    "org.kde.kwin.Scripting.unloadScript", name)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def active_now(self):
+        """A janela ativa agora, perguntando ao KWin (uns 30 ms)."""
+        raw = self.call(KWIN_ACTIVE_JS)
+        try:
+            info = json.loads(raw) if raw else None
+        except ValueError:
+            return None
+        return info if isinstance(info, dict) else None
 
     @Slot(str)
     def answer(self, payload):
@@ -6486,6 +9136,10 @@ class KWinBridge(QObject):
         return self._run(KWIN_ACTIVATE_JS)
 
     def cleanup(self):
+        try:
+            self.untrack()
+        except Exception:                          # noqa: BLE001
+            pass
         try:
             os.remove(self.script)
         except (OSError, AttributeError):
@@ -9384,6 +12038,159 @@ TRANSLATIONS = {
         "No trigger (hotkey toggles)": "Sem gatilho (o atalho liga/desliga)",
         "never": "nunca", "Rescan mice": "Reprocurar mouses",
         "Sound feedback on hotkey": "Som ao acionar o atalho",
+        # 1.13.0: interpretador de AutoHotkey, hotstrings, #IfWinActive e o som dos macros
+        '#Hotstring {what}: the usual end characters are used':
+            '#Hotstring {what}: valem os caracteres de fim de sempre',
+        '#{what} {expr}: only WinActive is understood, the hotkeys below work in every window':
+            '#{what} {expr}: só WinActive é entendido, os atalhos abaixo valem em qualquer janela',
+        '#{what}: the hotkeys below work in every window here':
+            '#{what}: aqui os atalhos abaixo valem em qualquer janela',
+        'AutoHotkey code: {what}':
+            'Código AutoHotkey: {what}',
+        'AutoHotkey v2 syntax':
+            'Sintaxe do AutoHotkey v2',
+        'Hotkey':
+            'Atalho',
+        'Like #IfWinActive: the hotkey works only while this window is active, and elsewhere the key does its normal job. The app name (like Sober) or part of the title. Needs KDE Plasma.':
+            'Como o #IfWinActive: o atalho só vale com esta janela ativa, e nas outras a tecla faz o trabalho normal dela. O nome do app (como Sober) ou parte do título. Precisa do KDE Plasma.',
+        'MouseMove without a position':
+            'MouseMove sem posição',
+        'Only in window:':
+            'Só na janela:',
+        'Runs once each time the text is typed. The typed text is erased first, unless Keep what was typed is on.':
+            'Roda uma vez a cada vez que o texto é digitado. O texto digitado é apagado antes, a não ser com Manter o que foi digitado.',
+        'SetTimer is not available here':
+            'SetTimer não está disponível aqui',
+        'SetTimer needs the name of a label or function':
+            'SetTimer precisa do nome de um rótulo ou função',
+        'SetTimer period {p} is not a number':
+            'o período {p} do SetTimer não é um número',
+        'SetTimer without a label':
+            'SetTimer sem rótulo',
+        'Sleep {a} is not a number':
+            'Sleep {a} não é um número',
+        'Sound when a macro turns on or off':
+            'Som quando um macro liga ou desliga',
+        'Sound when it turns on or off':
+            'Som quando ligar ou desligar',
+        'Two notes going up when the macro starts and down when it stops. Settings > Sound when a macro turns on or off silences every macro.':
+            'Duas notas subindo quando o macro começa e descendo quando para. Configurações > Som quando um macro liga ou desliga cala todos os macros.',
+        'Type the text that runs the macro.':
+            'Digite o texto que roda o macro.',
+        'Typed text (hotstring)':
+            'Texto digitado (hotstring)',
+        'Typed text:':
+            'Texto digitado:',
+        'Typing this, then a space, Enter or punctuation, erases it and runs the steps, like ::btw:: in AutoHotkey. A Type text step makes it a text replacement.':
+            'Digitar isto e depois espaço, Enter ou pontuação apaga o texto e roda os passos, como o ::btw:: do AutoHotkey. Com um passo Digitar texto, vira uma troca de texto.',
+        'Works in every window except this one (#IfWinNotActive)':
+            'Vale em todas as janelas menos nesta (#IfWinNotActive)',
+        'a block is not closed':
+            'um bloco não foi fechado',
+        'a } without its {':
+            'um } sem o { dele',
+        'ahk_class {cls}: here the hotkeys below need a window whose app name or title contains {cls}':
+            'ahk_class {cls}: aqui os atalhos abaixo precisam de uma janela cujo nome do app ou título contenha {cls}',
+        'ahk_exe {exe} is a Windows program; here the hotkeys below need the {name} window':
+            'ahk_exe {exe} é um programa do Windows; aqui os atalhos abaixo precisam da janela do {name}',
+        'any window':
+            'qualquer janela',
+        'arrays and objects are not supported':
+            'arrays e objetos não são suportados',
+        'arrays are not supported':
+            'arrays não são suportados',
+        'cannot read {what}':
+            'não deu para ler {what}',
+        'division by zero':
+            'divisão por zero',
+        'dynamic variables (%name%) inside an expression are not supported':
+            'variáveis dinâmicas (%nome%) dentro de uma expressão não são suportadas',
+        'expected {what}':
+            'faltou {what}',
+        'functions call each other too deep':
+            'funções chamando funções fundo demais',
+        'image {file} was not found':
+            'a imagem {file} não foi encontrada',
+        'line {n}: {what}':
+            'linha {n}: {what}',
+        'not in it':
+            'fora dela',
+        'not in {win}':
+            'fora de {win}',
+        'objects are not supported':
+            'objetos não são suportados',
+        'only a variable can take {op}':
+            'só uma variável aceita {op}',
+        'only in {win}':
+            'só em {win}',
+        'the active window is not known (that needs KDE Plasma), so this hotkey works in every window.':
+            'a janela ativa não é conhecida (isso precisa do KDE Plasma), então este atalho vale em qualquer janela.',
+        'the expression ends too early':
+            'a expressão termina antes da hora',
+        'the number is too big':
+            'o número é grande demais',
+        'the position is off the screen':
+            'a posição está fora da tela',
+        'the regular expression is not valid':
+            'a expressão regular não é válida',
+        'the screen is not available':
+            'a tela não está disponível',
+        'the script ends too early':
+            'o script termina antes da hora',
+        'the script is nested too deeply':
+            'o script tem blocos dentro de blocos demais',
+        'the script stopped: {err}':
+            'o script parou: {err}',
+        'the search area is not made of numbers':
+            'a área da busca não é feita de números',
+        'this hotkey is not in the script':
+            'este atalho não está no script',
+        'when typed':
+            'ao digitar',
+        '{hk}: uses variables, and the script is too big for the interpreter, skipped':
+            '{hk}: usa variáveis, e o script é grande demais para o interpretador, ignorado',
+        '{hk}: {why}, so it was skipped':
+            '{hk}: {why}, então ficou de fora',
+        '{hk}: runs as AutoHotkey code, on the interpreter inside WayClick':
+            '{hk}: roda como código AutoHotkey, no interpretador de dentro do WayClick',
+        '{hk}: the text is longer than {n} characters, skipped':
+            '{hk}: o texto passa de {n} caracteres, ficou de fora',
+        '{name}() is not supported':
+            '{name}() não é suportado',
+        '{what} is not a number':
+            '{what} não é um número',
+        '{what} is not supported':
+            '{what} não é suportado',
+        '{what} without a condition':
+            '{what} sem condição',
+        '{what} without its start':
+            '{what} sem o começo',
+        '{what}: the color is not a number':
+            '{what}: a cor não é um número',
+        '{what}: the position is not a number':
+            '{what}: a posição não é um número',
+        '{what}: windows by id, process or group are not supported, the hotkeys below work in every window':
+            '{what}: janelas por id, processo ou grupo não são suportadas, os atalhos abaixo valem em qualquer janela',
+        'Run AutoHotkey code':
+            'Rodar código AutoHotkey',
+        'Code:':
+            'Código:',
+        'Type the AutoHotkey code.':
+            'Digite o código AutoHotkey.',
+        'Without waiting for a space or Enter (*)':
+            'Sem esperar espaço ou Enter (*)',
+        'Also in the middle of a word (?)':
+            'Também no meio de uma palavra (?)',
+        'Match upper and lower case (C)':
+            'Diferenciar maiúsculas e minúsculas (C)',
+        'Do not copy the capitals typed (C1)':
+            'Não copiar as maiúsculas digitadas (C1)',
+        'Keep what was typed (B0)':
+            'Manter o que foi digitado (B0)',
+        'Leave out the space or Enter that ended it (O)':
+            'Sem o espaço ou Enter que terminou o texto (O)',
+        'Runs like a hotkey of an AutoHotkey script: variables, math, if, Loop, while, functions, Send, Sleep, Click, MouseMove, GetKeyState, KeyWait, PixelSearch, ImageSearch, SetTimer, WinActive. Variables keep their values from one press to the next. Objects, arrays and for are not supported.':
+            'Roda como um atalho de um script do AutoHotkey: variáveis, contas, if, Loop, while, funções, Send, Sleep, Click, MouseMove, GetKeyState, KeyWait, PixelSearch, ImageSearch, SetTimer, WinActive. As variáveis guardam o valor de um aperto para o outro. Objetos, arrays e for não são suportados.',
         "Start with system": "Iniciar com o sistema",
         "Anti-AFK: nudge the cursor every":
             "Anti-AFK: mexer o cursor a cada",
@@ -11072,7 +13879,8 @@ STEP_KINDS = (("tap", "Tap a key or click"), ("down", "Hold down"),
               ("window", "Check or focus a window"),
               ("count", "Count"),
               ("notify", "Send a notification"),
-              ("open", "Open a link or file"))
+              ("open", "Open a link or file"),
+              ("script", "Run AutoHotkey code"))
 POINT_CLICK_LABELS = (("none", "Only move"), ("left", "Left click"),
                       ("right", "Right click"), ("middle", "Middle click"),
                       ("double", "Double click"))
@@ -11457,6 +14265,22 @@ class StepDialog(QDialog):
             box.setValue(step.get(key, 0))
         self._screen_widgets(step)
         self._farm_widgets(step)
+        # código do AutoHotkey: o atalho importado leva o script inteiro e a
+        # linha dele; um passo novo roda o que estiver aqui de cima a baixo
+        self._script = {k: v for k, v in step.items()
+                        if k in ("line", "label", "hotkey", "dir", "threads")} \
+            if step["op"] == "script" else {}
+        self.code = QPlainTextEdit(step.get("src", "") if step["op"] ==
+                                   "script" else "")
+        self.code.setPlaceholderText(
+            "toggle := !toggle\nwhile (toggle) {\n    Send \"e\"\n"
+            "    Sleep 50\n}")
+        self.code.setMinimumSize(420, 220)
+        self.code.setLineWrapMode(QPlainTextEdit.NoWrap)
+        mono = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        self.code.setFont(mono)
+        self.code_v2 = QCheckBox(_("AutoHotkey v2 syntax"))
+        self.code_v2.setChecked(bool(step.get("v2")))
         form = QFormLayout()
         self.rows = _Rows(form)
         form.addRow(QLabel(_("Action:")), self.op)
@@ -11468,6 +14292,8 @@ class StepDialog(QDialog):
         self.rows.add("dir", "Direction:", self.wheel)
         self.rows.add("dx", "Right (px):", self.dx)
         self.rows.add("dy", "Down (px):", self.dy)
+        self.rows.add("code", "Code:", self.code)
+        self.rows.add("codev2", "", self.code_v2)
         for key, text, widget in self.farm_rows[:1] + self.screen_rows \
                 + self.farm_rows[1:]:
             self.rows.add(key, text, widget)
@@ -11779,8 +14605,16 @@ class StepDialog(QDialog):
             self.error.setText(_("{run} and {time} are already taken; pick "
                                  "another name."))
             return
+        if op == "script" and self.step() is not None:
+            st = self.step()
+            err = ahk_check(st["src"], st.get("v2") or None, st.get("line", 0),
+                            st.get("label", ""))
+            if err is not None:
+                self.error.setText(err.message())
+                return
         if self.step() is None:
             self.error.setText(_({
+                "script": "Type the AutoHotkey code.",
                 "image": "Pick an image first.",
                 "pixel": "The color must look like #ff8800.",
                 "window": "Type the name of the window, like Sober.",
@@ -11795,7 +14629,13 @@ class StepDialog(QDialog):
             return
         self.accept()
 
-    NOTES = {"text": "Typed with a US keyboard layout: letters, digits and "
+    NOTES = {"script": "Runs like a hotkey of an AutoHotkey script: "
+                       "variables, math, if, Loop, while, functions, Send, "
+                       "Sleep, Click, MouseMove, GetKeyState, KeyWait, "
+                       "PixelSearch, ImageSearch, SetTimer, WinActive. "
+                       "Variables keep their values from one press to the "
+                       "next. Objects, arrays and for are not supported.",
+             "text": "Typed with a US keyboard layout: letters, digits and "
                      "symbols land on the same physical keys.",
              "move": "Moves by an amount, from where the pointer is. To go to "
                      "an exact position, use Go to a screen position.",
@@ -11848,7 +14688,8 @@ class StepDialog(QDialog):
                        "human", "ok", "fail", "delay"),
              "window": ("match", "want", "wait", "winact", "ok", "fail"),
              "count": ("counter", "cevery", "cok"),
-             "notify": ("msg", "hook", "shot"), "open": ("link",)}
+             "notify": ("msg", "hook", "shot"), "open": ("link",),
+             "script": ("code", "codev2")}
     WATCH_SHOWN = {"image": ("wkind", "image", "conf", "region", "wwant",
                              "every", "act", "human", "wok", "delay"),
                    "pixel": ("wkind", "pos", "color", "tol", "region",
@@ -11933,6 +14774,9 @@ class StepDialog(QDialog):
                      shot=self.shot.isChecked() and self.shot.isEnabled())
         elif op == "open":
             s["url"] = self.link.text()
+        elif op == "script":
+            s.update(self._script, src=self.code.toPlainText(),
+                     v2=self.code_v2.isChecked())
         return normalize_step(s)
 
 
@@ -12008,16 +14852,78 @@ class MacroDialog(QDialog):
         self.dock_box = QCheckBox(_("Play in the Dock"))
         self.dock_box.setChecked(bool(m.get("dock")))
         self.dock_box.setToolTip(_(DOCK_BOX_TIP))
+        # gatilho: atalho, ou texto digitado (hotstring do AutoHotkey)
+        hs = m.get("hotstring") or {}
+        self.trigger = QComboBox()
+        self.trigger.addItem(_("Hotkey"), "hotkey")
+        self.trigger.addItem(_("Typed text (hotstring)"), "hotstring")
+        self.trigger.setCurrentIndex(1 if hs else 0)
+        self.abbr = QLineEdit(hs.get("abbr", ""))
+        self.abbr.setMaxLength(HS_MAX)
+        self.abbr.setPlaceholderText("btw")
+        self.abbr.setToolTip(_(
+            "Typing this, then a space, Enter or punctuation, erases it and "
+            "runs the steps, like ::btw:: in AutoHotkey. A Type text step "
+            "makes it a text replacement."))
+        self.hs_opts = {}
+        hs_w = QWidget()
+        hs_col = QVBoxLayout(hs_w)
+        hs_col.setContentsMargins(0, 0, 0, 0)
+        for key, label in HS_OPT_LABELS:
+            box = QCheckBox(_(label))
+            box.setChecked(key in hs.get("opts", []))
+            self.hs_opts[key] = box
+            hs_col.addWidget(box)
+        self.hs_w = hs_w
+        # #IfWinActive: só com esta janela ativa (ou fora dela)
+        win = m.get("window") or {}
+        self.win_match = QComboBox()
+        self.win_match.setEditable(True)
+        self.win_match.setInsertPolicy(QComboBox.NoInsert)
+        self.win_match.setMinimumContentsLength(14)
+        self.win_match.lineEdit().setMaxLength(200)
+        self.win_match.lineEdit().setPlaceholderText(_("any window"))
+        self.win_match.setEditText(win.get("match", ""))
+        self.win_match.setToolTip(_(
+            "Like #IfWinActive: the hotkey works only while this window is "
+            "active, and elsewhere the key does its normal job. The app name "
+            "(like Sober) or part of the title. Needs KDE Plasma."))
+        b_wins = QPushButton(_("Open windows…"))
+        b_wins.setToolTip(_("List the windows that are open now"))
+        b_wins.clicked.connect(lambda: window_names(
+            self.win_match, self.error, self.target_dock()))
+        self.win_not = QCheckBox(_("not in it"))
+        self.win_not.setChecked(bool(win.get("not")))
+        self.win_not.setToolTip(_("Works in every window except this one "
+                                  "(#IfWinNotActive)"))
+        self.beep = QCheckBox(_("Sound when it turns on or off"))
+        self.beep.setChecked(bool(m.get("beep", m["mode"] == "toggle")))
+        self.beep.setToolTip(_(
+            "Two notes going up when the macro starts and down when it "
+            "stops. Settings > Sound when a macro turns on or off silences "
+            "every macro."))
+        self._beep_auto = "beep" not in m      # segue o modo até mexerem
+        self.beep.clicked.connect(self._beep_clicked)
 
         form = QFormLayout()
         form.addRow(QLabel(_("Name:")), self.name)
+        form.addRow(QLabel(_("Trigger:")), self.trigger)
+        self.abbr_lbl = QLabel(_("Typed text:"))
+        form.addRow(self.abbr_lbl, self.abbr)
+        self.hs_lbl = QLabel("")
+        form.addRow(self.hs_lbl, hs_w)
         self.hk_lbl = QLabel(_("Hotkey:"))
         form.addRow(self.hk_lbl, self.hotkey)
         self.mods_lbl = QLabel(_("With:"))
         form.addRow(self.mods_lbl, mod_w)
         self.mod_w = mod_w
         form.addRow("", self.block)
-        form.addRow(QLabel(_("Mode:")), self.mode)
+        self.win_lbl = QLabel(_("Only in window:"))
+        self.win_w = _hrow(self.win_match, b_wins, self.win_not,
+                           stretch=False)
+        form.addRow(self.win_lbl, self.win_w)
+        self.mode_lbl = QLabel(_("Mode:"))
+        form.addRow(self.mode_lbl, self.mode)
         rep_row = QHBoxLayout()
         rep_row.setContentsMargins(0, 0, 0, 0)
         rep_row.addWidget(self.repeat)
@@ -12032,6 +14938,7 @@ class MacroDialog(QDialog):
         self.limit_lbl = QLabel(_("Stop after:"))
         form.addRow(self.limit_lbl, self.limit)
         form.addRow(QLabel(_("Key press time:")), self.press)
+        form.addRow("", self.beep)
         form.addRow("", self.dock_box)
 
         self.steps = list(m["steps"])
@@ -12086,6 +14993,7 @@ class MacroDialog(QDialog):
         col.addWidget(buttons)
         self.mode.currentIndexChanged.connect(self._sync)
         self.repeat.toggled.connect(self._sync)
+        self.trigger.currentIndexChanged.connect(self._trigger_changed)
         self._fill_steps()
         self._sync()
 
@@ -12193,11 +15101,36 @@ class MacroDialog(QDialog):
                        "no hotkey needed. Use a long repeat time, like an "
                        "anti idle key."}
 
+    def _beep_clicked(self, _on=False):
+        self._beep_auto = False
+
+    def _trigger_changed(self, _i=0):
+        if self.trigger.currentData() == "hotstring":
+            if self.press.value() == 0:
+                self.press.setValue(HS_PRESS_MS)
+            if self._beep_auto:
+                self.beep.setChecked(False)
+        self._sync()
+
     def _sync(self, _x=None):
+        typed = self.trigger.currentData() == "hotstring"
+        for w in (self.abbr_lbl, self.abbr, self.hs_lbl, self.hs_w):
+            w.setVisible(typed)
+        for w in (self.hk_lbl, self.hotkey, self.mods_lbl, self.mod_w,
+                  self.block, self.mode_lbl, self.mode, self.rep_lbl,
+                  self.rep_w, self.limit_lbl, self.limit):
+            w.setVisible(not typed)
+        if typed:
+            self.hint.setText(_(
+                "Runs once each time the text is typed. The typed text is "
+                "erased first, unless Keep what was typed is on."))
+            return
         mode = self.mode.currentData()
+        if self._beep_auto:
+            self.beep.setChecked(mode == "toggle")
         keyed = mode != "always"
         for w in (self.hk_lbl, self.hotkey, self.mods_lbl, self.mod_w,
-                  self.block):
+                  self.block, self.win_lbl, self.win_w):
             w.setEnabled(keyed)
         looping = mode != "once"
         self.rep_lbl.setEnabled(looping)
@@ -12210,6 +15143,10 @@ class MacroDialog(QDialog):
 
     def _ok(self):
         m = self.macro()
+        if self.trigger.currentData() == "hotstring" and \
+                not m.get("hotstring"):
+            self.error.setText(_("Type the text that runs the macro."))
+            return
         if not m["steps"]:
             self.error.setText(_("Add at least one step."))
             return
@@ -12234,7 +15171,15 @@ class MacroDialog(QDialog):
             "press_ms": self.press.value(),
             "limit": self.limit.value() if self.limit.isEnabled() else 0,
             "block": self.block.isChecked(), "steps": self.steps,
-            "dock": self.dock_box.isChecked()})
+            "dock": self.dock_box.isChecked(),
+            "beep": self.beep.isChecked(),
+            "window": {"match": self.win_match.currentText(),
+                       "not": self.win_not.isChecked()}
+            if keyed or self.trigger.currentData() == "hotstring" else None,
+            "hotstring": {"abbr": self.abbr.text(),
+                          "opts": [k for k, b in self.hs_opts.items()
+                                   if b.isChecked()]}
+            if self.trigger.currentData() == "hotstring" else None})
 
 
 def arm_clash_text(macros, code, name):
@@ -15659,6 +18604,7 @@ class App(QWidget):
         self.mode.currentIndexChanged.connect(self._mode_changed)
         self.sound = QCheckBox(_("Sound feedback on hotkey"))
         self.sound.setChecked(cfg.get("sound", True))
+        self.macro_sound = bool(cfg.get("macro_sound", True))
         self.autostart = QCheckBox(_("Start with system"))
         self.autostart.setChecked(autostart_enabled())
         self.autostart.toggled.connect(self._toggle_autostart)
@@ -16061,6 +19007,8 @@ class App(QWidget):
                               or code == self.hk.code)
         self.engine.changed.connect(self._macros_ran)
         self.engine.toggled.connect(self._macro_toggled)
+        self.engine.beep.connect(self._macro_beep)
+        self.engine.suspend_req.connect(self._suspend_from_script)
         self.engine.problem.connect(self._macro_problem)
         self.engine.message.connect(self._macro_message)
         self.engine.screen = SCREEN()
@@ -16431,6 +19379,11 @@ class App(QWidget):
         self.act_sound.setCheckable(True)
         self.act_sound.toggled.connect(self.sound.setChecked)
         self.sound.toggled.connect(self.act_sound.setChecked)
+        self.act_msound = self.m_set.addAction(
+            _("Sound when a macro turns on or off"))
+        self.act_msound.setCheckable(True)
+        self.act_msound.setChecked(self.macro_sound)
+        self.act_msound.toggled.connect(self._set_macro_sound)
         self.act_auto = self.m_set.addAction(_("Start with system"))
         self.act_auto.setCheckable(True)
         self.act_auto.toggled.connect(self.autostart.setChecked)
@@ -16550,6 +19503,7 @@ class App(QWidget):
         self.act_about.setText(_("About"))
         self.act_site.setText(_("Project on GitHub"))
         self.act_sound.setText(_("Sound feedback on hotkey"))
+        self.act_msound.setText(_("Sound when a macro turns on or off"))
         self.act_auto.setText(_("Start with system"))
         self.act_updates.setText(_("Check for updates on start"))
         self.act_update.setText(_("Check for updates"))
@@ -16773,6 +19727,19 @@ class App(QWidget):
     def _beep(self, which):
         if self.sound.isChecked():
             self.beeper.play(which)
+
+    def _macro_beep(self, which):
+        """Um macro ligou ou desligou (mon/moff), ou um script pediu
+        SoundBeep. O desligar do menu cala os dois primeiros."""
+        if which == "script":
+            self.beeper.play("on")
+        elif self.macro_sound:
+            self.beeper.play(which)
+
+    def _set_macro_sound(self, on):
+        self.macro_sound = bool(on)
+        if hasattr(self, "_save_timer"):
+            self._save_timer.start()
 
     def _paint_status(self):
         color = STATE_COLORS.get(getattr(self, "_state", ""), STATE_COLORS[""])
@@ -17538,7 +20505,22 @@ class App(QWidget):
         (desligar para também o que estiver rodando)."""
         on = not self.macro_box.isChecked()
         self.macro_box.setChecked(on)
-        self._beep("on" if on else "off")
+        self._macro_beep("mon" if on else "moff")
+
+    def _suspend_from_script(self, mode):
+        """Suspend dentro de um script: On desliga os macros, Off liga,
+        Toggle (ou nada) troca."""
+        mode = (mode or "toggle").strip().lower()
+        on = self.macro_box.isChecked()
+        if mode in ("on", "1", "true"):
+            want = False
+        elif mode in ("off", "0", "false"):
+            want = True
+        else:
+            want = not on
+        if want != on:
+            self.macro_box.setChecked(want)
+            self._macro_beep("mon" if want else "moff")
 
     # ---------------------------------------------------- macros (atalhos) --
     def _macro_outputs(self):
@@ -17564,11 +20546,16 @@ class App(QWidget):
                           if m["enabled"] and m["steps"]
                           and not m.get("dock")):
             self.ensure_pointer()
+        compiled = [CompiledMacro(m) for m in self.macros
+                    if m["enabled"] and m["steps"] and not m.get("dock")]
         if active and self.engine.windows is None and any(
-                CompiledMacro(m).uses_windows for m in self.macros
-                if m["enabled"] and m["steps"] and not m.get("dock")):
+                c.uses_windows or c.uses_active for c in compiled):
             kw = KWIN()                 # na thread da UI, onde ela vive
             self.engine.windows = kw if kw.ok else None
+        if active and self.engine.windows is not None and any(
+                c.uses_active for c in compiled):
+            # #IfWinActive: o KWin conta cada troca de janela ativa
+            self.engine.windows.track()
         path = self.selected_mouse()[0]
         if path and self.mouse is not None:
             # botão do mouse como atalho escondido: o relay sai pelo mesmo
@@ -17847,7 +20834,6 @@ class App(QWidget):
 
     def _macro_toggled(self, on):
         self._burst_start()
-        self._beep("on" if on else "off")
 
     # Limpeza via aboutToQuit e não closeEvent: sobrescrever closeEvent faz o
     # shiboken embrulhar o QCloseEvent, o que segfaulta no PySide6 + Python
@@ -17863,6 +20849,7 @@ class App(QWidget):
                 "hotkey_code": self.hk.code,
                 "mode": self.mode_key(),
                 "sound": self.sound.isChecked(),
+                "macro_sound": self.macro_sound,
                 "mouse_name": self.selected_mouse()[1],
                 "click_enabled": self.click_box.isChecked(),
                 "key_enabled": self.key_box.isChecked(),

@@ -201,9 +201,11 @@ check("found := ImageSearch(...) then if found",
       == ("image", "seen", "left", [0, 0, 100, 100]), st)
 i = imp("F2::\nImageSearch, X, Y, 0, 0, 99, 99, btn.png\nif !ErrorLevel\n"
         "{\n  Send e\n  Click %X%, %Y%\n}\nreturn\n")
-check("a click at the found spot that is not right after the search is "
-      "skipped with a note", ops(i.macros[0]) == ["image", "tap", "wait"]
-      and any("right after the search" in n for n in notes(i)), notes(i))
+check("a click at the found spot that is not right after the search "
+      "runs on the interpreter instead", ops(i.macros[0]) == ["script"]
+      and any("interpreter" in n for n in notes(i))
+      and not any("right after the search" in n for n in notes(i)),
+      notes(i))
 
 # ===================================================== laços e repetição ==
 i = imp("F2::\nLoop 3 {\n  ImageSearch, X, Y, 0, 0, 99, 99, btn.png\n"
@@ -237,8 +239,9 @@ check("else if chains", [st["op"] for st in s] ==
       and s[3]["fail_to"] == 7 and s[5]["ok_to"] == 8
       and (s[0]["color"], s[3]["color"]) == ("#ff0000", "#00ff00"), s)
 i = imp("F2::\nif (x = 0x00FF00)\n  Send a\nreturn\n")
-check("a comparison with no search before it is still skipped",
-      any("condition inside the actions" in n for n in notes(i)), notes(i))
+check("a comparison with no search before it runs on the interpreter",
+      ops(i.macros[0]) == ["script"]
+      and any("interpreter" in n for n in notes(i)), notes(i))
 norm = a.normalize_macro(i.macros[0]) if i.macros else None
 for case in ("v1", "v2"):
     pass

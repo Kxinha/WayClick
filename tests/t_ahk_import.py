@@ -50,9 +50,9 @@ CASES = {
                            "ExitApp is not supported"]),
     "combo.ahk": (["F5, once: Click Right, Wait 100 ms, Click Right, "
                    "Wait 100 ms, …", "F6, once: Wheel down ×3",
-                   "Numpad 1, once: Tap Numpad 5"],
-                  ["hotstrings are not supported", "(#If)",
-                   "two-key combinations", "release hotkeys (Up)"]),
+                   "Numpad 1, once, only in game: Tap Numpad 5",
+                   "::btw, when typed: Type “by the way”"],
+                  ["two-key combinations", "release hotkeys (Up)"]),
 }
 
 bad = 0

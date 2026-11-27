@@ -6,7 +6,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wayclick
-Version:        1.12.0
+Version:        1.13.0
 Release:        1%{?dist}
 Summary:        Autoclicker for Wayland, using /dev/uinput
 
@@ -77,6 +77,18 @@ python3 -c "import ast,sys; ast.parse(open('wayclick.py').read())"
 %{_prefix}/lib/modules-load.d/wayclick-uinput.conf
 
 %changelog
+* Fri Nov 27 2026 gabrielmf1998 <noreply@github.com> - 1.13.0-1
+- An AutoHotkey interpreter inside WayClick: a Run AutoHotkey code step
+  runs v1 or v2 code with variables, math, functions, loops and timers,
+  and Import AHK uses it for hotkeys whose bodies are real programs
+- Hotstrings: a macro can run when a text is typed, like ::btw::by the
+  way, with the *, ?, C, C1, B0 and O options
+- Window conditions: a macro can work only in one window, or everywhere
+  but it, like #IfWinActive, #IfWinNotActive and #HotIf WinActive()
+- #MaxThreadsPerHotkey from a script lets a second press stop a while
+  loop
+- A sound when a macro turns on or off (toggle macros by default, an
+  option for the others), and a Settings menu entry to silence them
 * Fri Nov 27 2026 gabrielmf1998 <noreply@github.com> - 1.12.0-1
 - Suspend hotkey on the Hotkeys page, like F7::Suspend in AutoHotkey: it
   switches the hotkey macros off and on and the game never receives it

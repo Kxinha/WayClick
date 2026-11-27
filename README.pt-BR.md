@@ -26,7 +26,11 @@ compositor e sem nada rodando como root.
   ou botão do mouse, com modificadores), liga e desliga, enquanto segura, uma
   vez ou sempre, uma lista de passos, e o atalho escondido do jogo como o
   AutoHotkey faz. Um **atalho de Suspend** desliga e liga todos eles, como o
-  `F7::Suspend`. **Importar AHK** transforma um script `.ahk` em macros
+  `F7::Suspend`. **Importar AHK** transforma um script `.ahk` em macros, e o
+  que não tem passo próprio roda num **interpretador de AutoHotkey** embutido
+  (variáveis, contas, funções, laços). **Hotstrings** (`::btw::by the way`),
+  **condições de janela** (`#IfWinActive`, `#HotIf WinActive(...)`) e um
+  **som** quando um macro liga ou desliga, que o menu Configurações silencia
 - **Passos de tela** nesses macros, como o `ImageSearch`, o `PixelSearch` e o
   `PixelGetColor` do AutoHotkey. Ir a um ponto exato e clicar, achar uma imagem, conferir a
   cor de um pixel, esperar até aparecer ou sumir e escolher o que vem depois,
@@ -277,8 +281,33 @@ Um macro é
   porque jogos leem as teclas uma vez por quadro e perdem toque curto demais.
 - **passos**, em ordem: tocar uma tecla ou clicar (N vezes), segurar, soltar,
   esperar (exato, ou um tempo aleatório entre dois valores), digitar texto,
-  girar a roda, mover o ponteiro uma distância, e os
-  [passos de tela](#passos-de-tela).
+  girar a roda, mover o ponteiro uma distância, os
+  [passos de tela](#passos-de-tela), e **Rodar código AutoHotkey** (veja
+  [o interpretador](#o-interpretador-de-autohotkey)).
+- **Gatilho**: um atalho, ou **Texto digitado (hotstring)**. Um hotstring roda
+  quando você digita o texto dele e depois um espaço, Enter ou pontuação, como
+  o `::btw::by the way`: ele apaga o que você digitou e roda os passos, então
+  um passo *Digitar texto* faz dele uma substituição de texto. As maiúsculas
+  são copiadas (`btw`, `Btw`, `BTW` dão `by the way`, `By the way`,
+  `BY THE WAY`), ele não dispara no meio de uma palavra, e o Backspace corrige
+  o que ele acompanha. As opções são as do AutoHotkey: `*` (sem tecla de
+  fim), `?` (também no meio da palavra), `C` (maiúsculas exatas), `C1` (não
+  copia as maiúsculas), `B0` (mantém o que foi digitado) e `O` (deixa de fora
+  a tecla de fim). Um atalho na mesma tecla ganha, como no AutoHotkey, então
+  com um macro no `Espaço` termine com Enter.
+- **Só na janela**: como o `#IfWinActive`, o atalho só vale enquanto aquela
+  janela está ativa (o nome do app, como `Sober`, ou parte do título; *Janelas
+  abertas…* lista elas), e fora dela a tecla faz o que faria normalmente.
+  *fora dela* é o `#IfWinNotActive`. Um macro de uma janela ganha de um macro
+  global na mesma tecla. A janela ativa vem do KWin, então isso precisa do KDE
+  Plasma; fora dele o atalho vale em todas as janelas e avisa uma vez.
+- **Som quando ligar ou desligar**: duas notas subindo quando o macro começa e
+  descendo quando para. Ligado por padrão nos macros *Liga e desliga*; marque
+  para *Enquanto segura* ou *Uma vez por aperto* (um macro de uma vez só toca
+  de novo no fim quando rodou meio segundo ou mais, como um laço `while`). Um
+  `SetTimer` ligado por código sobe quando começa e desce quando o último timer
+  para. **Configurações > Som quando um macro liga ou desliga** silencia todos
+  os macros de uma vez; o atalho de Suspend usa os mesmos sons.
 
 O que um macro segura é solto quando ele para, quando você o desabilita e
 quando o WayClick fecha. Um modificador que você segura para o atalho é solto
@@ -299,8 +328,10 @@ um bhop que está disparando uma tecla para no instante do aperto.
 
 **Importar AHK…** lê um arquivo `.ahk` (v1 ou v2) e transforma os atalhos dele
 em macros, mostrando antes no que cada um virou e o que não deu para converter,
-com o número da linha. Não é um interpretador de AutoHotkey; ele reconhece os
-padrões que scripts de jogo usam:
+com o número da linha. Os padrões que scripts de jogo usam viram passos
+comuns que dá para editar, e o que não tem passo próprio (variáveis, contas,
+funções, texto) roda como código AutoHotkey no
+[interpretador](#o-interpretador-de-autohotkey):
 
 | No script | Vira |
 |---|---|
@@ -318,10 +349,16 @@ padrões que scripts de jogo usam:
 | `ImageSearch, X, Y, X1, Y1, X2, Y2, *40 arquivo.png` + `if (ErrorLevel = 0)` + `Click` | Achar uma imagem naquela área, clicar nela, senão o outro caminho |
 | v2 `if PixelSearch(&x, &y, ...)`, `if !ImageSearch(...) return`, `achou := ImageSearch(...)` | os mesmos passos |
 | `Send` com `{Tecla down}`, `{Tecla up}`, `{Tecla N}`, `^!+#`, texto, `{Click}`, `{WheelDown N}`; `Click`, `Sleep`, `Random`, `MouseMove ..., R`, `Gosub`, funções, atalhos empilhados, `$`, `*`, `~`, nomes `sc`/`vk`, `SetKeyDelay` | os passos correspondentes |
+| `::btw::by the way`, `:*C:abrev::`, um hotstring com corpo, `#Hotstring` | um macro de hotstring |
+| `#IfWinActive ahk_exe RobloxPlayerBeta.exe`, `#IfWinNotActive`, v2 `#HotIf WinActive("...")` | Só na janela (programas do Windows viram a janela deles no Linux, como Roblox para Sober) |
+| `#MaxThreadsPerHotkey 2` | um segundo aperto roda junto com o primeiro, então `toggle := !toggle` + `while toggle` para ele |
+| `n++`, `x := y * 2`, `if (a > b && c)`, funções com `ByRef` e `static`, `Send %n%`, rótulos de `SetTimer` com contas | Rodar código AutoHotkey |
 
-Hotstrings, atalhos `Tecla Up`, combinações `A & B`, condições de janela `#If`
-(o atalho passa a valer em todas as janelas) e programação em geral são
-avisados e ignorados. `Click X, Y` e `MouseMove X, Y` viram passos
+Atalhos `Tecla Up`, combinações `A & B`, objetos e arrays, `for`, `switch`,
+`Loop, Parse` e comandos de GUI são avisados e ignorados, pela linha; o resto
+do script importa do mesmo jeito. `ahk_class` compara com o nome do app ou o
+título, e `#IfWinExist` ou janelas por id ou grupo valem em todas as janelas,
+cada um com um aviso. `Click X, Y` e `MouseMove X, Y` viram passos
 [Ir a uma posição da tela](#passos-de-tela), com um aviso quando o script
 media a partir da janela ativa, que é o padrão do AutoHotkey.
 
@@ -391,6 +428,38 @@ chegando por 18 segundos depois de desligar o macro. A 15,6 ms todo E ainda
 chega, só que a fila é bem menor, e a 33 ms não sobra nada. O editor de macro
 ainda aceita 1 ms (medido: mediana de 1,000 ms entre toques) para um programa
 que leia nesse ritmo.
+
+#### O interpretador de AutoHotkey
+
+Um passo **Rodar código AutoHotkey** guarda código AutoHotkey (v1, ou v2 com
+a caixa marcada) e roda dentro do WayClick, com o teclado e o mouse do macro.
+O importador usa ele nos atalhos cujo corpo é um programa de verdade, e dá
+para escrever um à mão. Ele cobre o que scripts de jogo usam:
+
+- variáveis que guardam o valor entre um aperto e outro (então
+  `toggle := !toggle` funciona), `global`, `static`, `local`, e `%var%` nos
+  comandos
+- expressões: contas, `//`, `**`, comparações, `&&`, `||`, `!`, `? :`,
+  juntar texto com `.`, `++`, `+=` e os outros
+- `if`/`else`, `while`, `Loop`, `Loop N`, `until`, `break`, `continue`,
+  `return`, `Gosub`, `Goto`, rótulos, `try`
+- funções com parâmetros, valores padrão, `ByRef` (v1) e `&ref` (v2)
+- `Send`, `SendInput`, `SendRaw`, `SendText`, `ControlSend` (para a janela
+  ativa), `Click`, `MouseClick`, `MouseMove`, `Sleep`, `SetKeyDelay`,
+  `GetKeyState`, `KeyWait`, `PixelGetColor`, `PixelSearch`, `ImageSearch`,
+  `WinActive`, `WinExist`, `WinActivate`, `WinWaitActive`, `SetTimer`,
+  `Suspend`, `SoundBeep`, `MsgBox` e `TrayTip` (como notificação), `ExitApp`
+  (para o macro e os timers dele)
+- `Random`, `Abs`, `Round`, `Floor`, `Ceil`, `Mod`, `Min`, `Max`, `Sqrt`,
+  `StrLen`, `SubStr`, `InStr`, `StrReplace`, `Trim`, `StrUpper`,
+  `StrLower`, `Format`, `RegExMatch`, `RegExReplace`, `Chr`, `Ord`, e
+  `A_Index`, `A_TickCount`, `A_ThisHotkey`, `A_ScreenWidth`,
+  `A_ScreenHeight`, `ErrorLevel`, `Clipboard`
+
+O código é conferido quando você salva o passo (e quando um script é
+importado), e um erro diz a linha. Um `while` sem fim para quando o macro
+para, quando os macros são desligados (ou suspensos) e quando o WayClick
+fecha, como qualquer outro macro.
 
 No terminal, `wayclick --import script.ahk --dry-run` mostra o mesmo relatório,
 e sem `--dry-run` acrescenta os macros na config (com o WayClick fechado, já
@@ -1044,6 +1113,8 @@ também como o teste lê o que teria chegado ao compositor (veja
 python3 tests/t_ahk_import.py                       # o importador nos scripts de tests/ahk
 python3 tests/t_ahk_screen.py                       # PixelGetColor, PixelSearch, ImageSearch e Suspend vindos de um .ahk, numa tela falsa
 sg input -c "python3 tests/t_suspend_ui.py"         # o atalho de Suspend: o script de bhop, liga, desliga, Ctrl, avisos, config, --import
+python3 tests/t_ahk_vm.py                           # o interpretador de AutoHotkey: expressões, laços, funções, timers, erros, v1 e v2
+sg input -c "python3 tests/t_hotstrings.py"         # hotstrings, #IfWinActive, som dos macros, #MaxThreadsPerHotkey e SetTimer no motor
 python3 tests/t_ahk_kwin.py                         # um .ahk de ponta a ponta num KWin aninhado, com duas capturas de tela
 sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk a 15,6 e a 1 ms, todos os modos, esconder, relay
 sg input -c "python3 tests/t_hotkeys_ui.py"         # a aba Atalhos de ponta a ponta, config, --import
@@ -1098,7 +1169,10 @@ O `t_ahk_kwin.py` usa a mesma caixa com uma tela só: uma janela alvo que
 mostra as teclas e os cliques que recebe, e o WayClick de verdade importando o
 `tests/ahk/kwin_e2e.ahk`. Segurar Espaço manda F9 umas 32 vezes por segundo
 (mediana medida de 31,3 ms), F7 suspende e volta, e os atalhos de `ImageSearch`
-e `PixelSearch` clicam na imagem e no ponto vermelho. A tela vem do
+e `PixelSearch` clicam na imagem e no ponto vermelho. Com o vigia do KWin
+contando qual janela está ativa, um atalho `#IfWinActive` roda um `Loop` no
+interpretador e digita a soma, um `#IfWinNotActive` continua tecla comum, e o
+`::btw::` apaga `btw` e digita `by the way`. A tela vem do
 ScreenShot2 do KWin da caixa, e duas capturas ficam em `/tmp/wayclick-ahk-kwin`
 (ou em `WCTEST_SHOTS`).
 

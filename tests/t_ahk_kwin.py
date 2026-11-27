@@ -22,7 +22,7 @@ sys.path.insert(0, HERE)
 UID = os.getuid()
 BOX_HOME = "/home/wctest"
 REC = BOX_HOME + "/rec"
-SPACE, F4, F6, F7, F9 = 57, 62, 64, 65, 67
+SPACE, F2, F3, F4, F6, F7, F9 = 57, 60, 61, 62, 64, 65, 67
 # o alvo: janela sem moldura em (10, 10); a figura e o ponto vermelho em
 # coordenadas da janela
 TW, TH, TX, TY = 1100, 700, 10, 10
@@ -198,12 +198,18 @@ def wayclick_main(bridge_sock, ahk):
     n = w.import_ahk_path(ahk, ask=False)
     w.tabs.setCurrentIndex(2)           # a aba Macros, com o Suspend
     beat = [0.0]
+    seen = [None]
 
     def tick():
         now = time.monotonic()
         if now - beat[0] < 0.2:
             return
         beat[0] = now
+        win = w.engine.windows
+        info = getattr(win, "active_info", None) if win else None
+        if info != seen[0]:
+            seen[0] = info
+            _log("active", info=info)
         hub = w.watcher.hub
         with hub.lock:
             held = sorted(p for p, d in hub.devs.items()
@@ -295,7 +301,8 @@ def main():
         cfg = os.path.join(b.home, ".config")
         os.makedirs(cfg, exist_ok=True)
         with open(os.path.join(cfg, "wayclick.json"), "w") as fh:
-            json.dump({"sound": False, "language": "pt_BR", "delay": 0,
+            json.dump({"sound": False, "macro_sound": False,
+                       "language": "pt_BR", "delay": 0,
                        "click_enabled": False}, fh)
         tlog = os.path.join(b.home, "alvo.log")
         evlog = os.path.join(b.home, "rec", "events.jsonl")
@@ -326,13 +333,15 @@ def main():
             ready = until(lambda: events("ready"), 40)
             ready = ready[-1] if ready else {}
             check("WayClick opens in the box and imports kwin_e2e.ahk",
-                  r.get("ok") and ready.get("imported") == 3
+                  r.get("ok") and ready.get("imported") == 6
                   and ready.get("suspend") == "F7" and ready.get("on"),
                   f"{ready} {'' if ready else b.tail('wayclick', 3000)}")
-            check("the three hotkeys became WayClick macros: hold, image "
-                  "and pixel steps",
+            check("the hotkeys became WayClick macros: hold, image, pixel, "
+                  "AutoHotkey code, a key and a hotstring",
                   ready.get("steps") and ready["steps"][1][0] == "image"
-                  and ready["steps"][2][0] == "pixel",
+                  and ready["steps"][2][0] == "pixel"
+                  and ready["steps"][3] == ["script"]
+                  and ready["steps"][5] == ["text"],
                   str(ready.get("steps")))
             until(lambda: any(x.get("caption") == "WayClick"
                               for x in b.kwin.windows()), 15, 0.2)
@@ -447,6 +456,41 @@ def main():
             check("the capture shows the picture where the click landed",
                   np.abs(seen - spr.astype(int)).max() <= 8,
                   f"max diff {np.abs(seen - spr.astype(int)).max()}")
+
+            # ------------- 4: #IfWinActive, o interpretador, um hotstring --
+            act = until(lambda: [e for e in events("active")
+                                 if (e.get("info") or {}).get("title")
+                                 == "Alvo AHK"], 5)
+            check("the KWin watcher tells WayClick the target is active",
+                  act, str(events("active"))[:400])
+            n0 = len(target())
+            kb.tap(F2)
+            time.sleep(0.5)
+            kb.tap(F3)
+            time.sleep(0.5)
+            downs = [e["code"] for e in target()[n0:] if e["k"] == "key"
+                     and e["down"]]
+            check("#IfWinActive: F2 runs its Loop on the interpreter and "
+                  "types 12 (2+4+6); F2 itself stays hidden",
+                  downs[:2] == [2, 3] and F2 not in downs, str(downs))
+            check("#IfWinNotActive: in the target F3 is a plain key and no "
+                  "x is sent", F3 in downs and 45 not in downs, str(downs))
+            n0 = len(target())
+            # termina com Enter: o Espaço é do bhop (um atalho ganha do
+            # hotstring, como no AutoHotkey)
+            for c in (48, 20, 17, 28):          # b t w Enter
+                kb.tap(c)
+                time.sleep(0.04)
+            time.sleep(1.0)
+            downs = [e["code"] for e in target()[n0:] if e["k"] == "key"
+                     and e["down"]]
+            want = [48, 20, 17, 14, 14, 14, 48, 21, 57, 20, 35, 18, 57, 17,
+                    30, 21, 28]
+            check("hotstring ::btw:: erases btw and types by the way, "
+                  "then the Enter",
+                  downs == want, str(downs))
+            check("and still no problem reported", not events("problem"),
+                  str(events("problem")))
         finally:
             b.request(op="stop", name="wayclick")
             b.request(op="stop", name="alvo")

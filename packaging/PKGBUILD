@@ -1,6 +1,6 @@
 # Maintainer: gabrielmf1998 <noreply@github.com>
 pkgname=wayclick
-pkgver=1.12.0
+pkgver=1.13.0
 pkgrel=1
 pkgdesc="Autoclicker for Wayland, using /dev/uinput"
 arch=('any')

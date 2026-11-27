@@ -25,7 +25,11 @@ running as root.
   mouse button, with modifiers), toggle, while held, once or always, a list of
   steps, and the hotkey hidden from the game like AutoHotkey does. A
   **Suspend hotkey** switches them all off and on, like `F7::Suspend`.
-  **Import AHK** turns a `.ahk` script into macros
+  **Import AHK** turns a `.ahk` script into macros, and what has no step of
+  its own runs on a built in **AutoHotkey interpreter** (variables, math,
+  functions, loops). **Hotstrings** (`::btw::by the way`), **window
+  conditions** (`#IfWinActive`, `#HotIf WinActive(...)`) and a **sound** when
+  a macro turns on or off, which the Settings menu can silence
 - **Screen steps** in those macros, like AutoHotkey's `ImageSearch`,
   `PixelSearch` and `PixelGetColor`. Go to an exact spot and click, find an image, check a pixel
   color, wait until it shows up or goes away and choose what comes next, post
@@ -274,7 +278,31 @@ A macro is
   frame and miss a tap that is too short.
 - **steps**, in order: tap a key or click (N times), hold down, release, wait
   (exact, or a random time between two values), type text, scroll the wheel,
-  move the pointer by an amount, and the [screen steps](#screen-steps).
+  move the pointer by an amount, the [screen steps](#screen-steps), and
+  **Run AutoHotkey code** (see [the interpreter](#the-autohotkey-interpreter)).
+- **Trigger**: a hotkey, or **Typed text (hotstring)**. A hotstring runs when
+  you type its text and then a space, Enter or punctuation, like
+  `::btw::by the way`: it erases what you typed and runs the steps, so a
+  *Type text* step makes it a text replacement. Capitals are copied (`btw`,
+  `Btw`, `BTW` give `by the way`, `By the way`, `BY THE WAY`), it does not
+  fire inside a word, and Backspace edits what it watches. Its options are
+  the AutoHotkey ones: `*` (no ending key needed), `?` (also inside a word),
+  `C` (exact case), `C1` (do not copy capitals), `B0` (keep what was typed)
+  and `O` (leave out the ending key). A hotkey on the same key wins, as in
+  AutoHotkey, so with a `Space` macro end it with Enter.
+- **Only in window**: like `#IfWinActive`, the hotkey works only while that
+  window is active (the app name, like `Sober`, or part of the title;
+  *Open windows…* lists them), and elsewhere the key does its normal job.
+  *not in it* is `#IfWinNotActive`. A macro for one window beats a global
+  macro on the same key. It reads the active window from KWin, so it needs
+  KDE Plasma; elsewhere the hotkey works in every window and says so once.
+- **Sound when it turns on or off**: two notes going up when the macro
+  starts and going down when it stops. On by default for *Toggle* macros;
+  tick it for *While held* or *Once per press* (a once macro sounds again at
+  the end only when it ran for half a second or more, like a `while` loop).
+  A `SetTimer` started from code sounds up when it starts and down when the
+  last timer stops. **Settings > Sound when a macro turns on or off**
+  silences every macro at once; the Suspend hotkey uses the same sounds.
 
 Whatever a macro holds is released when it stops, when you disable it and when
 WayClick quits. A modifier you are holding for the hotkey is let go before the
@@ -295,8 +323,10 @@ spamming a key stops the moment you press it.
 
 **Import AHK…** reads a `.ahk` file (v1 or v2) and turns its hotkeys into
 macros, showing first what each one became and what it could not convert, by
-line number. It is not an AutoHotkey interpreter; it recognises the patterns
-game scripts use:
+line number. The patterns game scripts use become plain steps you can edit,
+and whatever has no step of its own (variables, math, functions, string
+work) runs as AutoHotkey code on the
+[interpreter](#the-autohotkey-interpreter):
 
 | In the script | Becomes |
 |---|---|
@@ -314,10 +344,16 @@ game scripts use:
 | `ImageSearch, X, Y, X1, Y1, X2, Y2, *40 file.png` + `if (ErrorLevel = 0)` + `Click` | Find an image in that area, click it, else the other branch |
 | v2 `if PixelSearch(&x, &y, ...)`, `if !ImageSearch(...) return`, `found := ImageSearch(...)` | the same steps |
 | `Send` with `{Key down}`, `{Key up}`, `{Key N}`, `^!+#`, text, `{Click}`, `{WheelDown N}`; `Click`, `Sleep`, `Random`, `MouseMove ..., R`, `Gosub`, functions, stacked hotkeys, `$`, `*`, `~`, `sc`/`vk` names, `SetKeyDelay` | the matching steps |
+| `::btw::by the way`, `:*C:abbr::`, a hotstring with a body, `#Hotstring` | a hotstring macro |
+| `#IfWinActive ahk_exe RobloxPlayerBeta.exe`, `#IfWinNotActive`, v2 `#HotIf WinActive("...")` | Only in window (Windows programs map to their Linux window, like Roblox to Sober) |
+| `#MaxThreadsPerHotkey 2` | a second press runs alongside the first, so `toggle := !toggle` + `while toggle` stops it |
+| `n++`, `x := y * 2`, `if (a > b && c)`, functions with `ByRef` and `static`, `Send %n%`, `SetTimer` labels with math | Run AutoHotkey code |
 
-Hotstrings, `Key Up` hotkeys, `A & B` combinations, `#If` window conditions
-(the hotkey works in every window instead) and general scripting are reported
-and skipped. `Click X, Y` and `MouseMove X, Y` become
+`Key Up` hotkeys, `A & B` combinations, objects and arrays, `for`,
+`switch`, `Loop, Parse` and GUI commands are reported and skipped, by line;
+the rest of the script still imports. `ahk_class` matches the app name or
+the title, and `#IfWinExist` or windows by id or group work in every window,
+each with a note. `Click X, Y` and `MouseMove X, Y` become
 [Go to a screen position](#screen-steps) steps, with a note when the script
 measured them from the active window, which is AutoHotkey's default.
 
@@ -385,6 +421,37 @@ seconds after the macro was turned off. At 15.6 ms every E still arrives, the
 queue is just shorter, and at 33 ms nothing is left over. The macro editor
 still takes 1 ms (measured: median 1.000 ms between taps) for a program that
 reads that fast.
+
+#### The AutoHotkey interpreter
+
+A **Run AutoHotkey code** step holds AutoHotkey code (v1, or v2 with the box
+ticked) and runs it inside WayClick, with the macro's keyboard and mouse. The
+importer uses it for hotkeys whose bodies are real programs, and you can
+write one by hand. It covers what game scripts use:
+
+- variables that keep their value between presses (so `toggle := !toggle`
+  works), `global`, `static`, `local`, and `%var%` in commands
+- expressions: math, `//`, `**`, comparisons, `&&`, `||`, `!`, `? :`,
+  string concatenation with `.`, `++`, `+=` and the rest
+- `if`/`else`, `while`, `Loop`, `Loop N`, `until`, `break`, `continue`,
+  `return`, `Gosub`, `Goto`, labels, `try`
+- functions with parameters, defaults, `ByRef` (v1) and `&ref` (v2)
+- `Send`, `SendInput`, `SendRaw`, `SendText`, `ControlSend` (to the active
+  window), `Click`, `MouseClick`, `MouseMove`, `Sleep`, `SetKeyDelay`,
+  `GetKeyState`, `KeyWait`, `PixelGetColor`, `PixelSearch`, `ImageSearch`,
+  `WinActive`, `WinExist`, `WinActivate`, `WinWaitActive`, `SetTimer`,
+  `Suspend`, `SoundBeep`, `MsgBox` and `TrayTip` (as a notification),
+  `ExitApp` (stops the macro and its timers)
+- `Random`, `Abs`, `Round`, `Floor`, `Ceil`, `Mod`, `Min`, `Max`, `Sqrt`,
+  `StrLen`, `SubStr`, `InStr`, `StrReplace`, `Trim`, `StrUpper`,
+  `StrLower`, `Format`, `RegExMatch`, `RegExReplace`, `Chr`, `Ord`, and
+  `A_Index`, `A_TickCount`, `A_ThisHotkey`, `A_ScreenWidth`,
+  `A_ScreenHeight`, `ErrorLevel`, `Clipboard`
+
+The code is checked when you save the step (and when a script is imported),
+and an error names the line.
+An endless `while` stops when the macro stops, when macros are disabled
+(or suspended) and when WayClick quits, like any other macro.
 
 From a terminal, `wayclick --import script.ahk --dry-run` prints the same
 report, and without `--dry-run` adds the macros to the config (with WayClick
@@ -1030,6 +1097,8 @@ root needed.
 python3 tests/t_ahk_import.py                       # the importer on the scripts in tests/ahk
 python3 tests/t_ahk_screen.py                       # PixelGetColor, PixelSearch, ImageSearch and Suspend from a .ahk, run on a fake screen
 sg input -c "python3 tests/t_suspend_ui.py"         # the Suspend hotkey: the bhop script, on, off, Ctrl, warnings, config, --import
+python3 tests/t_ahk_vm.py                           # the AutoHotkey interpreter: expressions, loops, functions, timers, errors, v1 and v2
+sg input -c "python3 tests/t_hotstrings.py"         # hotstrings, #IfWinActive, macro sounds, #MaxThreadsPerHotkey and SetTimer on the engine
 python3 tests/t_ahk_kwin.py                         # a .ahk end to end in a nested KWin, with two screenshots
 sg input -c "python3 tests/t_hotkey_macros.py"      # SpamE F1.ahk at 15.6 and 1 ms, every mode, hiding, relay
 sg input -c "python3 tests/t_hotkeys_ui.py"         # the Hotkeys tab end to end, config, --import
@@ -1084,7 +1153,10 @@ uses one that is not installed).
 shows the keys and clicks it gets, and the real WayClick importing
 `tests/ahk/kwin_e2e.ahk`. Holding Space sends F9 about 32 times a second
 (measured median 31.3 ms), F7 suspends and resumes, and the `ImageSearch` and
-`PixelSearch` hotkeys click the picture and the red dot. Screens come from the
+`PixelSearch` hotkeys click the picture and the red dot. With the KWin
+watcher reporting the active window, an `#IfWinActive` hotkey runs a `Loop`
+on the interpreter and types its sum, an `#IfWinNotActive` one stays a plain
+key, and `::btw::` erases `btw` and types `by the way`. Screens come from the
 sandbox KWin's ScreenShot2, and two screenshots land in
 `/tmp/wayclick-ahk-kwin` (or `WCTEST_SHOTS`).
 
